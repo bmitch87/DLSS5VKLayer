@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <algorithm>
 #include <vector>
 
 using namespace dlssnr;
@@ -82,7 +83,7 @@ static bool ShmOpen(ShmMap& s) {
                          nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (s.file == INVALID_HANDLE_VALUE) { Log("[helper] open %ls failed (%lu)", winPath.c_str(), GetLastError()); return false; }
     LARGE_INTEGER size;
-    size.QuadPart = (LONGLONG)(4096 + kMaxFrame * 2);
+    size.QuadPart = (LONGLONG)ShmTotalBytes();
     SetFilePointerEx(s.file, size, nullptr, FILE_BEGIN);
     SetEndOfFile(s.file);
     s.mapping = CreateFileMappingW(s.file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
@@ -90,24 +91,37 @@ static bool ShmOpen(ShmMap& s) {
     s.base = MapViewOfFile(s.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
     if (!s.base) { Log("[helper] MapViewOfFile failed"); return false; }
     s.hdr = (ShmHeader*)s.base;
-    s.inPixels = (uint8_t*)s.base + 4096;
+    s.inPixels = (uint8_t*)s.base + kHeaderBytes;
     s.outPixels = s.inPixels + kMaxFrame;
-    if (s.hdr->magic.load() != kShmMagic || s.hdr->passes.load() == 0) {
+    if (s.hdr->magic.load() != kShmMagic || s.hdr->version.load() != kShmVersion ||
+        s.hdr->passes.load() == 0) {
+        // Loud, for the same reason the layer says it: a live process on the other side of a version
+        // mismatch silently resets this one's header back, and every setting looks dead.
+        if (s.hdr->magic.load() == kShmMagic && s.hdr->version.load() != kShmVersion)
+            Log("[helper] header is version %u but this helper is v%u -- another process is out of "
+                "date, re-initialising it; update the layer, the helper and the GUI together",
+                s.hdr->version.load(), kShmVersion);
         ShmInitDefaults(s.hdr);
     }
     if (s.hdr->quit.load()) Log("[helper] clearing stale quit flag");
     s.hdr->quit.store(0);
-    const uint32_t req = s.hdr->seq_req.load();
-    uint32_t resp = s.hdr->seq_resp.load();
-    const uint32_t ok = s.hdr->seq_ok.load();
-    if (resp > req) {
-        s.hdr->seq_resp.store(req);
-        resp = req;
+    // Pick up where the layer is, without claiming a frame this helper never answered. A response
+    // that runs ahead of the request is a stale mapping; a response that matches a request the old
+    // helper never marked good would tell the layer to compose a frame that was never produced.
+    {
+        const uint32_t req = s.hdr->seq_req.load();
+        const uint32_t resp = s.hdr->seq_resp.load();
+        const uint32_t ok = s.hdr->seq_ok.load();
+        if (resp > req) s.hdr->seq_resp.store(req);
+        else if (req > 0 && resp == req && ok < req) s.hdr->seq_resp.store(req - 1);
+        else s.hdr->seq_resp.store(req);
     }
-    if (req > 0 && resp == req && ok < req) {
-        s.hdr->seq_resp.store(req - 1);
-        resp = req - 1;
-    }
+    // Announced before anything slow happens. The first frame at a new size makes the model load a
+    // 165 MB library and build a feature -- hundreds of milliseconds at least -- during which this
+    // process ticks no heartbeat because it is busy. A layer inferring liveness from heartbeats alone
+    // concludes nobody is there at exactly the moment the helper is working hardest, which is how a
+    // running helper came to be ignored.
+    s.hdr->helperState.store(kHelperStarting);
     s.hdr->controlSeq.fetch_add(1);
     s.hdr->heartbeat.fetch_add(1);
     Log("[helper] shm attached: %ls", winPath.c_str());
@@ -158,27 +172,27 @@ struct VkCtx {
     VkDevice device = nullptr;
     VkQueue queue = nullptr;
     uint32_t queueFamily = 0;
-    VkQueue opticalQueue = nullptr;
+    VkQueue opticalQueue = VK_NULL_HANDLE;
     uint32_t opticalQueueFamily = UINT32_MAX;
-    VkCommandPool cmdPool = nullptr;
-    VkCommandPool cmdPoolFlow = nullptr;
-    VkCommandBuffer cmdScratch = nullptr;
-    VkCommandBuffer cmdCreate = nullptr;
-    VkCommandBuffer cmdEval = nullptr;
-    VkCommandBuffer cmdFlow = nullptr;
-    VkCommandBuffer cmdFlowPost = nullptr;
+    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    VkCommandPool cmdPoolFlow = VK_NULL_HANDLE;
+    VkCommandBuffer cmdScratch = VK_NULL_HANDLE;
+    VkCommandBuffer cmdCreate = VK_NULL_HANDLE;
+    VkCommandBuffer cmdEval = VK_NULL_HANDLE;
+    VkCommandBuffer cmdFlow = VK_NULL_HANDLE;
+    VkCommandBuffer cmdFlowPost = VK_NULL_HANDLE;
     // Fence ring: every submit takes the next fence; the CPU only blocks on a
     // fence when its result is genuinely needed (never per-submit).
     static constexpr uint32_t kFenceRing = 8;
     VkFence fences[kFenceRing] = {};
     uint32_t fenceCursor = 0;
     // Graphics -> optical-flow -> graphics handoff for the async NVOF stages.
-    VkSemaphore semPrep = nullptr;
-    VkSemaphore semFlow = nullptr;
-    VkBuffer uploadStaging = nullptr;
-    VkBuffer readStaging = nullptr;
-    VkDeviceMemory uploadMem = nullptr;
-    VkDeviceMemory readMem = nullptr;
+    VkSemaphore semPrep = VK_NULL_HANDLE;
+    VkSemaphore semFlow = VK_NULL_HANDLE;
+    VkBuffer uploadStaging = VK_NULL_HANDLE;
+    VkBuffer readStaging = VK_NULL_HANDLE;
+    VkDeviceMemory uploadMem = VK_NULL_HANDLE;
+    VkDeviceMemory readMem = VK_NULL_HANDLE;
     void* uploadMap = nullptr;
     void* readMap = nullptr;
     size_t stagingSize = 0;
@@ -199,9 +213,9 @@ struct VkCtx {
 };
 
 struct GpuImage {
-    VkImage image = nullptr;
-    VkImageView view = nullptr;
-    VkDeviceMemory memory = nullptr;
+    VkImage image = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -456,7 +470,12 @@ static bool CreateContext(VkCtx& c) {
     Log("[helper] flow timestamp query=%d bits=%u period=%.3f",
         int(c.flowQueryAvailable), c.flowTimestampBits, c.timestampPeriod);
 
-    return CreateStaging(c, kMaxFrame);
+    // Staging is allocated on the first frame, at that frame's size, rather than at the largest frame
+    // the protocol can carry. Every path that needs it grows it on demand already. Reserving the
+    // maximum up front cost two host-visible buffers of kMaxFrame each -- which, once the protocol
+    // grew to cover a supersampled 4K model raster, is a quarter of a gigabyte of pinned memory for a
+    // game that may present at 1080p.
+    return true;
 }
 
 static uint32_t FindMemoryType(VkCtx& c, uint32_t bits, VkMemoryPropertyFlags want) {
@@ -739,6 +758,21 @@ static bool UploadMappedPixels(VkCtx& c, GpuImage& img, size_t bytes) {
     return SubmitAndWait(c, c.cmdScratch);
 }
 
+static bool ReadbackPixels(VkCtx& c, GpuImage& img, size_t bytes) {
+    if (bytes > c.stagingSize && !CreateStaging(c, bytes)) return false;
+    if (!c.readMap) return false;
+    if (!BeginCmd(c.cmdEval)) return false;
+    TransitionImage(c, c.cmdEval, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy region{};
+    region.imageSubresource = { img.aspect(), 0, 0, 1 };
+    region.imageExtent = { img.width, img.height, 1 };
+    vkCmdCopyImageToBuffer(c.cmdEval, img.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           c.readStaging, 1, &region);
+    return SubmitAndWait(c, c.cmdEval);
+}
+
 static bool UploadPixels(VkCtx& c, GpuImage& img, const void* pixels, size_t bytes) {
     if (bytes > c.stagingSize && !CreateStaging(c, bytes)) return false;
     if (!c.uploadMap) return false;
@@ -755,7 +789,7 @@ struct OpticalFlowState {
     VkFormat inputFormat = VK_FORMAT_UNDEFINED;
     VkFormat flowFormat = VK_FORMAT_UNDEFINED;
     uint32_t grid = 1;
-    uint32_t quality = MVEC_QUALITY_BALANCED;
+    uint32_t quality = kMVecBalanced;
     uint32_t attemptedQuality = 0;
     bool userDisabled = false;
     bool hasPrev = false;
@@ -776,18 +810,53 @@ struct OpticalFlowState {
     GpuImage prev{}, curr{}, out{}, flowFloat{};
 };
 
+static float ClampF(float v, float lo, float hi) {
+    if (!(v >= lo)) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
 struct NeuralState {
     VkCtx vk{};
     NgxSnippet ngx{};
-    OpticalFlowState flow{};
-    GpuImage colorIn{}, colorOut{}, mv{}, depth{};
+
+    // The proxy the layer sent, and two surfaces the chain alternates between. Two, not one, because
+    // a pass must read the previous pass's answer while writing its own: with a single surface the
+    // model would be reading and writing the same image.
+    GpuImage colorIn{}, workA{}, workB{}, mv{}, depth{};
+
     uint32_t w = 0, h = 0;
     bool ready = false;
+
+    // Per-pass state. A pass owns a feature, the tuning that feature was built with, and whether it
+    // still owes the model a history reset.
+    NgxTuning tuning[kMaxPasses] = {};
+    bool passNeedsReset[kMaxPasses] = {};
+    uint32_t livePasses = 0;
+
+    // A pass is dirty when the header's tuning for it no longer matches what its feature was built
+    // with. It keeps answering with the old tuning until the replacement is ready, so a retune is a
+    // swap inside one frame rather than a gap in the chain.
+    bool passDirty[kMaxPasses] = {};
+    NgxTuning lastSeenTuning[kMaxPasses] = {};
+
+    // Rebuilds are spaced rather than done at once: back-to-back NGX creation exhausts the driver's
+    // latches and the model stops answering until the process restarts. The spacing is wall-clock
+    // milliseconds from the header (0 = no spacing) rather than frames, because a frame-counted wait
+    // crawls on a 30 fps game and races on a 144 fps one.
+    double buildAfterMs = 0;
+    double tuningChangedMs = 0;
+
+    uint64_t evaluates = 0;
+
+    // Motion vectors, from bmitch87's work. The layer hands over a finished swapchain image and
+    // nothing else, so the field is estimated here with the optical-flow engine rather than read
+    // from a game that has one.
+    OpticalFlowState flow{};
     bool firstFrame = true;
-    uint32_t preset = DLSS5_PRESET_NATIVE;
     uint32_t mvecEnabled = 1;
-    uint32_t mvecScaleMode = MVEC_SCALE_PIXELS;
-    uint32_t mvecQuality = MVEC_QUALITY_BALANCED;
+    uint32_t mvecScaleMode = kMVecPixels;
+    uint32_t mvecQuality = kMVecBalanced;
     uint32_t appliedMvecScaleMode = 0xFFFFFFFFu;
     std::vector<uint8_t> prevLuma;
     uint32_t lumaW = 0, lumaH = 0;
@@ -796,6 +865,9 @@ struct NeuralState {
     bool mvecResetPending = false;
     bool pendingMvClear = false;  // scene cut: zero MVec inside the prep cmd
 };
+
+// How long to wait after a change before rebuilding, and between one rebuild and the next, is now
+// the header's rebuildSettleMs -- wall-clock milliseconds, user-adjustable, 0 meaning no spacing.
 
 static void SrcAccessForLayout(VkImageLayout layout, VkAccessFlags* a, VkPipelineStageFlags* s) {
     *a = 0; *s = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
@@ -1005,7 +1077,7 @@ static void DestroyOpticalFlow(VkCtx& c, OpticalFlowState& f) {
     f.enabled = false;
     f.inputFormat = f.flowFormat = VK_FORMAT_UNDEFINED;
     f.grid = 1;
-    f.quality = MVEC_QUALITY_BALANCED;
+    f.quality = kMVecBalanced;
     f.attemptedQuality = 0;
     f.userDisabled = false;
     f.hasPrev = false;
@@ -1121,8 +1193,8 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
     sci.costFormat = VK_FORMAT_UNDEFINED;
     sci.outputGridSize = gridBit;
     sci.hintGridSize = VK_OPTICAL_FLOW_GRID_SIZE_UNKNOWN_NV;
-    sci.performanceLevel = quality == MVEC_QUALITY_FAST ? VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_FAST_NV
-        : quality == MVEC_QUALITY_QUALITY ? VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_SLOW_NV
+    sci.performanceLevel = quality == kMVecFast ? VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_FAST_NV
+        : quality == kMVecQuality ? VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_SLOW_NV
                                           : VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_MEDIUM_NV;
     sci.flags = 0;
     if (vkCreateOpticalFlowSessionNV(c.device, &sci, nullptr, &f.session) != VK_SUCCESS) {
@@ -1870,27 +1942,25 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
     return cut;
 }
 
-static void Swizzle(uint8_t* dst, const uint8_t* src, size_t px) {
-    uint32_t* d = (uint32_t*)dst;
-    const uint32_t* s = (const uint32_t*)src;
-    size_t i = 0;
-    for (; i + 4 <= px; i += 4) {
-        uint32_t v0 = s[i + 0], v1 = s[i + 1], v2 = s[i + 2], v3 = s[i + 3];
-        d[i + 0] = (v0 & 0xFF00FF00u) | ((v0 & 0x00FF0000u) >> 16) | ((v0 & 0x000000FFu) << 16);
-        d[i + 1] = (v1 & 0xFF00FF00u) | ((v1 & 0x00FF0000u) >> 16) | ((v1 & 0x000000FFu) << 16);
-        d[i + 2] = (v2 & 0xFF00FF00u) | ((v2 & 0x00FF0000u) >> 16) | ((v2 & 0x000000FFu) << 16);
-        d[i + 3] = (v3 & 0xFF00FF00u) | ((v3 & 0x00FF0000u) >> 16) | ((v3 & 0x000000FFu) << 16);
-    }
-    for (; i < px; ++i) {
-        uint32_t v = s[i];
-        d[i] = (v & 0xFF00FF00u) | ((v & 0x00FF0000u) >> 16) | ((v & 0x000000FFu) << 16);
-    }
+static NgxTuning TuningFor(const ShmHeader* h, uint32_t pass) {
+    const PassTuning p = ShmResolvePass(h, pass);
+    NgxTuning t;
+    t.intensity = ClampF(p.intensity, 0.0f, 4.0f);
+    t.localTone = ClampF(p.localTone, 0.0f, 4.0f);
+    t.localStructure = ClampF(p.localStructure, 0.0f, 4.0f);
+    t.skinStructure = ClampF(p.skinStructure, -1.0f, 4.0f);
+    t.style = p.style;
+    t.preset = p.preset;
+    t.autoMask = p.autoMask ? 1u : 0u;
+    return t;
 }
 
-static float ClampF(float v, float lo, float hi) {
-    if (!(v >= lo)) return lo;
-    if (v > hi) return hi;
-    return v;
+static void PublishStatus(ShmMap& shm, NeuralState& ns, uint32_t state) {
+    if (!shm.hdr) return;
+    shm.hdr->helperState.store(state);
+    shm.hdr->modelUp.store(ns.ngx.ready && !ns.ngx.disabled ? 1u : 0u);
+    shm.hdr->helperFeatures.store(ns.livePasses);
+    ShmStore64(shm.hdr->helperFramesLo, shm.hdr->helperFramesHi, ns.evaluates);
 }
 
 static uint16_t FloatToHalf(float f) {
@@ -1935,54 +2005,55 @@ static float HalfToFloat(uint16_t h) {
     return f;
 }
 
+// What the model is told the motion field's numbers mean.
 static void ApplyMotionScale(NgxSnippet& ngx, uint32_t mode, uint32_t w, uint32_t h) {
     float sx = 2.0f / float(w), sy = 2.0f / float(h);
-    if (mode == MVEC_SCALE_PIXELS) { sx = 1.0f; sy = 1.0f; }
-    else if (mode == MVEC_SCALE_UV01) { sx = 1.0f / float(w); sy = 1.0f / float(h); }
+    if (mode == kMVecPixels) { sx = 1.0f; sy = 1.0f; }
+    else if (mode == kMVecUv01) { sx = 1.0f / float(w); sy = 1.0f / float(h); }
     NgxSetMotionScale(ngx, sx, sy);
 }
 
-static bool EnsureNeural(NeuralState& ns, uint32_t w, uint32_t h) {
+static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     if (ns.ready && ns.w == w && ns.h == h) return true;
     if (ns.ngx.disabled) return false;
-    if (ns.ngx.feature) { NgxTeardown(ns.ngx, ns.vk.device); }
+
+    if (ns.ngx.snippet) NgxReleaseAllPasses(ns.ngx, ns.vk.device);
     DestroyOpticalFlow(ns.vk, ns.flow);
-    DestroyImage2D(ns.vk, ns.colorIn); DestroyImage2D(ns.vk, ns.colorOut);
+    DestroyImage2D(ns.vk, ns.colorIn);
+    DestroyImage2D(ns.vk, ns.workA);
+    DestroyImage2D(ns.vk, ns.workB);
     DestroyImage2D(ns.vk, ns.mv);
     DestroyImage2D(ns.vk, ns.depth);
+    ns.livePasses = 0;
+    std::memset(ns.passDirty, 0, sizeof(ns.passDirty));
 
     if (!CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.colorIn) ||
-        !CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.colorOut)) {
-        Log("[helper] image creation failed"); return false;
+        !CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.workA) ||
+        !CreateImage2D(ns.vk, VK_FORMAT_R8G8B8A8_UNORM, w, h, ns.workB) ||
+        !CreateImage2D(ns.vk, VK_FORMAT_R16G16_SFLOAT, w, h, ns.mv) ||
+        !CreateImage2D(ns.vk, VK_FORMAT_R32_SFLOAT, w, h, ns.depth)) {
+        Log("[helper] image creation failed at %ux%u", w, h);
+        ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
+                       "could not allocate the model's surfaces");
+        return false;
     }
 
-    const VkFormat mvFormat = VK_FORMAT_R16G16_SFLOAT;
-    if (!CreateImage2D(ns.vk, mvFormat, w, h, ns.mv)) {
-        Log("[helper] MVec image creation failed"); return false;
-    }
-
-    const char* zeroDepthEnv = getenv("DLSSNR_ZERO_DEPTH");
-    const bool wantZeroDepth = !(zeroDepthEnv && zeroDepthEnv[0] == '0');
-    if (wantZeroDepth && !CreateImage2D(ns.vk, VK_FORMAT_R32_SFLOAT, w, h, ns.depth)) {
-        Log("[helper] zero depth image creation failed, continuing with null depth");
-    }
-
+    // Depth stays zero: a present-time layer has none, and the model treats a flat depth buffer as
+    // "no parallax to reason about" rather than as a lie about the scene.
+    //
+    // Motion is a different matter. It used to be zero for the same reason, which is what made the
+    // pass weaker in motion than OptiScaler's -- the model judged every frame on its own with no
+    // idea what had moved. It is now estimated here instead, with the optical-flow engine, from the
+    // two frames the helper has anyway. bmitch87's work; DLSSNR_MVEC=0 turns it off.
     const char* mvecMode = getenv("DLSSNR_MVEC");
     const bool wantFlow = ns.mvecEnabled != 0 && !(mvecMode && !_stricmp(mvecMode, "0"));
-    if (wantFlow && !SetupOpticalFlow(ns.vk, ns, w, h, ns.mvecQuality)) {
-        Log("[helper] synthetic motion vectors disabled, using zero MVec");
-    }
-    const size_t mvBytes = ImageSizeBytes(ns.vk, ns.mv);
-    std::vector<uint8_t> zeros(mvBytes, 0);
-    if (!UploadPixels(ns.vk, ns.mv, zeros.data(), zeros.size())) return false;
-    if (ns.depth.image) {
-        const size_t depthBytes = ImageSizeBytes(ns.vk, ns.depth);
-        std::vector<uint8_t> depthZeros(depthBytes, 0);
-        if (!UploadPixels(ns.vk, ns.depth, depthZeros.data(), depthZeros.size())) {
-            Log("[helper] zero depth upload failed, continuing with null depth");
-            DestroyImage2D(ns.vk, ns.depth);
-        }
-    }
+    if (wantFlow && !SetupOpticalFlow(ns.vk, ns, w, h, ns.mvecQuality))
+        Log("[helper] estimated motion vectors unavailable; falling back to a zero field");
+
+    std::vector<uint8_t> zeros(size_t(w) * h * 4, 0);
+    if (!UploadPixels(ns.vk, ns.mv, zeros.data(), zeros.size()) ||
+        !UploadPixels(ns.vk, ns.depth, zeros.data(), zeros.size())) return false;
+
     if (!BeginCmd(ns.vk.cmdScratch)) return false;
     TransitionImage(ns.vk, ns.vk.cmdScratch, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
@@ -1992,72 +2063,219 @@ static bool EnsureNeural(NeuralState& ns, uint32_t w, uint32_t h) {
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     }
-    TransitionImage(ns.vk, ns.vk.cmdScratch, ns.colorOut, VK_IMAGE_LAYOUT_GENERAL, 0,
+    TransitionImage(ns.vk, ns.vk.cmdScratch, ns.workA, VK_IMAGE_LAYOUT_GENERAL, 0,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    TransitionImage(ns.vk, ns.vk.cmdScratch, ns.workB, VK_IMAGE_LAYOUT_GENERAL, 0,
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     if (!SubmitAndWait(ns.vk, ns.vk.cmdScratch)) return false;
 
+    // Pass 0's feature is built with pass 0's tuning, here, because the model reads it at create.
+    // Pass 0 is created inside NgxLoadAndInit, so its tuning has to be in the parameter block before
+    // that call rather than recorded after it. Setting it afterwards is what made pass 0 always come
+    // up with defaults while this side believed it had the user's values.
+    NgxTuning first = TuningFor(shm.hdr, 0);
+
     if (!BeginCmd(ns.vk.cmdCreate)) return false;
-    bool ok = NgxLoadAndInit(ns.ngx, ns.vk.instance, ns.vk.physical, ns.vk.device, w, h, ns.vk.cmdCreate);
+    bool ok = NgxLoadAndInit(ns.ngx, ns.vk.instance, ns.vk.physical, ns.vk.device, w, h, ns.vk.cmdCreate, first);
     if (!SubmitAndWait(ns.vk, ns.vk.cmdCreate) || !ok) {
         Log("[helper] snippet init/create failed at %ux%u", w, h);
+        ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
+                       "the model would not initialise; see the helper log");
         ns.ngx.disabled = true;
+        PublishStatus(shm, ns, kHelperModelFailed);
         return false;
     }
 
-    auto fill = [](NVSDK_NGX_Resource_VK& r, GpuImage& img, bool rw) {
-        r = {};
-        r.Type = NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGE_VIEW;
-        r.ReadWrite = rw;
-        r.Resource.ImageViewInfo.ImageView = img.view;
-        r.Resource.ImageViewInfo.Image = img.image;
-        r.Resource.ImageViewInfo.SubresourceRange = { img.aspect(), 0, 1, 0, 1 };
-        r.Resource.ImageViewInfo.Format = img.format;
-        r.Resource.ImageViewInfo.Width = img.width;
-        r.Resource.ImageViewInfo.Height = img.height;
-    };
-    NVSDK_NGX_Resource_VK rc{}, ro{}, rm{}, rd{};
-    fill(rc, ns.colorIn, false); fill(ro, ns.colorOut, true); fill(rm, ns.mv, false);
-    if (ns.depth.image) fill(rd, ns.depth, false);
-    NgxSetResources(ns.ngx, rc, ro, rm, rd, w, h);
+    ns.tuning[0] = first;
+    ns.lastSeenTuning[0] = first;
+    ns.passNeedsReset[0] = true;
+    ns.livePasses = 1;
+    ns.w = w;
+    ns.h = h;
+    ns.ready = true;
+    ns.tuningChangedMs = NowMs();
+    ns.buildAfterMs = NowMs() + shm.hdr->rebuildSettleMs.load();
+
+    // The motion field's units go with the field, so they are set as soon as there is a feature to
+    // tell. The per-pass resource binding happens in BindPass; this is the part that does not change
+    // between passes.
     ApplyMotionScale(ns.ngx, ns.mvecScaleMode, w, h);
     ns.appliedMvecScaleMode = ns.mvecScaleMode;
-    NgxSetPreset(ns.ngx, ns.preset);
-
-    ns.w = w; ns.h = h; ns.ready = true; ns.firstFrame = true;
-    ns.prevLuma.clear(); ns.lumaW = ns.lumaH = 0;
+    ns.firstFrame = true;
+    ns.prevLuma.clear();
+    ns.lumaW = ns.lumaH = 0;
     Log("[helper] neural ready %ux%u", w, h);
+    ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes, "");
+    PublishStatus(shm, ns, kHelperRunning);
     return true;
+}
+
+// Bind one pass's input and output. The proxy the layer sent is read by pass 0 and never written by
+// the chain, so what the composition later differences against is the whole chain's edit rather than
+// the last pass's edit against the one before it.
+static void BindPass(NeuralState& ns, uint32_t pass, GpuImage*& in, GpuImage*& out) {
+    if (pass == 0) {
+        in = &ns.colorIn;
+        out = &ns.workA;
+    } else if (pass % 2 == 1) {
+        in = &ns.workA;
+        out = &ns.workB;
+    } else {
+        in = &ns.workB;
+        out = &ns.workA;
+    }
+}
+
+static void FillResource(NVSDK_NGX_Resource_VK& r, GpuImage& img, bool rw) {
+    r = {};
+    r.Type = NVSDK_NGX_RESOURCE_VK_TYPE_VK_IMAGE_VIEW;
+    r.ReadWrite = rw;
+    r.Resource.ImageViewInfo.ImageView = img.view;
+    r.Resource.ImageViewInfo.Image = img.image;
+    r.Resource.ImageViewInfo.SubresourceRange = { img.aspect(), 0, 1, 0, 1 };
+    r.Resource.ImageViewInfo.Format = img.format;
+    r.Resource.ImageViewInfo.Width = img.width;
+    r.Resource.ImageViewInfo.Height = img.height;
+}
+
+// Bring the built features into line with what the header asks for.
+//
+// A retuned pass is replaced on its own -- retuning pass 2 no longer tears down passes 0 and 1 --
+// and it keeps answering with the tuning it was built with until the replacement is ready, so a
+// slider change is a swap inside one frame rather than a gap in the chain. Builds are spaced by the
+// header's rebuildSettleMs rather than done back to back: NGX creation is expensive and back-to-back
+// creation exhausts the driver's latches, after which the model stops answering until the process
+// restarts. A spacing of 0 means no wait at all -- everything pending is built within this call.
+static void MaintainPasses(NeuralState& ns, ShmMap& shm, uint32_t wanted) {
+    if (!ns.ready || ns.ngx.disabled) return;
+
+    const uint32_t spacing = shm.hdr->rebuildSettleMs.load();
+    const double now = NowMs();
+
+    // Has anything the model latches at creation changed?
+    //
+    // Compared by value rather than by watching tuningSeq. The sequence is a hint, not the truth: a
+    // header reset returns it to zero while this process still remembers a larger number, and the
+    // change that follows then looks like no change at all. Seven atomic loads per live pass per
+    // frame is nothing next to a control that silently stops working. Every new value re-arms the
+    // wait, so dragging a slider debounces rather than rebuilding at each tick.
+    auto scanDirty = [&]() -> int {
+        int first = -1;
+        for (uint32_t i = 0; i < ns.livePasses; ++i) {
+            const NgxTuning t = TuningFor(shm.hdr, i);
+            if (!(t == ns.lastSeenTuning[i])) { ns.lastSeenTuning[i] = t; ns.tuningChangedMs = now; }
+            ns.passDirty[i] = !(t == ns.tuning[i]);
+            if (ns.passDirty[i] && first < 0) first = (int)i;
+        }
+        return first;
+    };
+
+    // With a spacing set, the buildAfterMs gate lets exactly one action through per call; with 0,
+    // every pending action runs here in order.
+    for (uint32_t guard = 0; guard < 2 * kMaxPasses; ++guard) {
+        const int dirty = scanDirty();
+
+        if (wanted < ns.livePasses) {
+            vkDeviceWaitIdle(ns.vk.device);
+            for (uint32_t i = wanted; i < ns.livePasses; ++i) {
+                NgxReleasePass(ns.ngx, i, ns.vk.device);
+                ns.passDirty[i] = false;
+            }
+            ns.livePasses = wanted;
+            ns.buildAfterMs = now + spacing;
+            continue;
+        }
+
+        if (now - ns.tuningChangedMs < (double)spacing || now < ns.buildAfterMs) break;
+
+        if (dirty >= 0) {
+            const uint32_t pass = (uint32_t)dirty;
+            Log("[helper] pass %u retuned; rebuilding it (spacing %u ms)", pass, spacing);
+            vkDeviceWaitIdle(ns.vk.device);
+            NgxReleasePass(ns.ngx, pass, ns.vk.device);
+            const NgxTuning t = TuningFor(shm.hdr, pass);
+            NgxSetCreateTuning(ns.ngx, t);
+            if (BeginCmd(ns.vk.cmdCreate)) {
+                const bool built = NgxCreatePass(ns.ngx, pass, ns.w, ns.h, ns.vk.cmdCreate);
+                SubmitAndWait(ns.vk, ns.vk.cmdCreate);
+                if (built) {
+                    ns.tuning[pass] = t;
+                    ns.lastSeenTuning[pass] = t;
+                    ns.passDirty[pass] = false;
+                    ns.passNeedsReset[pass] = true;
+                } else {
+                    // The chain skips the hole and the next settle retries the build.
+                    Log("[helper] pass %u rebuild failed; skipping it until it builds", pass);
+                }
+            }
+            ns.buildAfterMs = now + spacing;
+            continue;
+        }
+
+        // Frames where nothing is built fail open: the layer presents the game's own frame, which is
+        // the right answer while the model has no feature to answer with.
+        if (wanted > ns.livePasses) {
+            const uint32_t pass = ns.livePasses;
+            const NgxTuning t = TuningFor(shm.hdr, pass);
+            NgxSetCreateTuning(ns.ngx, t);
+            if (!BeginCmd(ns.vk.cmdCreate)) return;
+            const bool built = NgxCreatePass(ns.ngx, pass, ns.w, ns.h, ns.vk.cmdCreate);
+            SubmitAndWait(ns.vk, ns.vk.cmdCreate);
+            if (built) {
+                ns.tuning[pass] = t;
+                ns.lastSeenTuning[pass] = t;
+                ns.passNeedsReset[pass] = true;
+                ns.livePasses = pass + 1;
+            } else {
+                // A later pass failing is a ceiling, not a fault: the chain simply runs at what fits.
+                Log("[helper] pass %u would not build; holding the chain at %u", pass, ns.livePasses);
+                shm.hdr->helperPassCeiling.store(ns.livePasses);
+                ns.buildAfterMs = now + spacing;
+                break;
+            }
+            ns.buildAfterMs = now + spacing;
+            continue;
+        }
+
+        break;
+    }
 }
 
 static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     uint32_t w = shm.hdr->width.load(), h = shm.hdr->height.load();
-    uint32_t fmt = shm.hdr->format.load();
     if (!w || !h || w > kMaxW || h > kMaxH) return false;
 
-    size_t px = size_t(w) * h;
-    size_t bytes = px * 4;
+    const size_t px = size_t(w) * h;
+    const size_t bytes = px * 4;
+
     if (!ShmNeuralEnabled(shm.hdr)) {
         std::memcpy(shm.outPixels, shm.inPixels, bytes);
         return true;
     }
 
-    const uint32_t passes = ShmPasses(shm.hdr);
+    const uint32_t wanted = ShmPasses(shm.hdr);
     const bool time = TimeEnabled();
     const double t0 = NowMs();
-    ns.preset = ShmPreset(shm.hdr);
+
+    // What the header asks of the motion field, before the feature is built, because a change to the
+    // quality has to be answered by rebuilding the flow session rather than by writing a parameter.
     const uint32_t prevMvecEnabled = ns.mvecEnabled;
     ns.mvecEnabled = ShmMVecEnabled(shm.hdr) ? 1u : 0u;
     ns.mvecScaleMode = ShmMVecScaleMode(shm.hdr);
     ns.mvecQuality = ShmMVecQuality(shm.hdr);
     const bool mvecJustDisabled = prevMvecEnabled && !ns.mvecEnabled;
     const bool mvecJustEnabled = !prevMvecEnabled && ns.mvecEnabled;
-    if (!EnsureNeural(ns, w, h)) return false;
+
+    if (!EnsureNeural(ns, shm, w, h)) return false;
+    MaintainPasses(ns, shm, wanted);
+    if (!ns.ready || ns.livePasses == 0) return false;
+
     if (ns.appliedMvecScaleMode != ns.mvecScaleMode) {
         ApplyMotionScale(ns.ngx, ns.mvecScaleMode, w, h);
         ns.appliedMvecScaleMode = ns.mvecScaleMode;
     }
-
     if (!ns.mvecEnabled && (ns.flow.enabled || mvecJustDisabled)) {
         if (vkDeviceWaitIdle && vkDeviceWaitIdle(ns.vk.device) != VK_SUCCESS) {
             Log("[mvec] device wait failed during disable");
@@ -2068,16 +2286,15 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         if (!ClearMotionVectors(ns)) { Log("[frame] clear MVec failed"); return false; }
         ns.mvecResetPending = true;
         ns.lastResetLogged = 0xFFFFFFFFu;
-        if (mvecJustDisabled) Log("[mvec] disabled by user");
+        if (mvecJustDisabled) Log("[mvec] disabled by the header");
     }
     if (mvecJustEnabled) {
-        const int rc = ReactivateMotionVectors(ns, w, h, ns.mvecQuality);
-        if (rc < 0) return false;
+        if (ReactivateMotionVectors(ns, w, h, ns.mvecQuality) < 0) return false;
     } else if (ns.mvecEnabled && !ns.flow.enabled &&
                (ns.flow.userDisabled || ns.flow.attemptedQuality != ns.mvecQuality)) {
         ns.flow.userDisabled = false;
         if (!SetupOpticalFlow(ns.vk, ns, w, h, ns.mvecQuality)) {
-            Log("[helper] synthetic motion vectors unavailable");
+            Log("[helper] estimated motion vectors unavailable");
         } else {
             ns.firstFrame = true;
             ns.mvecResetPending = true;
@@ -2087,11 +2304,14 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     if (ns.flow.enabled && ns.flow.quality != ns.mvecQuality) {
         const int rc = ReactivateMotionVectors(ns, w, h, ns.mvecQuality);
         if (rc < 0) return false;
-        if (rc == 0) Log("[helper] synthetic motion vectors disabled after quality change");
+        if (rc == 0) Log("[helper] estimated motion vectors disabled after a quality change");
     }
 
-    const uint8_t* in = shm.inPixels;
-    const bool sceneCut = DetectSceneCut(ns, in, w, h, fmt);
+    // The proxy the layer encoded. It is already R8G8B8A8_UNORM and display-referred, so there is
+    // nothing to swizzle and nothing to convert.
+    //
+    // The flow engine wants the staging buffer too, and wants it larger than the frame when the
+    // conversion runs partly on the host, so the size is settled before anything is copied in.
     size_t needed = bytes;
     if (ns.flow.enabled && (ns.flow.cpuOnly || ns.flow.hybrid)) {
         const size_t mvBytes = ImageSizeBytes(ns.vk, ns.mv);
@@ -2099,19 +2319,22 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         if (mvBytes > needed) needed = mvBytes;
         if (flowBytes > needed) needed = flowBytes;
     }
-    if (needed > ns.vk.stagingSize && !CreateStaging(ns.vk, needed)) { Log("[frame] CreateStaging failed"); return false; }
-    if (fmt == 0) Swizzle((uint8_t*)ns.vk.uploadMap, in, px);   // BGRA -> RGBA
-    else std::memcpy(ns.vk.uploadMap, in, bytes);
-    const double tSwizzleIn = time ? NowMs() : 0.0;
+    if (needed > ns.vk.stagingSize && !CreateStaging(ns.vk, needed)) return false;
+    std::memcpy(ns.vk.uploadMap, shm.inPixels, bytes);
 
+    // A cut is not motion. Carrying a flow field across one hands the model a field describing a
+    // scene that is no longer on screen, which is worse than handing it nothing.
+    const bool sceneCut = DetectSceneCut(ns, shm.inPixels, w, h, 1);
     if (sceneCut && !ns.firstFrame && ns.flow.enabled) {
         ns.flow.hasPrev = false;
-        ns.pendingMvClear = true;  // zeroed inside the flow prep submit (GPU-side)
+        ns.pendingMvClear = true;  // zeroed inside the flow prep submit, GPU-side
     }
+
+    const double tUpload = time ? NowMs() : 0.0;
     if (ns.flow.enabled) {
-        // colorIn upload is merged into the flow prep command buffer.
+        // The colorIn upload is merged into the flow prep command buffer.
         if (!RunOpticalFlow(ns)) {
-            Log("[mvec] disabling synthetic motion vectors after flow failure");
+            Log("[mvec] disabling estimated motion vectors after a flow failure");
             DestroyOpticalFlow(ns.vk, ns.flow);
             ns.flow.attemptedQuality = ns.mvecQuality;
             ns.flow.userDisabled = false;
@@ -2119,102 +2342,77 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
             ns.mvecResetPending = true;
             ns.lastResetLogged = 0xFFFFFFFFu;
         }
-    } else {
-        if (!UploadMappedPixels(ns.vk, ns.colorIn, bytes)) { Log("[frame] upload colorIn failed"); return false; }
+    } else if (!UploadMappedPixels(ns.vk, ns.colorIn, bytes)) {
+        return false;
     }
-    const double tUpload = time ? NowMs() : 0.0;
-    const double tFlow = time ? NowMs() : 0.0;
+
+    const uint32_t passes = std::min(wanted, ns.livePasses);
+    GpuImage* last = nullptr;
 
     for (uint32_t pass = 0; pass < passes; ++pass) {
-        const PassStrength ps = ShmGetPassStrength(shm.hdr, pass);
-        NgxSetPreset(ns.ngx, ps.preset);
-        NgxSetStrengths(ns.ngx,
-            ClampF(ps.intensity, 0.0f, 4.0f),
-            ClampF(ps.localTone, 0.0f, 4.0f),
-            ClampF(ps.localStructure, 0.0f, 4.0f),
-            ClampF(ps.skinStructure, -1.0f, 4.0f),
-            ClampF(ps.sharpness, 0.0f, 1.0f));
-        if (!BeginCmd(ns.vk.cmdEval)) { Log("[frame] begin eval cmd failed"); return false; }
+        // A failed rebuild leaves a hole; the chain runs without that pass rather than losing the
+        // frame with it.
+        if (!ns.ngx.features[pass]) continue;
+        GpuImage *in = nullptr, *out = nullptr;
+        BindPass(ns, pass, in, out);
 
-        VkAccessFlags inSrc = 0;
-        VkPipelineStageFlags inStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-        if (ns.colorIn.layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-            inSrc = VK_ACCESS_TRANSFER_WRITE_BIT; inStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        } else if (ns.colorIn.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-            inSrc = VK_ACCESS_SHADER_READ_BIT; inStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-        } else if (ns.colorIn.layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-            inSrc = VK_ACCESS_TRANSFER_READ_BIT; inStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        }
-        TransitionImage(ns.vk, ns.vk.cmdEval, ns.colorIn, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            inSrc, VK_ACCESS_SHADER_READ_BIT, inStage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        NVSDK_NGX_Resource_VK rc{}, ro{}, rm{}, rd{};
+        FillResource(rc, *in, false);
+        FillResource(ro, *out, true);
+        FillResource(rm, ns.mv, false);
+        FillResource(rd, ns.depth, false);
+        NgxSetResources(ns.ngx, rc, ro, rm, rd, w, h);
 
-        VkAccessFlags outSrc = 0;
-        VkPipelineStageFlags outStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-        if (ns.colorOut.layout == VK_IMAGE_LAYOUT_GENERAL) {
-            outSrc = VK_ACCESS_SHADER_WRITE_BIT; outStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-        } else if (ns.colorOut.layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-            outSrc = VK_ACCESS_TRANSFER_READ_BIT; outStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        } else if (ns.colorOut.layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-            outSrc = VK_ACCESS_TRANSFER_WRITE_BIT; outStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        }
-        TransitionImage(ns.vk, ns.vk.cmdEval, ns.colorOut, VK_IMAGE_LAYOUT_GENERAL,
-            outSrc, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-            outStage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        // Sharpness is the one strength the model reads at evaluate, so it follows the setting
+        // without a rebuild; everything else was latched when this pass's feature was built.
+        const PassTuning ps = ShmResolvePass(shm.hdr, pass);
+        NgxSetSharpness(ns.ngx, ClampF(ps.sharpness, 0.0f, 1.0f));
 
-        const bool reset = pass == 0 && (ns.firstFrame || sceneCut || ns.mvecResetPending);
-        const bool logReset = Verbose() || (pass == 0 && uint32_t(reset) != ns.lastResetLogged);
-        NgxSetReset(ns.ngx, reset, logReset);
-        if (pass == 0) {
-            if (logReset) {
-                Log("[reset] pass=%u reset=%u first=%u sceneCut=%u mvecPending=%u seq=%u",
-                    pass, reset ? 1u : 0u, ns.firstFrame ? 1u : 0u, sceneCut ? 1u : 0u,
-                    ns.mvecResetPending ? 1u : 0u, shm.hdr->seq_req.load());
-            }
-            ns.lastResetLogged = reset ? 1u : 0u;
-            ns.firstFrame = false;
-            ns.mvecResetPending = false;
+        if (!BeginCmd(ns.vk.cmdEval)) return false;
+        TransitionImage(ns.vk, ns.vk.cmdEval, *in, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        TransitionImage(ns.vk, ns.vk.cmdEval, *out, VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+
+        // A pass owes the model a history reset when its feature was just built, and every pass owes
+        // one when the motion field changed under it -- a model told to reproject with a field that
+        // no longer describes the same thing smears until it is told to start over.
+        const bool reset = ns.passNeedsReset[pass] || ns.mvecResetPending || ns.firstFrame;
+        NgxSetReset(ns.ngx, reset, reset && ns.lastResetLogged != ns.mvecScaleMode);
+        if (reset) ns.lastResetLogged = ns.mvecScaleMode;
+        ns.passNeedsReset[pass] = false;
+
+        if (!NgxEvaluatePass(ns.ngx, pass, ns.vk.cmdEval)) {
+            vkEndCommandBuffer(ns.vk.cmdEval);
+            return false;
         }
-        if (!NgxEvaluate(ns.ngx, ns.vk.cmdEval)) { vkEndCommandBuffer(ns.vk.cmdEval); Log("[frame] NgxEvaluate failed"); return false; }
-        if (pass + 1 < passes) {
-            TransitionImage(ns.vk, ns.vk.cmdEval, ns.colorOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            TransitionImage(ns.vk, ns.vk.cmdEval, ns.colorIn, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkImageCopy copy{};
-            copy.srcSubresource = { ns.colorOut.aspect(), 0, 0, 1 };
-            copy.srcOffset = { 0, 0, 0 };
-            copy.dstSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
-            copy.dstOffset = { 0, 0, 0 };
-            copy.extent = { w, h, 1 };
-            vkCmdCopyImage(ns.vk.cmdEval, ns.colorOut.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                           ns.colorIn.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-            if (!SubmitAndWait(ns.vk, ns.vk.cmdEval)) { Log("[frame] pass copy submit failed"); return false; }
-        } else {
-            TransitionImage(ns.vk, ns.vk.cmdEval, ns.colorOut, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-            VkBufferImageCopy region{};
-            region.imageSubresource = { ns.colorOut.aspect(), 0, 0, 1 };
-            region.imageExtent = { w, h, 1 };
-            vkCmdCopyImageToBuffer(ns.vk.cmdEval, ns.colorOut.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                   ns.vk.readStaging, 1, &region);
-            if (!SubmitAndWait(ns.vk, ns.vk.cmdEval)) { Log("[frame] eval/readback submit failed"); return false; }
-        }
+        if (!SubmitAndWait(ns.vk, ns.vk.cmdEval)) return false;
+        last = out;
     }
+    ns.mvecResetPending = false;
+    ns.firstFrame = false;
     const double tEval = time ? NowMs() : 0.0;
-    const double tReadback = tEval;
-    if (fmt == 0) Swizzle(shm.outPixels, (const uint8_t*)ns.vk.readMap, px);  // RGBA -> BGRA
-    else std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
-    const double tSwizzleOut = time ? NowMs() : 0.0;
+
+    if (!last || !ReadbackPixels(ns.vk, *last, bytes)) return false;
+    std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
+    const double tDone = time ? NowMs() : 0.0;
+
+    ++ns.evaluates;
+    if (shm.hdr) {
+        ShmStore64(shm.hdr->helperFramesLo, shm.hdr->helperFramesHi, ns.evaluates);
+        shm.hdr->helperEvalMsBits.store(FloatToBits(float(tEval - tUpload)));
+        shm.hdr->helperFeatures.store(ns.livePasses);
+        shm.hdr->modelUp.store(1);
+    }
 
     if (time) {
         static int frameNo = 0;
         if (++frameNo % TimeInterval() == 0) {
-            Log("[time] passes=%u swizzleIn=%.2f upload=%.2f flow=%.2f eval=%.2f readback=%.2f swizzleOut=%.2f total=%.2f ms",
-                passes, tSwizzleIn - t0, tUpload - tSwizzleIn, tFlow - tUpload, tEval - tFlow,
-                tReadback - tEval, tSwizzleOut - tReadback, tSwizzleOut - t0);
+            Log("[time] passes=%u/%u flow=%s upload=%.2f eval=%.2f readback=%.2f total=%.2f ms",
+                passes, wanted, ns.flow.enabled ? "on" : "off",
+                tUpload - t0, tEval - tUpload, tDone - tEval, tDone - t0);
         }
     }
     return true;
@@ -2252,12 +2450,36 @@ int main() {
     }
 
     NeuralState ns{};
-    if (!CreateContext(ns.vk)) return 3;
+    if (!CreateContext(ns.vk)) {
+        shm.hdr->helperState.store(kHelperNoVulkan);
+        ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
+                       "no NVIDIA device with the NVX extensions");
+        return 3;
+    }
+    shm.hdr->helperState.store(kHelperRunning);
     Log("[helper] context ready, waiting for frames");
 
     uint32_t lastReq = shm.hdr->seq_resp.load();
     while (!shm.hdr->quit.load()) {
+        // Restated every pass, not announced once.
+        //
+        // Four processes can re-initialise this header -- the layer, the interface, the control tool
+        // and this one -- and a freshly initialised header says there is no helper. A helper that
+        // announced itself only when it attached would be erased by any of them and never correct
+        // the record, after which every game passes its frames through while this process sits here
+        // waiting for frames that are no longer being sent. One atomic store per pass ends that.
+        shm.hdr->helperState.store(ns.ngx.disabled ? kHelperModelFailed : kHelperRunning);
+
         uint32_t req = shm.hdr->seq_req.load();
+
+        // The counter only ever climbs, so a smaller value than last time means the header was
+        // re-initialised under us. Resynchronise rather than treat the difference as a new frame.
+        if (req < lastReq) {
+            Log("[helper] shared memory was re-initialised; resynchronising at %u", req);
+            lastReq = req;
+            shm.hdr->seq_resp.store(req);
+            continue;
+        }
         if (req == lastReq) {
             for (int i = 0; i < 20000; ++i) {
                 if (shm.hdr->quit.load() || shm.hdr->seq_req.load() != lastReq) break;
@@ -2282,6 +2504,7 @@ int main() {
 
     if (shm.hdr->quit.load()) Log("[helper] quit requested");
     else if (ns.ngx.disabled) Log("[helper] neural disabled");
+    shm.hdr->helperState.store(kHelperStopped);
     Log("[helper] shutting down");
     if (ns.ngx.snippet) NgxTeardown(ns.ngx, ns.vk.device);
     vkDeviceWaitIdle(ns.vk.device);

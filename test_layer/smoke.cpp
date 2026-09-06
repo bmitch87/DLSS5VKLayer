@@ -34,6 +34,13 @@ static uint32_t EnvU32(const char* name, uint32_t def) {
     return v && *v ? (uint32_t)strtoul(v, nullptr, 10) : def;
 }
 
+// A real function rather than a lambda: WNDPROC carries __stdcall, and on 32-bit Windows that is a
+// different calling convention from the one a lambda's function pointer has. On x86-64 there is only
+// one convention, so the lambda compiled there and only there.
+static LRESULT CALLBACK SmokeWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    return DefWindowProcW(h, m, w, l);
+}
+
 int main() {
     const uint32_t smW = EnvU32("DLSSNR_SMOKE_W", 1920);
     const uint32_t smH = EnvU32("DLSSNR_SMOKE_H", 1080);
@@ -91,11 +98,11 @@ int main() {
     }
     if (!pd) { printf("[smoke] no NVIDIA device\n"); return 1; }
 
-    VkSurfaceKHR surface = nullptr;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
     HINSTANCE hi = GetModuleHandleW(nullptr);
     static const wchar_t kCls[] = L"dlssnrSmokeWnd";
     WNDCLASSW wc{};
-    wc.lpfnWndProc = [](HWND h, UINT m, WPARAM w, LPARAM l) -> LRESULT { return DefWindowProcW(h, m, w, l); };
+    wc.lpfnWndProc = SmokeWndProc;
     wc.hInstance = hi;
     wc.lpszClassName = kCls;
     RegisterClassW(&wc);
@@ -140,7 +147,7 @@ int main() {
     vkGetDeviceQueue(device, family, 0, &queue);
     printf("[smoke] device + headless surface ready\n");
 
-    VkSwapchainKHR swapchain = nullptr;
+    VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkSwapchainCreateInfoKHR sci{};
     sci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     sci.surface = surface;
@@ -167,23 +174,23 @@ int main() {
     cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cpci.queueFamilyIndex = family;
-    VkCommandPool pool = nullptr;
+    VkCommandPool pool = VK_NULL_HANDLE;
     CHECK(vkCreateCommandPool(device, &cpci, nullptr, &pool));
     VkCommandBufferAllocateInfo cbai{};
     cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbai.commandPool = pool;
     cbai.commandBufferCount = 1;
-    VkCommandBuffer cb = nullptr;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
     CHECK(vkAllocateCommandBuffers(device, &cbai, &cb));
 
     VkFenceCreateInfo fci{};
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    VkFence fence = nullptr;
+    VkFence fence = VK_NULL_HANDLE;
     CHECK(vkCreateFence(device, &fci, nullptr, &fence));
 
     for (uint32_t frame = 0; frame < frames; ++frame) {
         uint32_t index = 0;
-        VkResult acq = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, nullptr, fence, &index);
+        VkResult acq = vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, VK_NULL_HANDLE, fence, &index);
         if (acq != VK_SUCCESS && acq != VK_NOT_READY && acq != VK_SUBOPTIMAL_KHR) { printf("[smoke] acquire failed: %d\n", (int)acq); return 1; }
         CHECK(vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX));
         vkResetFences(device, 1, &fence);

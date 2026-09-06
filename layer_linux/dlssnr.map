@@ -1,0 +1,19 @@
+/* Only the loader's entry points leave this object.
+ *
+ * A game normally links libvulkan.so.1 as a DT_NEEDED, which puts the loader's own
+ * vkGetInstanceProcAddr in the global symbol scope. A layer that exports the same name with default
+ * visibility then has its *own* reference to that name preempted by the loader's copy: negotiate
+ * hands the loader back the loader's public entry point instead of the layer's, and the chain the
+ * loader builds calls straight back into itself. Hiding everything else and binding our own
+ * references locally (-Bsymbolic) is what keeps that from happening.
+ */
+DLSSNR_1.0 {
+    global:
+        vkNegotiateLoaderLayerInterfaceVersion;
+        vkGetInstanceProcAddr;
+        vkGetDeviceProcAddr;
+        vkEnumerateInstanceLayerProperties;
+        vkEnumerateInstanceExtensionProperties;
+    local:
+        *;
+};

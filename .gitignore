@@ -1,0 +1,12 @@
+# Build output
+/build/
+/dist/
+
+# Proprietary NGX binaries, imported per-machine and never redistributable here
+/binaries/
+
+# Editor and tooling leftovers
+*.o
+*.swp
+.qmake.stash
+moc_*.cpp

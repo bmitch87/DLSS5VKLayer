@@ -1,10 +1,10 @@
 %global debug_package %{nil}
 %global _enable_debug_packages 0
 %global _include_debuginfo_sources 0
-%global pkg_release 4
+%global pkg_release 3
 
 Name:           dlssnr-personal
-Version:        0.2.1
+Version:        0.2.2
 Release:        %{pkg_release}%{?dist}
 Summary:        DLSS5 Neural Rendering Vulkan layer and helper with bundled NGX DLLs
 License:        Proprietary
@@ -44,11 +44,28 @@ cp -a root/usr %{buildroot}/usr
 %{_bindir}/dlssnr-helper
 %{_bindir}/dlssnr-gui
 %{_bindir}/dlssnr-runner-probe
-%{_datadir}/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.json
+%{_datadir}/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.*.json
 %{_datadir}/applications/dlssnr.desktop
 %doc %{_datadir}/doc/dlssnr/dxvk-license.txt
 
 %changelog
+* Sun Sep 06 2026 DLSS5VKLayer - 0.2.2-3
+- Multipass: changing one pass's model settings rebuilds only that pass. It used to tear down the whole chain and rebuild every pass, one per settle window, which is what made a single slider feel like it crawled through each pass.
+- Multipass: a retuned pass keeps answering with its old tuning until its replacement is ready, so changing settings no longer drops the chain mid-rebuild.
+- Rebuild pacing is now wall-clock milliseconds instead of frames (framerate no longer decides it) and is a setting: "Rebuild spacing (ms)" in the Cost group, default 250, 0 rebuilds immediately and chains the rest back to back. Raise it if the model ever stops answering after changing settings.
+- Shared-memory protocol v6. The helper logs how long each feature build takes.
+* Sun Sep 06 2026 DLSS5VKLayer - 0.2.2-2
+- GUI: settings move to tabs -- Rendering (neural rendering, cost, composition and model), Motion, Colour, Inspect. "How much of it lands" is renamed "Composition".
+- Add the composition switch (shared-memory protocol v5): off by default, the model's raw answer is presented as the frame with no blend, guard or enlargement; the composition controls hide while it is off.
+- Status header shows an Active/Inactive presenting indicator instead of the composed-frames debug line; project and SHM paths are no longer printed.
+- Start/Stop enable and disable with the helper's actual liveness (launcher PID file, same check the CLI uses).
+- Gear menu (bottom right): reset all settings, open the helper log. Settings now persist to config.ini and restore on launch; window size is remembered.
+- Layer: fix a stale clamp that silently killed the "Native + edit" enlargement mode.
+- Layer, helper and GUI now report a shared-memory version mismatch loudly (log line + status banner) instead of silently re-initialising each other's header -- a stale layer made every new setting look dead.
+
+* Sun Sep 06 2026 DLSS5VKLayer - 0.2.2-1
+- Declare `library_arch` in each implicit-layer manifest so the loader skips the wrong word size by reading it instead of dlopening, ending the "wrong ELF class" log spam in every process.
+
 * Sun Sep 06 2026 DLSS5VKLayer - 0.2.1-4
 - Offload NVOF MVec post-processing to the GPU: compute pass decodes SFIXED5 flow, applies a deadzone and upscales the grid into `DLSSNR.MVec` with no host readback.
 - Add `DLSSNR_MVEC_DEADZONE` (default 0.5 px) and `DLSSNR_MVEC_COMPUTE=0` kill switch; static geometry now yields exactly zero motion vectors.

@@ -6,6 +6,7 @@
 #include "guard.h"
 #include "logging.h"
 #include "ngx_param.h"
+#include <chrono>
 #include <cstring>
 
 namespace dlssnr {
@@ -186,7 +187,8 @@ static void RegisterPeRange(const char* name, HMODULE mod) {
 // Load + init (everything up to and including CreateFeature(18))
 // ---------------------------------------------------------------------------
 bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkDevice device,
-                    uint32_t width, uint32_t height, VkCommandBuffer recordingCmd) {
+                    uint32_t width, uint32_t height, VkCommandBuffer recordingCmd,
+                    const NgxTuning& tuning) {
     if (s.disabled) return false;
     s.binDir = ResolveBinDir();
     if (s.binDir.empty()) { Log("[ngx] nvngx_dlssnr.dll not found (set DLSSNR_BIN_DIR)"); s.disabled = true; return false; }
@@ -339,7 +341,7 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_VisibilityNodeMask", 1u, &seh);
 
     // Create flags: sharpening is applied by the net when the runtime float is
-    // nonzero (see NgxSetStrengths); auto-exposure keeps adaptation state in the
+    // nonzero (see NgxSetSharpness); auto-exposure keeps adaptation state in the
     // DLL so it survives normal dynamic lighting without host-side resets.
     unsigned int createFlags = NVSDK_NGX_DLSS_Feature_Flags_DoSharpening |
                                NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
@@ -407,8 +409,8 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
         }
     }
 
-    // Tonemapping hint now that the snippet's feature flags are known: SDR by
-    // default (input is LDR RGBA8); HDR only when both requested and capable.
+    // Tonemapping hint now that the snippet's feature flags are known: SDR by default (the input is
+    // LDR RGBA8); HDR only when both asked for and advertised.
     {
         DWORD seh2 = 0;
         const bool hdrPath = wantHdr && s.hdrCapable;
@@ -417,7 +419,11 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
         Log("[params] tonemap hint: %s (featureFlags=%#x)", hdrPath ? "HDR" : "SDR", s.featureFlags);
     }
 
-    bool created = NgxCreateFeature(s, width, height, recordingCmd);
+    // Last, so neither the create contract above nor the tonemap hint can overwrite it. Its preset
+    // write in particular used to land after everything the caller chose.
+    NgxSetCreateTuning(s, tuning);
+
+    bool created = NgxCreatePass(s, 0, width, height, recordingCmd);
     if (!created && s.snippet && s.params) {
         auto reqs = reinterpret_cast<FnVkGetFeatureRequirements>(
             GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_GetFeatureRequirements"));
@@ -434,28 +440,67 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     return created;
 }
 
-bool NgxCreateFeature(NgxSnippet& s, uint32_t width, uint32_t height, VkCommandBuffer recordingCmd) {
-    if (s.disabled || !s.params) return false;
-    if (s.feature) {
-        DWORD seh = 0;
-        NVSDK_NGX_Result r = CallReleaseSafely(s.releaseFeature, s.feature, &seh);
-        Log("[ngx] ReleaseFeature (recreate) -> %#x seh=%#x", (uint32_t)r, seh);
-        s.feature = nullptr;
-    }
+void NgxSetCreateTuning(NgxSnippet& s, const NgxTuning& t) {
+    if (!s.params) return;
     DWORD seh = 0;
+    bool ok = true;
+    ok &= ParamSetUI(s.params, "DLSSNR.Hint.Render.Preset", t.preset, &seh);
+    ok &= ParamSetUI(s.params, "DLSSNR.Style", t.style, &seh);
+    ok &= ParamSetF(s.params, "DLSSNR.Intensity", t.intensity, &seh);
+    ok &= ParamSetF(s.params, "DLSSNR.LocalToneStrength", t.localTone, &seh);
+    ok &= ParamSetF(s.params, "DLSSNR.LocalStructureStrength", t.localStructure, &seh);
+    ok &= ParamSetF(s.params, "DLSSNR.SkinStructureStrength", t.skinStructure, &seh);
+    ok &= ParamSetUI(s.params, "DLSSNR.UseAutoMask", t.autoMask, &seh);
+    if (!ok) Log("[params] create tuning FAILED (seh=%#x)", seh);
+    else
+        Log("[params] create tuning: preset=%u style=%u intensity=%.2f tone=%.2f structure=%.2f "
+            "skin=%.2f automask=%u",
+            t.preset, t.style, t.intensity, t.localTone, t.localStructure, t.skinStructure, t.autoMask);
+}
+
+void NgxReleasePass(NgxSnippet& s, uint32_t pass, VkDevice device) {
+    if (pass >= kMaxPasses || !s.features[pass] || !s.releaseFeature) return;
+    // Never free under the GPU. The helper submits and fences every evaluate, so waiting on the
+    // device here is enough and is cheaper to reason about than parking the handle for N frames.
+    (void) device;
+    DWORD seh = 0;
+    NVSDK_NGX_Result r = CallReleaseSafely(s.releaseFeature, s.features[pass], &seh);
+    Log("[ngx] ReleaseFeature pass %u -> %#x seh=%#x", pass, (uint32_t)r, seh);
+    s.features[pass] = nullptr;
+}
+
+void NgxReleaseAllPasses(NgxSnippet& s, VkDevice device) {
+    for (uint32_t i = 0; i < kMaxPasses; ++i) NgxReleasePass(s, i, device);
+    s.featureCount = 0;
+    s.ready = false;
+}
+
+bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height,
+                   VkCommandBuffer recordingCmd) {
+    if (s.disabled || !s.params || pass >= kMaxPasses) return false;
+    if (s.features[pass]) return true;
+
+    DWORD seh = 0;
+    const auto t0 = std::chrono::steady_clock::now();
     NVSDK_NGX_Result createResult = CallCreateSafely(s.createFeature, recordingCmd,
-        FEATURE_DLSSNR, s.params, &s.feature, &seh);
-    Log("[ngx] VULKAN_CreateFeature(18) -> %#x seh=%#x handle=%p size=%ux%u",
-        (uint32_t)createResult, seh, (void*)s.feature, width, height);
-    if (!NVSDK_NGX_SUCCEED(createResult) || !s.feature) {
-        s.feature = nullptr;
-        s.disabled = true;
+        FEATURE_DLSSNR, s.params, &s.features[pass], &seh);
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    Log("[ngx] VULKAN_CreateFeature(18) pass %u -> %#x seh=%#x handle=%p size=%ux%u in %.0f ms",
+        pass, (uint32_t)createResult, seh, (void*)s.features[pass], width, height, ms);
+    if (!NVSDK_NGX_SUCCEED(createResult) || !s.features[pass]) {
+        s.features[pass] = nullptr;
+        // Only the first pass failing is fatal; a later one failing simply caps the chain, which is
+        // what a memory ceiling looks like and is not a reason to lose the pass altogether.
+        if (pass == 0) s.disabled = true;
         return false;
     }
     s.featureW = width;
     s.featureH = height;
+    if (pass + 1 > s.featureCount) s.featureCount = pass + 1;
     s.ready = true;
-    Log("[ngx] STATUS: Feature=18 created=true path=vulkan-snippet size=%ux%u", width, height);
+    if (pass == 0)
+        Log("[ngx] STATUS: Feature=18 created=true path=vulkan-snippet size=%ux%u", width, height);
     return true;
 }
 
@@ -515,21 +560,35 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
     ps &= ParamSetUI(s.params, "DLSS.Indicator.Invert.Y.Axis", 0u, &seh);
     ps &= ParamSetUI(s.params, "DLSSNR.Enabled", 1u, &seh);
     ps &= ParamSetUI(s.params, "DLSSNR.Reset", 1u, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.Style", 0u, &seh);
-    ps &= ParamSetF(s.params, "DLSSNR.Intensity", 1.0f, &seh);
-    ps &= ParamSetF(s.params, "DLSSNR.LocalToneStrength", 1.0f, &seh);
-    ps &= ParamSetF(s.params, "DLSSNR.LocalStructureStrength", 1.0f, &seh);
-    ps &= ParamSetF(s.params, "DLSSNR.SkinStructureStrength", -1.0f, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.UseAutoMask", 1u, &seh);
     ps &= ParamSetUI(s.params, "DLSSNR.UICorrection", 0u, &seh);
+
+    // Style, Intensity, LocalTone, LocalStructure, SkinStructure and UseAutoMask are deliberately
+    // absent. They used to be written here, every frame, as constants -- which did two harmful
+    // things: it had no effect on the running feature, because the model latches them at creation,
+    // and it left the parameter block holding those constants for whatever created a feature next.
+    // A feature built at any moment other than immediately after NgxSetCreateTuning therefore got
+    // defaults no matter what the user had chosen. They belong to NgxTuning and to create time.
+    //
+    // UseAutoMask was the clearest case: the constant written here was 0, so the automatic skin mask
+    // was forced off regardless of the setting, whose default is on.
+    // Read back once per change rather than once per pass per frame: this runs on every evaluate in
+    // a multipass chain, and the readback is a diagnostic, not a step.
     unsigned int autoMask = 0;
     float mvecScaleX = 0.0f, mvecScaleY = 0.0f;
     ParamGetUI(s.params, "DLSSNR.UseAutoMask", &autoMask, &seh);
     ParamGetF(s.params, "DLSSNR.MVecScaleX", &mvecScaleX, &seh);
     ParamGetF(s.params, "DLSSNR.MVecScaleY", &mvecScaleY, &seh);
-    Log("[params] evaluate contract set: %s (seh=%#x) UseAutoMask=%u MVecScaleX=%.6f MVecScaleY=%.6f depth=%s",
-        ps ? "ok" : "FAILED", seh, autoMask, mvecScaleX, mvecScaleY,
-        s.resDepth.Resource.ImageViewInfo.ImageView ? "bound" : "null");
+    const bool hasDepthNow = s.resDepth.Resource.ImageViewInfo.ImageView != VK_NULL_HANDLE;
+    if (Verbose() || !ps || autoMask != s.loggedAutoMask || mvecScaleX != s.loggedMVecScaleX ||
+        mvecScaleY != s.loggedMVecScaleY || hasDepthNow != s.loggedDepthBound) {
+        s.loggedAutoMask = autoMask;
+        s.loggedMVecScaleX = mvecScaleX;
+        s.loggedMVecScaleY = mvecScaleY;
+        s.loggedDepthBound = hasDepthNow;
+        Log("[params] evaluate contract set: %s (seh=%#x) UseAutoMask=%u MVecScaleX=%.6f MVecScaleY=%.6f depth=%s",
+            ps ? "ok" : "FAILED", seh, autoMask, mvecScaleX, mvecScaleY,
+            hasDepthNow ? "bound" : "null");
+    }
 }
 
 void NgxSetReset(NgxSnippet& s, bool reset, bool logValue) {
@@ -545,18 +604,6 @@ void NgxSetReset(NgxSnippet& s, bool reset, bool logValue) {
         reset ? 1u : 0u, back, back2, int(ok1), int(ok2), seh);
 }
 
-void NgxSetPreset(NgxSnippet& s, uint32_t preset) {
-    if (!s.params) return;
-    if (preset > 2u) preset = 0u;
-    DWORD seh = 0;
-    ParamSetUI(s.params, "DLSSNR.Style", preset, &seh);
-    if (s.loggedPreset == (int)preset) return;
-    s.loggedPreset = (int)preset;
-    unsigned int back = 0;
-    ParamGetUI(s.params, "DLSSNR.Style", &back, &seh);
-    Log("[params] DLSS5 preset=%u DLSSNR.Style=%u (seh=%#x)", preset, back, seh);
-}
-
 void NgxSetMotionScale(NgxSnippet& s, float scaleX, float scaleY) {
     if (!s.params) return;
     DWORD seh = 0;
@@ -568,16 +615,11 @@ void NgxSetMotionScale(NgxSnippet& s, float scaleX, float scaleY) {
     Log("[params] MVecScaleX=%.6f MVecScaleY=%.6f (seh=%#x)", x, y, seh);
 }
 
-void NgxSetStrengths(NgxSnippet& s, float intensity, float localTone,
-                     float localStructure, float skinStructure, float sharpness) {
+void NgxSetSharpness(NgxSnippet& s, float sharpness) {
     if (!s.params) return;
     DWORD seh = 0;
-    ParamSetF(s.params, "DLSSNR.Intensity", intensity, &seh);
-    ParamSetF(s.params, "DLSSNR.LocalToneStrength", localTone, &seh);
-    ParamSetF(s.params, "DLSSNR.LocalStructureStrength", localStructure, &seh);
-    ParamSetF(s.params, "DLSSNR.SkinStructureStrength", skinStructure, &seh);
-    // Runtime sharpness float must reach the DLL on every evaluate dispatch
-    // (DoSharpening was enabled at create; this is the per-frame amount).
+    // The runtime sharpness float has to reach the DLL on every evaluate dispatch: DoSharpening is
+    // enabled at create, and this is the per-frame amount it applies.
     ParamSetF(s.params, "Sharpness", sharpness, &seh);
     if (Verbose()) {
         float back = 0.0f;
@@ -586,10 +628,11 @@ void NgxSetStrengths(NgxSnippet& s, float intensity, float localTone,
     }
 }
 
-bool NgxEvaluate(NgxSnippet& s, VkCommandBuffer recordingCmd) {
-    if (s.disabled || !s.ready || !s.feature) return false;
+bool NgxEvaluatePass(NgxSnippet& s, uint32_t pass, VkCommandBuffer recordingCmd) {
+    if (s.disabled || !s.ready || pass >= kMaxPasses || !s.features[pass]) return false;
     DWORD seh = 0;
-    NVSDK_NGX_Result r = CallEvaluateSafely(s.evaluateFeature, recordingCmd, s.feature, s.params, &seh);
+    NVSDK_NGX_Result r =
+        CallEvaluateSafely(s.evaluateFeature, recordingCmd, s.features[pass], s.params, &seh);
     if (!NVSDK_NGX_SUCCEED(r)) {
         Log("[ngx] VULKAN_EvaluateFeature -> %#x seh=%#x (disabling)", (uint32_t)r, seh);
         s.disabled = true;
@@ -602,11 +645,13 @@ bool NgxEvaluate(NgxSnippet& s, VkCommandBuffer recordingCmd) {
 // -> restore IAT -> FreeLibrary.
 void NgxTeardown(NgxSnippet& s, VkDevice device) {
     DWORD seh = 0;
-    if (s.feature && s.releaseFeature) {
-        NVSDK_NGX_Result r = CallReleaseSafely(s.releaseFeature, s.feature, &seh);
-        Log("[ngx] ReleaseFeature -> %#x seh=%#x", (uint32_t)r, seh);
-        s.feature = nullptr;
+    for (uint32_t i = 0; i < kMaxPasses; ++i) {
+        if (!s.features[i] || !s.releaseFeature) continue;
+        NVSDK_NGX_Result r = CallReleaseSafely(s.releaseFeature, s.features[i], &seh);
+        Log("[ngx] ReleaseFeature pass %u -> %#x seh=%#x", i, (uint32_t)r, seh);
+        s.features[i] = nullptr;
     }
+    s.featureCount = 0;
     if (s.shutdown1) {
         NVSDK_NGX_Result r = CallShutdownSafely(s.shutdown1, device, &seh);
         Log("[ngx] snippet Shutdown1 -> %#x seh=%#x", (uint32_t)r, seh);

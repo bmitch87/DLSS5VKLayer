@@ -5,97 +5,142 @@
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
+#include <QHBoxLayout>
 #include <QLabel>
+#include <QSignalBlocker>
+#include <QSpinBox>
 #include <QTabWidget>
 #include <QVBoxLayout>
 
-static QDoubleSpinBox* makeSpin(double lo, double hi, double step, double value, QWidget* parent) {
-    auto* s = new QDoubleSpinBox(parent);
-    s->setRange(lo, hi);
-    s->setSingleStep(step);
-    s->setValue(value);
-    return s;
-}
-
-PassDialog::PassDialog(ShmHeader* h, QWidget* parent) : QDialog(parent), hdr(h) {
-    setWindowTitle("Per-pass settings");
-    resize(420, 360);
+PassDialog::PassDialog(ShmHeader* header, QWidget* parent) : QDialog(parent), hdr(header) {
+    setWindowTitle("Per-pass model settings");
+    resize(460, 460);
 
     auto* root = new QVBoxLayout(this);
-    root->addWidget(new QLabel("Override global settings for individual passes.", this));
+    auto* note = new QLabel(
+        "A pass follows the global settings for anything it does not tick. These are read when that "
+        "pass's feature is built, so a change takes a moment to appear.",
+        this);
+    note->setWordWrap(true);
+    root->addWidget(note);
+
     tabs = new QTabWidget(this);
-    root->addWidget(tabs);
-
-    for (uint32_t i = 0; i < kMaxPasses; ++i) {
+    // Only the passes that can actually run are offered; the ceiling is a real limit, not a hint.
+    const uint32_t shown = hdr ? ShmPassCeiling(hdr) : kDefaultMaxPasses;
+    for (uint32_t i = 0; i < shown; ++i) {
         auto* page = new QWidget(tabs);
-        auto* form = new QFormLayout(page);
-        PassStrength ps = hdr ? ShmGetPassStrength(hdr, i) : PassStrength{};
-
-        rows[i].enabled = new QCheckBox("Override global settings", page);
-        rows[i].enabled->setChecked(hdr && hdr->pass[i].enabled.load());
-        form->addRow(rows[i].enabled);
-
-        rows[i].preset = new QComboBox(page);
-        rows[i].preset->addItem("DLSS5 Native", uint32_t(DLSS5_PRESET_NATIVE));
-        rows[i].preset->addItem("DLSS5 Natural", uint32_t(DLSS5_PRESET_NATURAL));
-        rows[i].preset->addItem("DLSS5 Cinematic", uint32_t(DLSS5_PRESET_CINEMATIC));
-        rows[i].preset->setCurrentIndex(int(ps.preset));
-        form->addRow("DLSS5 preset", rows[i].preset);
-
-        rows[i].intensity = makeSpin(0.0, 4.0, 0.05, ps.intensity, page);
-        rows[i].localTone = makeSpin(0.0, 4.0, 0.05, ps.localTone, page);
-        rows[i].localStructure = makeSpin(0.0, 4.0, 0.05, ps.localStructure, page);
-        rows[i].skinStructure = makeSpin(-1.0, 4.0, 0.05, ps.skinStructure, page);
-        rows[i].sharpness = makeSpin(0.0, 1.0, 0.05, ps.sharpness, page);
-
-        form->addRow("Intensity", rows[i].intensity);
-        form->addRow("Local tone", rows[i].localTone);
-        form->addRow("Local structure", rows[i].localStructure);
-        form->addRow("Skin structure", rows[i].skinStructure);
-        form->addRow("Sharpness", rows[i].sharpness);
-
-        const bool on = rows[i].enabled->isChecked();
-        rows[i].preset->setEnabled(on);
-        rows[i].intensity->setEnabled(on);
-        rows[i].localTone->setEnabled(on);
-        rows[i].localStructure->setEnabled(on);
-        rows[i].skinStructure->setEnabled(on);
-        rows[i].sharpness->setEnabled(on);
-
-        connect(rows[i].enabled, &QCheckBox::toggled, this, [this, i](bool checked) {
-            rows[i].preset->setEnabled(checked);
-            rows[i].intensity->setEnabled(checked);
-            rows[i].localTone->setEnabled(checked);
-            rows[i].localStructure->setEnabled(checked);
-            rows[i].skinStructure->setEnabled(checked);
-            rows[i].sharpness->setEnabled(checked);
-            writePass(int(i));
-        });
-        connect(rows[i].preset, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this, i] { writePass(int(i)); });
-        connect(rows[i].intensity, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, i] { writePass(int(i)); });
-        connect(rows[i].localTone, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, i] { writePass(int(i)); });
-        connect(rows[i].localStructure, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, i] { writePass(int(i)); });
-        connect(rows[i].skinStructure, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, i] { writePass(int(i)); });
-        connect(rows[i].sharpness, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this, i] { writePass(int(i)); });
-
+        buildPage(i, page);
         tabs->addTab(page, QString("Pass %1").arg(i + 1));
     }
+    root->addWidget(tabs);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, this);
+    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::accept);
     root->addWidget(buttons);
-    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::close);
-    connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
 }
 
-void PassDialog::writePass(int pass) {
-    if (!hdr || pass < 0 || pass >= int(kMaxPasses)) return;
-    auto& r = rows[uint32_t(pass)];
-    hdr->pass[uint32_t(pass)].enabled.store(r.enabled->isChecked() ? 1u : 0u);
-    hdr->pass[uint32_t(pass)].preset.store(r.preset->currentData().toUInt());
-    hdr->pass[uint32_t(pass)].intensityBits.store(FloatToBits(float(r.intensity->value())));
-    hdr->pass[uint32_t(pass)].localToneBits.store(FloatToBits(float(r.localTone->value())));
-    hdr->pass[uint32_t(pass)].localStructureBits.store(FloatToBits(float(r.localStructure->value())));
-    hdr->pass[uint32_t(pass)].skinStructureBits.store(FloatToBits(float(r.skinStructure->value())));
-    hdr->pass[uint32_t(pass)].sharpnessBits.store(FloatToBits(float(r.sharpness->value())));
+void PassDialog::buildPage(uint32_t pass, QWidget* page) {
+    auto* form = new QFormLayout(page);
+    if (!hdr) return;
+
+    const uint32_t mask = hdr->pass[pass].overrideMask.load();
+    PassControl& pc = hdr->pass[pass];
+
+    const auto addRow = [&](const QString& label, uint32_t bit, QWidget* value,
+                            std::function<uint32_t()> read, std::function<void(uint32_t)> write) {
+        auto* on = new QCheckBox(page);
+        on->setChecked((mask & bit) != 0);
+        value->setEnabled(on->isChecked());
+
+        auto* row = new QHBoxLayout;
+        row->addWidget(on);
+        row->addWidget(value, 1);
+        form->addRow(label, row);
+
+        Row r{ on, value, bit, std::move(read), std::move(write) };
+        rows[pass].push_back(r);
+
+        connect(on, &QCheckBox::toggled, this, [this, pass, value](bool checked) {
+            value->setEnabled(checked);
+            writePass(pass);
+        });
+    };
+
+    const auto makeFloat = [&](double lo, double hi, double step, uint32_t bits) {
+        auto* w = new QDoubleSpinBox(page);
+        w->setRange(lo, hi);
+        w->setSingleStep(step);
+        w->setValue(double(BitsToFloat(bits)));
+        connect(w, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+                [this, pass](double) { writePass(pass); });
+        return w;
+    };
+
+    auto* intensity = makeFloat(0.0, 4.0, 0.05, pc.intensityBits.load());
+    addRow("Intensity", kOverrideIntensity, intensity,
+           [intensity] { return FloatToBits(float(intensity->value())); }, {});
+
+    auto* structure = makeFloat(0.0, 4.0, 0.05, pc.localStructureBits.load());
+    addRow("Local structure", kOverrideLocalStructure, structure,
+           [structure] { return FloatToBits(float(structure->value())); }, {});
+
+    auto* tone = makeFloat(0.0, 4.0, 0.05, pc.localToneBits.load());
+    addRow("Local tone", kOverrideLocalTone, tone,
+           [tone] { return FloatToBits(float(tone->value())); }, {});
+
+    auto* skin = makeFloat(-1.0, 4.0, 0.05, pc.skinStructureBits.load());
+    addRow("Skin structure", kOverrideSkinStructure, skin,
+           [skin] { return FloatToBits(float(skin->value())); }, {});
+
+    auto* sharp = makeFloat(0.0, 1.0, 0.05, pc.sharpnessBits.load());
+    addRow("Sharpness", kOverrideSharpness, sharp,
+           [sharp] { return FloatToBits(float(sharp->value())); }, {});
+
+    auto* style = new QComboBox(page);
+    style->addItems({ "Default", "Natural", "Cinematic" });
+    style->setCurrentIndex(int(pc.style.load()));
+    connect(style, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+            [this, pass](int) { writePass(pass); });
+    addRow("Style", kOverrideStyle, style, [style] { return uint32_t(style->currentIndex()); }, {});
+
+    auto* preset = new QSpinBox(page);
+    preset->setRange(0, 15);
+    preset->setValue(int(pc.preset.load()));
+    connect(preset, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            [this, pass](int) { writePass(pass); });
+    addRow("Preset", kOverridePreset, preset, [preset] { return uint32_t(preset->value()); }, {});
+
+    auto* automask = new QCheckBox("on", page);
+    automask->setChecked(pc.autoMask.load() != 0);
+    connect(automask, &QCheckBox::toggled, this, [this, pass](bool) { writePass(pass); });
+    addRow("Auto skin mask", kOverrideAutoMask, automask,
+           [automask] { return automask->isChecked() ? 1u : 0u; }, {});
+}
+
+void PassDialog::writePass(uint32_t pass) {
+    if (!hdr || pass >= kMaxPasses) return;
+    PassControl& pc = hdr->pass[pass];
+
+    uint32_t mask = 0;
+    for (const Row& r : rows[pass]) {
+        if (!r.on->isChecked()) continue;
+        mask |= r.bit;
+        const uint32_t v = r.read();
+        switch (r.bit) {
+            case kOverrideIntensity: pc.intensityBits.store(v); break;
+            case kOverrideLocalStructure: pc.localStructureBits.store(v); break;
+            case kOverrideLocalTone: pc.localToneBits.store(v); break;
+            case kOverrideSkinStructure: pc.skinStructureBits.store(v); break;
+            case kOverrideSharpness: pc.sharpnessBits.store(v); break;
+            case kOverrideStyle: pc.style.store(v); break;
+            case kOverridePreset: pc.preset.store(v); break;
+            case kOverrideAutoMask: pc.autoMask.store(v); break;
+            default: break;
+        }
+    }
+    pc.overrideMask.store(mask);
     hdr->controlSeq.fetch_add(1);
+    // Every one of these is latched when the pass's feature is built, so the helper has to know to
+    // rebuild rather than carry on with a feature made from the old values.
+    hdr->tuningSeq.fetch_add(1);
 }

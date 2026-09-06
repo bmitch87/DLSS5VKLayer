@@ -6,11 +6,10 @@ PROG="${0##*/}"
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
-if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-  RUNTIME_DIR="$XDG_RUNTIME_DIR/dlssnr"
-else
-  RUNTIME_DIR="/tmp/dlssnr-$UID"
-fi
+# Not $XDG_RUNTIME_DIR: pressure-vessel hands a Steam game a private tmpfs there, so the game and
+# the helper would end up on two different shared-memory files. /tmp is bind-mounted into the
+# container. Must match ShmRuntimeDir() in common/shm_protocol.h.
+RUNTIME_DIR="/tmp/dlssnr-${DLSSNR_UID:-$UID}"
 
 CONFIG_DIR="$XDG_CONFIG_HOME/dlssnr"
 CONFIG_FILE="$CONFIG_DIR/config.ini"
@@ -90,6 +89,11 @@ load_config() {
   log="$(read_config_value log "$CONFIG_FILE")"
   dxvk_vendor="$(read_config_value dxvk_vendor "$CONFIG_FILE")"
   dxvk_device="$(read_config_value dxvk_device "$CONFIG_FILE")"
+  # A config written by an older build pins the mapping to $XDG_RUNTIME_DIR, which is exactly the
+  # path a Steam game cannot see. Treat that one value as if it had never been set.
+  if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ "$shm" = "$XDG_RUNTIME_DIR/dlssnr/shm.bin" ]; then
+    shm=""
+  fi
   [ -n "$shm" ] || shm="$SHM_FILE"
   [ -n "$log" ] || log="$LOG_FILE"
 }
@@ -217,6 +221,41 @@ detect_runner_probe() {
     fi
   done
   return 1
+}
+
+detect_shmctl() {
+  local d c
+  d="$(detect_install_dir)"
+  for c in \
+    "$d/build/dlssnr-shmctl" \
+    "$d/bin/dlssnr-shmctl" \
+    "$d/dlssnr-shmctl" \
+    "/usr/lib64/dlssnr/bin/dlssnr-shmctl" \
+    "/usr/lib/dlssnr/bin/dlssnr-shmctl" \
+    "/usr/bin/dlssnr-shmctl" \
+    "$HOME/.local/lib/dlssnr/bin/dlssnr-shmctl"; do
+    if [ -x "$c" ]; then
+      printf '%s' "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Read or write the shared-memory header.
+#
+# This used to be `dd bs=1 seek=20`, a hardcoded byte offset into a C++ struct. It was right for one
+# header layout and silently wrong for the next: what sat at offset 20 became the frame height, so
+# the line that stopped the helper would have corrupted the frame size instead. dlssnr-shmctl
+# includes the header and derives its own offsets.
+shm_control() {
+  local tool
+  tool="$(detect_shmctl || true)"
+  if [ -z "$tool" ]; then
+    echo "warning: dlssnr-shmctl not found; cannot $1 the shared-memory header" >&2
+    return 1
+  fi
+  "$tool" "$shm" "$1"
 }
 
 proton_score() {
@@ -508,7 +547,7 @@ cmd_start() {
   mkdir -p "$(dirname "$log")" "$(dirname "$shm")"
   ( umask 077; touch "$shm" )
   chmod 600 "$shm" 2>/dev/null || true
-  printf '\x00\x00\x00\x00' | dd of="$shm" bs=1 seek=20 count=4 conv=notrunc status=none 2>/dev/null || true
+  shm_control resume
 
   export WINEPREFIX="$WINE_PREFIX_DIR"
   export DLSSNR_SHM="$shm"
@@ -576,7 +615,7 @@ cmd_stop() {
   local pids pid
 
   if [ -f "$shm" ]; then
-    printf '\x01\x00\x00\x00' | dd of="$shm" bs=1 seek=20 count=4 conv=notrunc status=none 2>/dev/null || true
+    shm_control quit
   fi
 
   if running_pid; then
@@ -822,6 +861,13 @@ cmd_doctor() {
 
   printf 'runtime dir: %s\n' "$RUNTIME_DIR"
   if [ -w "$RUNTIME_DIR" ]; then echo "  ok"; else echo "  not writable"; ok=1; fi
+
+  # The mapping used to live here. A leftover from an older build is harmless in itself, but it is
+  # the thing a stale binary would still be talking to, so say so rather than let it puzzle anyone.
+  if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -e "$XDG_RUNTIME_DIR/dlssnr/shm.bin" ]; then
+    printf 'stale mapping: %s\n' "$XDG_RUNTIME_DIR/dlssnr/shm.bin"
+    echo "  left by an older build; remove it with: rm -rf $XDG_RUNTIME_DIR/dlssnr"
+  fi
 
   printf 'state dir: %s\n' "$STATE_DIR"
   if [ -w "$STATE_DIR" ]; then echo "  ok"; else echo "  not writable"; ok=1; fi

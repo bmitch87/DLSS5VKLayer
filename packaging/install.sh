@@ -74,12 +74,19 @@ else
   ln -sf ../lib/dlssnr/bin/runner_probe "$BINDIR/dlssnr-runner-probe"
 fi
 
-sed "s#/usr/lib64/dlssnr/layer/libVkLayer_NV_dlssnr.so#$LIBDIR/layer/libVkLayer_NV_dlssnr.so#" \
-  "$root/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.json" \
-  > "$MANIFEST_DIR/VK_LAYER_NV_dlssnr.json"
+for arch_manifest in "$root"/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.*.json; do
+  [ -f "$arch_manifest" ] || continue
+  sed -e "s#/usr/lib64/dlssnr/layer/#$LIBDIR/layer/#" \
+      -e "s#/usr/lib64/dlssnr/layer32/#$LIBDIR/layer32/#" \
+    "$arch_manifest" > "$MANIFEST_DIR/$(basename "$arch_manifest")"
+done
 
-chmod 755 "$BINDIR/dlssnr-helper" "$BINDIR/dlssnr-gui" "$LIBDIR/bin/runner_probe" 2>/dev/null || true
-chmod 755 "$LIBDIR/layer/libVkLayer_NV_dlssnr.so" 2>/dev/null || true
+# Older installs put a single, architecture-less manifest here. Left behind it would load the 64-bit
+# layer a second time under a different name.
+rm -f "$MANIFEST_DIR/VK_LAYER_NV_dlssnr.json"
+
+chmod 755 "$BINDIR/dlssnr-helper" "$BINDIR/dlssnr-gui" "$LIBDIR/bin/runner_probe" "$LIBDIR/bin/dlssnr-shmctl" 2>/dev/null || true
+chmod 755 "$LIBDIR/layer/libVkLayer_NV_dlssnr.so" "$LIBDIR/layer32/libVkLayer_NV_dlssnr.so" 2>/dev/null || true
 chmod 755 "$LIBDIR/helper/dlssnr_helper.exe" 2>/dev/null || true
 
 echo "installed DLSS5VKLayer to $LIBDIR"

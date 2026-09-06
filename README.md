@@ -26,7 +26,7 @@ This project is experimental. It is intended for local testing and research.
   - NVIDIA NGX binary import
 - XDG-aware paths:
   - config: `$XDG_CONFIG_HOME/dlssnr/config.ini`
-  - runtime/SHM/PID: `$XDG_RUNTIME_DIR/dlssnr/`, fallback `/tmp/dlssnr-$UID/`
+  - runtime/SHM/PID: `/tmp/dlssnr-$UID/` (not `$XDG_RUNTIME_DIR`, which Steam's container makes private)
   - logs/state: `$XDG_STATE_HOME/dlssnr/`, fallback `~/.local/state/dlssnr/`
   - managed prefix: `~/.local/share/dlssnr/prefix/`
 
@@ -67,13 +67,13 @@ The personal package variant includes these DLLs. Only redistribute the personal
 Public package:
 
 ```bash
-sudo rpm -Uvh dist/dlssnr-0.2.1-3.fc44.x86_64.rpm
+sudo rpm -Uvh dist/dlssnr-0.2.2-3.fc44.x86_64.rpm
 ```
 
 Personal package:
 
 ```bash
-sudo rpm -Uvh dist/dlssnr-personal-0.2.1-3.fc44.x86_64.rpm
+sudo rpm -Uvh dist/dlssnr-personal-0.2.2-3.fc44.x86_64.rpm
 ```
 
 `wine` is a recommended package, not a hard dependency, so Proton-only users are not forced to install host Wine.
@@ -83,8 +83,8 @@ sudo rpm -Uvh dist/dlssnr-personal-0.2.1-3.fc44.x86_64.rpm
 Extract the tarball:
 
 ```bash
-tar -xzf dist/dlssnr-0.2.1-3-linux-x86_64.tar.gz
-cd dlssnr-0.2.1-3-linux-x86_64
+tar -xzf dist/dlssnr-0.2.2-3-linux-x86_64.tar.gz
+cd dlssnr-0.2.2-3-linux-x86_64
 ```
 
 User install, no root required:
@@ -154,39 +154,31 @@ The layer is intended to coexist with the Steam overlay. If a game crashes durin
 
 ## Steam / Proton Containers
 
-Steam games run inside the Steam Linux Runtime / `pressure-vessel` container. By default, the container may not expose `$XDG_RUNTIME_DIR/dlssnr` to the game process, so the Vulkan layer and the helper can end up looking at different shared-memory files.
-
-Symptoms:
+Steam games run inside the Steam Linux Runtime / `pressure-vessel` container, which gives the game a
+**private** `tmpfs` at `$XDG_RUNTIME_DIR`. Anything the helper puts there is simply not present inside
+the game, so the layer would create its own empty mapping at a path that reads identically in the log
+and then wait forever for a helper that is answering on the other file:
 
 ```text
 [dlssnr-layer] [shm] attached /run/user/1000/dlssnr/shm.bin seq_req=0 seq_resp=0
-[dlssnr-layer] [shm] helper unresponsive, disabling
+[dlssnr-layer] [shm] no answer in 20 ms x4 (helper not running); passing frames through
 ```
 
-while the helper log only says it is waiting for frames.
+For that reason the mapping lives in **`/tmp/dlssnr-$UID/`**, which the container bind-mounts from the
+host. Nothing needs to be added to the launch options for this; `VKLayer_DLSS5=1 %command%` is enough.
 
-### Per-Game Fix
-
-Add this to the Steam game launch options:
-
-```text
-PRESSURE_VESSEL_FILESYSTEMS_RW="$XDG_RUNTIME_DIR/dlssnr" VKLayer_DLSS5=1 %command%
-```
-
-If you already use other `PRESSURE_VESSEL_FILESYSTEMS_RW` paths, keep them and append the DLSS5VKLayer runtime directory with a colon separator.
-
-### System-Wide Fix
-
-To avoid editing every game launch option, expose the directory to Steam and Proton globally:
+If you saw the symptom above with an older build, remove the mapping it left behind:
 
 ```bash
-mkdir -p ~/.config/environment.d
-printf '%s\n' 'PRESSURE_VESSEL_FILESYSTEMS_RW="${XDG_RUNTIME_DIR}/dlssnr"' > ~/.config/environment.d/99-dlssnr.conf
+rm -rf "$XDG_RUNTIME_DIR/dlssnr"
 ```
 
-Log out and log back in, or restart your user session, so Steam picks up the new environment.
+`dlssnr-helper doctor` reports a leftover if one is still there.
 
-If you use a custom `DLSSNR_SHM` path, expose the directory containing that file instead. For example:
+### Custom `DLSSNR_SHM` paths
+
+If you point `DLSSNR_SHM` somewhere else, that directory has to be visible inside the container as
+well. Either keep it under `/tmp`, or expose it:
 
 ```text
 PRESSURE_VESSEL_FILESYSTEMS_RW=/home/USERNAME/.local/share/dlssnr VKLayer_DLSS5=1 %command%
@@ -236,10 +228,10 @@ If you previously used an older build, remove stale shared-memory files:
 
 ```bash
 rm -f /tmp/dlssnr_shm.bin
-rm -f "${XDG_RUNTIME_DIR:-/tmp/dlssnr-$UID}/dlssnr/shm.bin"
+rm -rf "${XDG_RUNTIME_DIR:-/nonexistent}/dlssnr"
 ```
 
-Current builds use the XDG runtime path by default, so games and the helper should not need `DLSSNR_SHM` set manually. Steam games may still need the `PRESSURE_VESSEL_FILESYSTEMS_RW` bind mount described above.
+Current builds use `/tmp/dlssnr-$UID/shm.bin` by default, so neither games nor the helper need `DLSSNR_SHM` set manually -- including under Steam's container.
 
 Logs are written to the XDG state directory:
 
@@ -285,23 +277,25 @@ Start the GUI with:
 dlssnr-gui
 ```
 
-The main window has a global `DLSS5 preset` selector:
+Every setting is a row in the scrolling list, grouped by what it acts on. The model's own profile is
+under **Model**, as `Style`:
 
 ```text
-DLSS5 Native      maps to DLSSNR.Style 0
-DLSS5 Natural     maps to DLSSNR.Style 1
-DLSS5 Cinematic   maps to DLSSNR.Style 2
+Default     maps to DLSSNR.Style 0
+Natural     maps to DLSSNR.Style 1
+Cinematic   maps to DLSSNR.Style 2
 ```
 
-The Passes dialog has the same preset selector per pass. A pass preset applies when that pass overrides the global settings.
-
-The cogwheel button in the bottom-right corner opens the settings menu. It controls synthetic motion vectors:
+Motion vectors are under **Motion**:
 
 ```text
-Enable synthetic motion vectors
-Motion vector scale: Pixels (default), Normalized [-1, 1], UV [0, 1]
-Motion vector quality: Fast, Balanced (default), Quality
+Estimate motion vectors   on by default
+Motion quality            Fast, Balanced (default), Quality
+Motion units              Normalised, Pixels (default), UV 0..1
 ```
+
+The Passes dialog overrides settings for one pass at a time, field by field: each row has its own
+checkbox, and a field left unchecked follows the global value rather than restating it.
 
 Settings are written to shared memory and take effect on the next processed frame. Closing the GUI requests a helper stop, so the helper does not need to be stopped manually.
 
@@ -407,16 +401,14 @@ Add `--purge` to also remove user config, state, runtime data, and the managed p
 If the helper starts and immediately logs `shutting down`, update to `0.2.1-3` or newer and remove stale runtime state:
 
 ```bash
-rm -f "${XDG_RUNTIME_DIR:-/tmp/dlssnr-$UID}/dlssnr/shm.bin"
+rm -f "/tmp/dlssnr-$UID/shm.bin"
 ```
 
 If a Steam game crashes in `steamoverlayvulkanlayer.so`, update to `0.2.1-3` or newer.
 
-If a Steam/Proton game logs `[shm] helper unresponsive, disabling` while the helper is waiting for frames, bind the shared-memory directory into `pressure-vessel`:
-
-```text
-PRESSURE_VESSEL_FILESYSTEMS_RW="$XDG_RUNTIME_DIR/dlssnr" VKLayer_DLSS5=1 %command%
-```
+If a Steam/Proton game logs `no answer ... (helper not running)` while the helper is waiting for
+frames, it is on a different mapping than the helper -- see [Steam / Proton
+Containers](#steam--proton-containers).
 
 ## Important Notes
 

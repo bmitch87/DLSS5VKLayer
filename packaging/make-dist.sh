@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION="${DLSSNR_VERSION:-0.2.1}"
+VERSION="${DLSSNR_VERSION:-0.2.2}"
 RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)}"
 RELEASE="${RELEASE:-1}"
 DIST="dist"
@@ -12,6 +12,7 @@ export DLSSNR_SKIP_MANIFEST_INSTALL=1
 
 [ -f "$BUILD/dlssnr_helper.exe" ] || ./build.sh
 [ -f "$BUILD/runner_probe" ] || ./build.sh
+[ -f "$BUILD/dlssnr-shmctl" ] || ./build.sh
 [ -f "$BUILD/gui/dlssnr_gui" ] || ./build.sh
 
 mkdir -p "$DIST"
@@ -25,6 +26,7 @@ stage_variant() {
   rm -rf "$pkg_dir"
   mkdir -p \
     "$root/usr/lib64/dlssnr/layer" \
+    "$root/usr/lib64/dlssnr/layer32" \
     "$root/usr/lib64/dlssnr/helper" \
     "$root/usr/lib64/dlssnr/bin" \
     "$root/usr/lib64/dlssnr/dxvk/2.7.1" \
@@ -34,8 +36,13 @@ stage_variant() {
     "$root/usr/share/doc/dlssnr"
 
   cp "$BUILD/layer/libVkLayer_NV_dlssnr.so" "$root/usr/lib64/dlssnr/layer/"
+  # The 32-bit layer is optional: it only exists when a multilib toolchain was present at build time.
+  if [ -f "$BUILD/layer32/libVkLayer_NV_dlssnr.so" ]; then
+    cp "$BUILD/layer32/libVkLayer_NV_dlssnr.so" "$root/usr/lib64/dlssnr/layer32/"
+  fi
   cp "$BUILD/dlssnr_helper.exe" "$root/usr/lib64/dlssnr/helper/"
   cp "$BUILD/runner_probe" "$root/usr/lib64/dlssnr/bin/"
+  cp "$BUILD/dlssnr-shmctl" "$root/usr/lib64/dlssnr/bin/"
   cp "$BUILD/gui/dlssnr_gui" "$root/usr/bin/dlssnr-gui"
   cp dlssnr-helper "$root/usr/bin/dlssnr-helper"
   ln -sf ../lib64/dlssnr/bin/runner_probe "$root/usr/bin/dlssnr-runner-probe"
@@ -44,14 +51,27 @@ stage_variant() {
   cp packaging/dlssnr.desktop "$root/usr/share/applications/"
   cp packaging/install.sh packaging/uninstall.sh "$pkg_dir/"
 
-  sed "s#./libVkLayer_NV_dlssnr.so#/usr/lib64/dlssnr/layer/libVkLayer_NV_dlssnr.so#" \
+  # One manifest per architecture, each naming its own library and its own layer name. The loader
+  # keys implicit layers by name, so sharing one name means it keeps a single entry and then rejects
+  # it for the wrong word size -- which is why Steam's overlay is _32 beside _64.
+  sed -e "s#./libVkLayer_NV_dlssnr.so#/usr/lib64/dlssnr/layer/libVkLayer_NV_dlssnr.so#" \
+      -e 's#"implementation_version"#"library_arch": "64",\n    "implementation_version"#' \
     layer_linux/manifest/VK_LAYER_NV_dlssnr.json \
-    > "$root/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.json"
+    > "$root/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.x86_64.json"
+
+  if [ -f "$BUILD/layer32/libVkLayer_NV_dlssnr.so" ]; then
+    sed -e "s#./libVkLayer_NV_dlssnr.so#/usr/lib64/dlssnr/layer32/libVkLayer_NV_dlssnr.so#" \
+        -e 's#"VK_LAYER_NV_dlssnr"#"VK_LAYER_NV_dlssnr_32"#' \
+        -e 's#"implementation_version"#"library_arch": "32",\n    "implementation_version"#' \
+      layer_linux/manifest/VK_LAYER_NV_dlssnr.json \
+      > "$root/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.i686.json"
+  fi
 
   chmod 755 "$pkg_dir/install.sh" "$pkg_dir/uninstall.sh"
   chmod 755 "$root/usr/bin/dlssnr-helper" "$root/usr/bin/dlssnr-gui"
-  chmod 755 "$root/usr/lib64/dlssnr/bin/runner_probe"
+  chmod 755 "$root/usr/lib64/dlssnr/bin/runner_probe" "$root/usr/lib64/dlssnr/bin/dlssnr-shmctl"
   chmod 755 "$root/usr/lib64/dlssnr/layer/libVkLayer_NV_dlssnr.so"
+  chmod 755 "$root/usr/lib64/dlssnr/layer32/libVkLayer_NV_dlssnr.so" 2>/dev/null || true
   chmod 755 "$root/usr/lib64/dlssnr/helper/dlssnr_helper.exe"
 
   if [ "$variant" = "personal" ]; then
