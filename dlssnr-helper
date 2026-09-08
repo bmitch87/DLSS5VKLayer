@@ -284,10 +284,28 @@ detect_proton() {
     fi
   fi
 
-  for base in \
-    "${XDG_DATA_HOME:-$HOME/.local/share}/Steam/compatibilitytools.d" \
-    "$HOME/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d" \
-    "$HOME/snap/steam/common/.local/share/Steam/compatibilitytools.d"; do
+  # System-wide data dirs come last so user installs win score ties. The XDG defaults are
+  # always scanned, not just used as a fallback: Steam Runtime scrubs XDG_DATA_DIRS and points
+  # it at container paths, so trusting the variable alone would miss
+  # /usr/share/steam/compatibilitytools.d (CachyOS) when launched from %command%.
+  local bases="${XDG_DATA_HOME:-$HOME/.local/share}/Steam/compatibilitytools.d
+$HOME/.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d
+$HOME/snap/steam/common/.local/share/Steam/compatibilitytools.d
+/usr/local/share/steam/compatibilitytools.d
+/usr/share/steam/compatibilitytools.d"
+  local entry oldifs="$IFS"
+  IFS=':'
+  set -f
+  for entry in ${XDG_DATA_DIRS:-}; do
+    [ -n "$entry" ] || continue
+    [ "${entry#/}" != "$entry" ] || continue
+    bases="$bases
+$entry/steam/compatibilitytools.d"
+  done
+  set +f
+  IFS="$oldifs"
+
+  while IFS= read -r base; do
     [ -d "$base" ] || continue
     for dir in "$base"/*; do
       [ -x "$dir/proton" ] || continue
@@ -302,7 +320,9 @@ detect_proton() {
         best_score="$score"
       fi
     done
-  done
+  done <<EOF
+$bases
+EOF
   printf '%s' "$best"
 }
 
@@ -325,8 +345,9 @@ detect_wine() {
 detect_steam_root() {
   local d
   for d in \
-    "$HOME/.local/share/Steam" \
+    "${XDG_DATA_HOME:-$HOME/.local/share}/Steam" \
     "$HOME/.steam/steam" \
+    "$HOME/.steam/root" \
     "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
     if [ -d "$d" ]; then
       printf '%s' "$d"

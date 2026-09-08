@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _enable_debug_packages 0
 %global _include_debuginfo_sources 0
-%global pkg_release 4
+%global pkg_release 5
 
 Name:           dlssnr-personal
 Version:        0.2.5
@@ -80,6 +80,16 @@ fi
 /sbin/ldconfig || :
 
 %changelog
+* Tue Sep 08 2026 DLSS5VKLayer - 0.2.5-5
+- Runner discovery: system-wide compatibility tools are now found. On top of the per-user dirs, every
+  directory in $XDG_DATA_DIRS and the XDG defaults /usr/local/share and /usr/share are scanned -- the
+  defaults always, not merely as a fallback, because Steam Runtime rewrites XDG_DATA_DIRS inside its
+  container. This is where CachyOS ships Proton-CachyOS (/usr/share/steam/compatibilitytools.d), and
+  the XDG_DATA_DIRS scan covers other distro layouts (NixOS, custom prefixes) without further edits.
+  User dirs are scanned first and the sort is stable, so a user-installed tool wins a name/score tie
+  against a system copy. runner_probe and the dlssnr-helper shell fallback were updated in lockstep.
+- Helper: detect_steam_root now honours $XDG_DATA_HOME and also checks ~/.steam/root.
+
 * Tue Sep 08 2026 DLSS5VKLayer - 0.2.5-4
 - Helper: the nvapi64.dll load is now exception-guarded and skipped when the runner already supplies
   NVAPI (the launcher sets DLSSNR_SKIP_NVAPI for Proton, where DXVK-NVAPI answers NVAPI). Forcing the

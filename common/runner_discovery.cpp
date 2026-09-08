@@ -120,7 +120,24 @@ std::vector<RunnerInfo> discoverCustomRunners() {
     scanCompatibilityTools(fs::path(home) / ".var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d", runners);
     scanCompatibilityTools(fs::path(home) / "snap/steam/common/.local/share/Steam/compatibilitytools.d", runners);
 
-    std::sort(runners.begin(), runners.end(), [](const RunnerInfo& a, const RunnerInfo& b) {
+    // System-wide data dirs, scanned after the user dirs so user installs win score ties.
+    // The XDG defaults are always included, not just used as a fallback: Steam Runtime scrubs
+    // XDG_DATA_DIRS and points it at container paths, so trusting the variable alone would
+    // miss /usr/share/steam/compatibilitytools.d (CachyOS) when launched from %command%.
+    std::vector<std::string> dataDirs{"/usr/local/share", "/usr/share"};
+    if (const char* env = std::getenv("XDG_DATA_DIRS")) {
+        std::stringstream ss(env);
+        std::string dir;
+        while (std::getline(ss, dir, ':')) {
+            if (dir.empty() || dir[0] != '/') continue;
+            dataDirs.push_back(dir);
+        }
+    }
+    for (const auto& dir : dataDirs) {
+        scanCompatibilityTools(fs::path(dir) / "steam" / "compatibilitytools.d", runners);
+    }
+
+    std::stable_sort(runners.begin(), runners.end(), [](const RunnerInfo& a, const RunnerInfo& b) {
         if (a.score != b.score) return a.score > b.score;
         return a.name < b.name;
     });
