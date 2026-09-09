@@ -10,8 +10,8 @@ name: Build
 #   revision  X.Y.Z-R+1  (version untouched, release +1)
 #   none      rebuild the current version as-is (non-incrementing)
 #
-# After all builds succeed, the bumped version is pushed as a git tag
-# (e.g. v1.0.0-1). Nothing is committed back to any branch.
+# After all builds succeed, the new version is committed back to the branch
+# (both spec files) and pushed as a git tag (e.g. v1.0.0-1).
 # Publish via the separate manual release-draft workflow.
 on:
   workflow_dispatch:
@@ -290,8 +290,8 @@ jobs:
             dist/*.deb
             !dist/dlssnr-personal*
 
-  # ---- Tag the bumped version (no commits back) ----------------------------
-  tag:
+  # ---- Commit the new version, then tag it ----------------------------------
+  publish:
     needs: [version, tarball, fedora, ubuntu, debian]
     runs-on: ubuntu-latest
     steps:
@@ -299,15 +299,36 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Commit spec version bump (skip if already current)
+        run: |
+          VER="${{ needs.version.outputs.version }}"
+          REL="${{ needs.version.outputs.release }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          for spec in packaging/dlssnr.spec packaging/dlssnr-personal.spec; do
+            sed -i "s/^%{!?dlssnr_version: %global dlssnr_version [^}]*}/%{!?dlssnr_version: %global dlssnr_version $VER}/" "$spec"
+            sed -i "s/^%{!?dlssnr_release: %global dlssnr_release [^}]*}/%{!?dlssnr_release: %global dlssnr_release $REL}/" "$spec"
+            grep -q "dlssnr_version $VER}" "$spec" || { echo "error: version sed missed $spec" >&2; exit 1; }
+            grep -q "dlssnr_release $REL}" "$spec" || { echo "error: release sed missed $spec" >&2; exit 1; }
+          done
+          if git diff --quiet -- packaging/; then
+            echo "Specs already at $VER-$REL, nothing to commit"
+          else
+            git diff -- packaging/
+            git commit -m "Bump version to $VER-$REL" -- packaging/
+            git pull --rebase origin "${{ github.ref_name }}"
+            git push origin "HEAD:${{ github.ref_name }}"
+            echo "Committed $VER-$REL"
+          fi
+
       - name: Push version tag unless it exists
         run: |
           TAG="${{ needs.version.outputs.tag }}"
+          git fetch origin "refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             echo "Tag $TAG already exists, skipping"
           else
-            git -c user.name="github-actions[bot]" \
-                -c user.email="github-actions[bot]@users.noreply.github.com" \
-                tag -a "$TAG" -m "dlssnr ${{ needs.version.outputs.version }}-${{ needs.version.outputs.release }}"
+            git tag -a "$TAG" -m "dlssnr ${{ needs.version.outputs.version }}-${{ needs.version.outputs.release }}"
             git push origin "refs/tags/$TAG"
             echo "Pushed tag $TAG"
           fi
