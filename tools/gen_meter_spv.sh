@@ -3,8 +3,8 @@
 # layer_linux/src/shaders/meter_reduce.comp.
 #
 # Needs glslang (the distro 'glslang' package or a release), or build/glsl2spv
-# (built by build.sh) which dlopens libshaderc_shared. The generated header is
-# committed, so build.sh does not require either one.
+# (built separately) which dlopens libshaderc_shared. The generated header is
+# committed, so the normal Meson build does not require either one.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

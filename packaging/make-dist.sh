@@ -19,18 +19,25 @@ case "$VARIANTS" in
     *) echo "error: DLSSNR_VARIANTS must be public, personal or both" >&2; exit 1 ;;
 esac
 
-VERSION="${DLSSNR_VERSION:-$(sed -n 's/^Version:[[:space:]]*//p' packaging/dlssnr.spec | head -1)}"
+VERSION="${DLSSNR_VERSION:-$(sed -n 's/^%{!?dlssnr_version: %global dlssnr_version \([^}]*\)}.*/\1/p' packaging/dlssnr.spec | head -1)}"
 VERSION="${VERSION:-0.2.5}"
 RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%{!?dlssnr_release: %global dlssnr_release \([^}]*\)}.*/\1/p' packaging/dlssnr.spec | head -1)}"
 RELEASE="${RELEASE:-1}"
 DIST="dist"
 BUILD="${DLSSNR_BUILD_DIR:-build}"
+NATIVE_BUILD="$BUILD/native"
+LINUX32_BUILD="$BUILD/linux32"
+WINDOWS_BUILD="$BUILD/windows"
 export DLSSNR_SKIP_MANIFEST_INSTALL=1
 
-[ -f "$BUILD/dlssnr_helper.exe" ] || ./build.sh
-[ -f "$BUILD/runner_probe" ] || ./build.sh
-[ -f "$BUILD/dlssnr-shmctl" ] || ./build.sh
-[ -f "$BUILD/gui/dlssnr_gui" ] || ./build.sh
+if [ ! -f "$NATIVE_BUILD/layer_linux/libVkLayer_NV_dlssnr.so" ] ||
+   [ ! -f "$LINUX32_BUILD/layer_linux/libVkLayer_NV_dlssnr.so" ] ||
+   [ ! -f "$WINDOWS_BUILD/windows/dlssnr_helper.exe" ] ||
+   [ ! -f "$NATIVE_BUILD/tools/runner_probe" ] ||
+   [ ! -f "$NATIVE_BUILD/tools/dlssnr-shmctl" ] ||
+   [ ! -f "$NATIVE_BUILD/gui/dlssnr_gui" ]; then
+    DLSSNR_BUILD_ROOT="$BUILD" tools/meson-build.sh
+fi
 
 mkdir -p "$DIST"
 
@@ -52,15 +59,15 @@ stage_variant() {
     "$root/usr/share/applications" \
     "$root/usr/share/doc/dlssnr"
 
-  cp "$BUILD/layer/libVkLayer_NV_dlssnr.so" "$root/usr/lib64/dlssnr/layer/"
+  cp "$NATIVE_BUILD/layer_linux/libVkLayer_NV_dlssnr.so" "$root/usr/lib64/dlssnr/layer/"
   # The 32-bit layer is optional: it only exists when a multilib toolchain was present at build time.
-  if [ -f "$BUILD/layer32/libVkLayer_NV_dlssnr.so" ]; then
-    cp "$BUILD/layer32/libVkLayer_NV_dlssnr.so" "$root/usr/lib64/dlssnr/layer32/"
+  if [ -f "$LINUX32_BUILD/layer_linux/libVkLayer_NV_dlssnr.so" ]; then
+    cp "$LINUX32_BUILD/layer_linux/libVkLayer_NV_dlssnr.so" "$root/usr/lib64/dlssnr/layer32/"
   fi
-  cp "$BUILD/dlssnr_helper.exe" "$root/usr/lib64/dlssnr/helper/"
-  cp "$BUILD/runner_probe" "$root/usr/lib64/dlssnr/bin/"
-  cp "$BUILD/dlssnr-shmctl" "$root/usr/lib64/dlssnr/bin/"
-  cp "$BUILD/gui/dlssnr_gui" "$root/usr/bin/dlssnr-gui"
+  cp "$WINDOWS_BUILD/windows/dlssnr_helper.exe" "$root/usr/lib64/dlssnr/helper/"
+  cp "$NATIVE_BUILD/tools/runner_probe" "$root/usr/lib64/dlssnr/bin/"
+  cp "$NATIVE_BUILD/tools/dlssnr-shmctl" "$root/usr/lib64/dlssnr/bin/"
+  cp "$NATIVE_BUILD/gui/dlssnr_gui" "$root/usr/bin/dlssnr-gui"
   cp dlssnr-helper "$root/usr/bin/dlssnr-helper"
   ln -sf ../lib64/dlssnr/bin/runner_probe "$root/usr/bin/dlssnr-runner-probe"
   ln -sf ../lib64/dlssnr/bin/dlssnr-shmctl "$root/usr/bin/dlssnr-shmctl"
@@ -77,7 +84,7 @@ stage_variant() {
     layer_linux/manifest/VK_LAYER_NV_dlssnr.json \
     > "$root/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.x86_64.json"
 
-  if [ -f "$BUILD/layer32/libVkLayer_NV_dlssnr.so" ]; then
+  if [ -f "$LINUX32_BUILD/layer_linux/libVkLayer_NV_dlssnr.so" ]; then
     sed -e "s#./libVkLayer_NV_dlssnr.so#/usr/lib64/dlssnr/layer32/libVkLayer_NV_dlssnr.so#" \
         -e 's#"VK_LAYER_NV_dlssnr"#"VK_LAYER_NV_dlssnr_32"#' \
         -e 's#"implementation_version"#"library_arch": "32",\n    "implementation_version"#' \

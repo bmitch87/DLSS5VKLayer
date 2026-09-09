@@ -560,7 +560,7 @@ static std::string LayerObjectPath() {
 
 // True when a *different* copy of this layer is already in the chain.
 //
-// build.sh installs an implicit-layer manifest pointing at the build tree while install.sh installs
+// Local packaging installs an implicit-layer manifest pointing at the build tree while install.sh installs
 // another pointing at the install prefix, and the loader honours both: two copies of the layer, two
 // present hooks, two full round trips, and a single shared-memory file with two writers racing on
 // one sequence number. Only the first copy stays live; the rest declare themselves inert and pass

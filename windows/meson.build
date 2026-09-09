@@ -1,0 +1,24 @@
+windows_inc = include_directories('../standalone_runner/third_party', '../core')
+windows_cpp_link_args = [
+  '-static',
+  '-nostdlib++',
+  '-Wl,--start-group',
+  '-lstdc++',
+  '-lwinpthread',
+  '-Wl,--end-group',
+]
+
+executable('dlssnr_helper',
+  '../helper/main.cpp',
+  '../core/ngx_snippet.cpp',
+  '../core/guard.cpp',
+  include_directories: windows_inc,
+  link_args: windows_cpp_link_args + ['-mwindows'],
+  install: false,
+)
+
+executable('smoke', '../test_layer/smoke.cpp',
+  include_directories: windows_inc,
+  link_args: windows_cpp_link_args,
+  install: false,
+)

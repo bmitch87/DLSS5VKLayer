@@ -80,7 +80,7 @@ jobs:
       - name: Install build dependencies
         run: |
           dnf install -y \
-            gcc gcc-c++ clang make \
+            clang llvm meson ninja-build \
             glibc-devel kernel-headers libstdc++-devel \
             libX11-devel libXi-devel libXext-devel libXrandr-devel \
             mingw64-gcc-c++ \
@@ -91,10 +91,10 @@ jobs:
             git-core bash tar gzip
 
       - name: Verify 32-bit toolchain
-        # Same test build.sh uses, but with stderr visible: if -m32 is broken
+        # Keep the required 32-bit Clang environment visible in CI: if -m32 is broken
         # this fails loudly with the real error instead of silently skipping
         # the 32-bit layer later.
-        run: echo 'int main(){return 0;}' | g++ -m32 -x c++ - -o /dev/null
+        run: echo 'int main(){return 0;}' | clang++ -m32 -x c++ - -o /dev/null
 
       - name: Build tarball (public variant only)
         env:
@@ -102,7 +102,7 @@ jobs:
           DLSSNR_VARIANTS: public
           DLSSNR_VERSION: ${{ needs.version.outputs.version }}
           DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./build.sh --tar
+        run: tools/meson-build.sh && ./packaging/make-dist.sh tar
 
       - name: List artifacts
         run: ls -l dist/
@@ -127,7 +127,7 @@ jobs:
       - name: Install build dependencies
         run: |
           dnf install -y \
-            gcc gcc-c++ clang make \
+            clang llvm meson ninja-build \
             glibc-devel kernel-headers libstdc++-devel \
             libX11-devel libXi-devel libXext-devel libXrandr-devel \
             mingw64-gcc-c++ \
@@ -139,10 +139,10 @@ jobs:
             git-core bash tar gzip
 
       - name: Verify 32-bit toolchain
-        # Same test build.sh uses, but with stderr visible: if -m32 is broken
+        # Keep the required 32-bit Clang environment visible in CI: if -m32 is broken
         # this fails loudly with the real error instead of silently skipping
         # the 32-bit layer later.
-        run: echo 'int main(){return 0;}' | g++ -m32 -x c++ - -o /dev/null
+        run: echo 'int main(){return 0;}' | clang++ -m32 -x c++ - -o /dev/null
 
       # NOTE: --dist still stages the tarball internally (the RPM installs it
       # as its payload), but only the .rpm is uploaded -- the generic tarball
@@ -153,7 +153,7 @@ jobs:
           DLSSNR_VARIANTS: public
           DLSSNR_VERSION: ${{ needs.version.outputs.version }}
           DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./build.sh --dist
+        run: tools/meson-build.sh && ./packaging/make-dist.sh rpm
 
       - name: Smoke-check RPM contents
         run: |
@@ -179,10 +179,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            g++ g++-multilib make \
+            clang llvm meson ninja-build g++-multilib \
             g++-mingw-w64-x86-64 \
-            qt6-base-dev qt6-base-dev-tools qmake6 \
-            clang \
+            qt6-base-dev qt6-base-dev-tools \
             libx11-dev libxi-dev libxext-dev libxrandr-dev \
             pciutils \
             pkg-config \
@@ -195,7 +194,7 @@ jobs:
           DLSSNR_VARIANTS: public
           DLSSNR_VERSION: ${{ needs.version.outputs.version }}
           DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./build.sh --tar
+        run: tools/meson-build.sh && ./packaging/make-dist.sh tar
 
       - name: Build .deb package (public variant only)
         env:
@@ -241,10 +240,9 @@ jobs:
         run: |
           apt-get update
           apt-get install -y \
-            g++ g++-multilib make \
+            clang llvm meson ninja-build g++-multilib \
             g++-mingw-w64-x86-64 \
-            qt6-base-dev qt6-base-dev-tools qmake6 \
-            clang \
+            qt6-base-dev qt6-base-dev-tools \
             libx11-dev libxi-dev libxext-dev libxrandr-dev \
             pciutils \
             pkg-config \
@@ -257,7 +255,7 @@ jobs:
           DLSSNR_VARIANTS: public
           DLSSNR_VERSION: ${{ needs.version.outputs.version }}
           DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./build.sh --tar
+        run: tools/meson-build.sh && ./packaging/make-dist.sh tar
 
       - name: Build .deb package (public variant only)
         env:

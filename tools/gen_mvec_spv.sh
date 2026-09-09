@@ -8,8 +8,8 @@
 #
 # Needs glslang (https://github.com/KhronosGroup/glslang releases, or the
 # distro 'glslang' package). Without the CLI, tools/glsl2spv -- built by
-# build.sh -- dlopens libshaderc_shared and fills the same role. The generated
-# header is committed, so build.sh does not require either one.
+# glsl2spv -- dlopens libshaderc_shared and fills the same role. The generated
+# header is committed, so the normal Meson build does not require either one.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
