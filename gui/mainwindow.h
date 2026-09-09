@@ -108,4 +108,5 @@ private:
 
     ShmBinder* binder = nullptr;
     QString lastSettingsBlob;
+    QString lastProfilePath;
 };

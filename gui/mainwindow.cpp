@@ -4,6 +4,7 @@
 #include "shm_binder.h"
 #include "../layer_linux/src/hotkey.h"
 
+#include <QAbstractItemView>
 #include <QAction>
 #include <QActionGroup>
 #include <QCheckBox>
@@ -17,6 +18,7 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
@@ -33,6 +35,7 @@
 #include <QSpinBox>
 #include <QStandardPaths>
 #include <QStyle>
+#include <QStyleOptionComboBox>
 #include <QTabWidget>
 #include <QTextStream>
 #include <QTimer>
@@ -50,6 +53,40 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+// Size the profile combo to its current entry, capped at 200px so a long profile
+// name can't crowd the buttons beside it.
+static void fitProfileCombo(QComboBox* combo) {
+    const QFontMetrics fm(combo->font());
+    const int w = fm.horizontalAdvance(combo->currentText());
+    QStyleOptionComboBox opt;
+    opt.initFrom(combo);
+    combo->setFixedWidth(qMin(
+        combo->style()->sizeFromContents(QStyle::CT_ComboBox, &opt,
+                                         QSize(w, fm.height()), combo).width(),
+        200));
+}
+
+// Pixels of text width the profile combo leaves for a name inside its 200px cap.
+static int profileTextPixelBudget(const QComboBox* combo) {
+    const QFontMetrics fm(combo->font());
+    QStyleOptionComboBox opt;
+    opt.initFrom(const_cast<QComboBox*>(combo));
+    const int chrome = combo->style()->sizeFromContents(
+        QStyle::CT_ComboBox, &opt, QSize(0, fm.height()), combo).width();
+    return qMax(fm.horizontalAdvance(QLatin1Char('W')), 200 - chrome);
+}
+
+// Widen the dropdown so the longest entry is never elided: the popup's item rect
+// loses a little room to the frame and margins, so reserve that. The reserve is
+// deliberately small so the popup stays within the window's width.
+static void fitProfilePopup(QComboBox* combo) {
+    const QFontMetrics fm(combo->font());
+    int longest = 0;
+    for (int i = 0; i < combo->count(); ++i)
+        longest = qMax(longest, fm.horizontalAdvance(combo->itemText(i)));
+    combo->view()->setMinimumWidth(longest + 24);
+}
 
 static QIcon gearIcon(const QWidget* w) {
     QIcon icon = QIcon::fromTheme("preferences-system-symbolic", QIcon::fromTheme("preferences-system"));
@@ -199,7 +236,6 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     startBtn = new QPushButton("Start helper", this);
     stopBtn = new QPushButton("Stop helper", this);
     profileCombo = new QComboBox(this);
-    profileCombo->setMinimumWidth(200);
     profileCombo->setToolTip("Select a saved profile to load, or choose '(default)' to reset.");
     profileSaveBtn = new QPushButton("Save", this);
     profileSaveBtn->setToolTip("Save current settings to the selected profile.");
@@ -211,6 +247,9 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     root->addLayout(buttons);
 
     refreshProfileList();
+    // Re-fit once the window is shown: the font (and thus the metrics) the style
+    // settles on can differ from the app default used during construction.
+    QTimer::singleShot(0, this, [this] { fitProfileCombo(profileCombo); });
 
     root->addWidget(buildSettings(), 1);
 
@@ -289,6 +328,8 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     connect(stopBtn, &QPushButton::clicked, this, &MainWindow::stopHelper);
     connect(profileSaveBtn, &QPushButton::clicked, this, &MainWindow::saveSettingsToFile);
     connect(profileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
+        fitProfileCombo(profileCombo);
+        lastProfilePath = (idx == 0) ? QString() : profileCombo->itemData(idx).toString();
         if (idx == 0) { applyDefaults(); return; }  // "(default)" — reset to defaults
         const QString path = profileCombo->itemData(idx).toString();
         loadSettingsFromFile(path);
@@ -473,6 +514,7 @@ void MainWindow::loadConfig() {
         else if (key == "dxvk_device") dxvkDevice = value;
         else if (key == "window_width") windowW = value.toInt();
         else if (key == "window_height") windowH = value.toInt();
+        else if (key == "profile") lastProfilePath = value;
         else if (key.startsWith("set_")) pendingSettings.append({key, value});
     }
 }
@@ -494,6 +536,7 @@ void MainWindow::saveConfig() {
     out << "dxvk_device=" << dxvkDevice << "\n";
     out << "window_width=" << (isVisible() ? width() : windowW) << "\n";
     out << "window_height=" << (isVisible() ? height() : windowH) << "\n";
+    out << "profile=" << lastProfilePath << "\n";
     if (hdr) {
         for (const SettingEntry& e : kSettingsTable)
             out << e.key << "=" << settingText(e, (hdr->*e.field).load()) << "\n";
@@ -581,8 +624,15 @@ void MainWindow::refreshProfileList() {
     const QStringList files = dir.entryList(QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
     for (const QString& f : files) {
         if (f.endsWith(".ini", Qt::CaseInsensitive))
-            profileCombo->addItem(f, dir.absoluteFilePath(f));
+            profileCombo->addItem(f.left(f.size() - 4), dir.absoluteFilePath(f));
     }
+    // Reopen on the profile the last session had selected. The signal is blocked here, so this
+    // only moves the dropdown; the settings themselves come back via the config's set_* keys.
+    const int saved = lastProfilePath.isEmpty() ? -1 : profileCombo->findData(lastProfilePath);
+    if (saved > 0)
+        profileCombo->setCurrentIndex(saved);
+    fitProfileCombo(profileCombo);
+    fitProfilePopup(profileCombo);
 }
 
 // Save settings: always prompt for a profile name, pre-populated with the selected profile.
@@ -596,11 +646,33 @@ void MainWindow::saveSettingsToFile() {
     const QString prompt = (profileCombo->currentIndex() == 0)
                            ? "" : profileCombo->currentText();
 
-    bool ok = false;
-    const QString name = QInputDialog::getText(
-        this, "Save profile", "Profile name:", QLineEdit::Normal,
-        prompt, &ok);
-    if (!ok || name.trimmed().isEmpty()) return;
+    QInputDialog dlg(this);
+    dlg.setWindowTitle("Save profile");
+    dlg.setLabelText("Profile name:");
+    dlg.setInputMode(QInputDialog::TextInput);
+    dlg.setTextValue(prompt);
+    if (auto* edit = dlg.findChild<QLineEdit*>()) {
+        // Cap by rendered width, not character count, and by whichever box is
+        // tighter: the entry field itself or the combo's 200px budget.
+        const QFontMetrics fm(edit->font());
+        const int comboAvail = profileTextPixelBudget(profileCombo);
+        edit->setMaxLength(200);
+        QString accepted = edit->text();
+        connect(edit, &QLineEdit::textChanged, edit,
+                [edit, fm, comboAvail, accepted](const QString& t) mutable {
+            const int avail = qMin(edit->contentsRect().width() - 8, comboAvail);
+            if (fm.horizontalAdvance(t) > avail) {
+                const QSignalBlocker block(edit);
+                edit->setText(accepted);
+                edit->end(false);
+                return;
+            }
+            accepted = t;
+        });
+    }
+    if (dlg.exec() != QDialog::Accepted) return;
+    const QString name = dlg.textValue();
+    if (name.trimmed().isEmpty()) return;
 
     QString fileName = name.trimmed();
     if (!fileName.endsWith(".ini", Qt::CaseInsensitive))
@@ -619,15 +691,19 @@ void MainWindow::saveSettingsToFile() {
     for (const SettingEntry& e : kSettingsTable)
         out << e.key << "=" << settingText(e, (hdr->*e.field).load()) << "\n";
 
-    // Add or update the profile in the dropdown and select it.
-    int existing = profileCombo->findText(fileName);
+    // Add or update the profile in the dropdown and select it. The dropdown shows the
+// bare name; the ".ini" suffix lives only in the file on disk.
+    const QString display = fileName.left(fileName.size() - 4);
+    int existing = profileCombo->findText(display);
     if (existing < 0) {
-        profileCombo->addItem(fileName, path);
+        profileCombo->addItem(display, path);
         profileCombo->setCurrentIndex(profileCombo->count() - 1);
     } else {
         profileCombo->setItemData(existing, path);
         profileCombo->setCurrentIndex(existing);
     }
+    fitProfileCombo(profileCombo);
+    fitProfilePopup(profileCombo);
 }
 
 // Load settings from a specific file path and apply them immediately.
