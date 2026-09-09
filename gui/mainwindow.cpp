@@ -19,6 +19,7 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QLabel>
 #include <QIcon>
 #include <QLineEdit>
@@ -197,9 +198,19 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     auto* buttons = new QHBoxLayout;
     startBtn = new QPushButton("Start helper", this);
     stopBtn = new QPushButton("Stop helper", this);
+    profileCombo = new QComboBox(this);
+    profileCombo->setMinimumWidth(200);
+    profileCombo->setToolTip("Select a saved profile to load, or choose '(default)' to reset.");
+    profileSaveBtn = new QPushButton("Save", this);
+    profileSaveBtn->setToolTip("Save current settings to the selected profile.");
     buttons->addWidget(startBtn);
     buttons->addWidget(stopBtn);
+    buttons->addStretch(1);
+    buttons->addWidget(profileCombo);
+    buttons->addWidget(profileSaveBtn);
     root->addLayout(buttons);
+
+    refreshProfileList();
 
     root->addWidget(buildSettings(), 1);
 
@@ -276,6 +287,12 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
 
     connect(startBtn, &QPushButton::clicked, this, &MainWindow::startHelper);
     connect(stopBtn, &QPushButton::clicked, this, &MainWindow::stopHelper);
+    connect(profileSaveBtn, &QPushButton::clicked, this, &MainWindow::saveSettingsToFile);
+    connect(profileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int idx) {
+        if (idx == 0) { applyDefaults(); return; }  // "(default)" — reset to defaults
+        const QString path = profileCombo->itemData(idx).toString();
+        loadSettingsFromFile(path);
+    });
     connect(runnerCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &MainWindow::applyRunnerSelection);
     connect(runnerPathEdit, &QLineEdit::editingFinished, this, [this] {
         runnerPath = runnerPathEdit->text().trimmed();
@@ -358,6 +375,14 @@ QString MainWindow::findHelperCli() const {
 QString MainWindow::configPath() const {
     const QString base = qEnvironmentVariable("XDG_CONFIG_HOME", QDir::homePath() + "/.config");
     return base + "/dlssnr/config.ini";
+}
+
+// Returns ~/.config/dlssnr/profiles/ for saving/loading setting profiles.
+QString MainWindow::profilesDir() const {
+    const QString dir = qEnvironmentVariable("XDG_CONFIG_HOME", QDir::homePath() + "/.config")
+                        + "/dlssnr/profiles";
+    QDir().mkpath(dir);
+    return dir;
 }
 
 // Must match DATA_DIR in dlssnr-helper, so the GUI and the CLI import into and read from the same
@@ -526,6 +551,11 @@ void MainWindow::resetAllSettings() {
                               "Reset every setting to its default? The helper will rebuild its "
                               "features from the defaults.") != QMessageBox::Yes)
         return;
+    applyDefaults();
+}
+
+// Apply factory defaults directly (no confirmation dialog).
+void MainWindow::applyDefaults() {
     if (!hdr) return;
     ShmInitDefaults(hdr);
     hdr->controlSeq.fetch_add(1);
@@ -536,6 +566,108 @@ void MainWindow::resetAllSettings() {
         QSignalBlocker block(rebuildSpin);
         rebuildSpin->setValue(int(hdr->rebuildSettleMs.load()));
     }
+    updateCompositionVisibility();
+    lastSettingsBlob = settingsBlob();
+    saveConfig();
+}
+
+// Refresh the profile combo box with all .ini files in the profiles directory.
+void MainWindow::refreshProfileList() {
+    const QSignalBlocker blocker(profileCombo);
+    profileCombo->clear();
+    profileCombo->addItem("(default)", QVariant());
+
+    const QDir dir(profilesDir());
+    const QStringList files = dir.entryList(QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
+    for (const QString& f : files) {
+        if (f.endsWith(".ini", Qt::CaseInsensitive))
+            profileCombo->addItem(f, dir.absoluteFilePath(f));
+    }
+}
+
+// Save settings: always prompt for a profile name, pre-populated with the selected profile.
+void MainWindow::saveSettingsToFile() {
+    if (!hdr) {
+        QMessageBox::warning(this, "DLSS5VKLayer", "Shared memory not attached yet.");
+        return;
+    }
+
+    // Pre-populate with the current profile name; empty when "(default)" is selected.
+    const QString prompt = (profileCombo->currentIndex() == 0)
+                           ? "" : profileCombo->currentText();
+
+    bool ok = false;
+    const QString name = QInputDialog::getText(
+        this, "Save profile", "Profile name:", QLineEdit::Normal,
+        prompt, &ok);
+    if (!ok || name.trimmed().isEmpty()) return;
+
+    QString fileName = name.trimmed();
+    if (!fileName.endsWith(".ini", Qt::CaseInsensitive))
+        fileName += ".ini";
+    const QString path = profilesDir() + "/" + fileName;
+
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
+        QMessageBox::warning(this, "DLSS5VKLayer",
+                             "Could not write to:\n" + path);
+        return;
+    }
+    QTextStream out(&f);
+    out << "# DLSS5VKLayer settings\n";
+    out << "# Generated by dlssnr_gui\n\n";
+    for (const SettingEntry& e : kSettingsTable)
+        out << e.key << "=" << settingText(e, (hdr->*e.field).load()) << "\n";
+
+    // Add or update the profile in the dropdown and select it.
+    int existing = profileCombo->findText(fileName);
+    if (existing < 0) {
+        profileCombo->addItem(fileName, path);
+        profileCombo->setCurrentIndex(profileCombo->count() - 1);
+    } else {
+        profileCombo->setItemData(existing, path);
+        profileCombo->setCurrentIndex(existing);
+    }
+}
+
+// Load settings from a specific file path and apply them immediately.
+void MainWindow::loadSettingsFromFile(const QString& path) {
+    if (!hdr) {
+        QMessageBox::warning(this, "DLSS5VKLayer", "Shared memory not attached yet.");
+        return;
+    }
+
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, "DLSS5VKLayer",
+                             "Could not read:\n" + path);
+        return;
+    }
+
+    QTextStream in(&f);
+    int loaded = 0, skipped = 0;
+    while (!in.atEnd()) {
+        QString line = in.readLine().trimmed();
+        if (line.isEmpty() || line.startsWith('#') || !line.contains('=')) continue;
+        const QString key = line.section('=', 0, 0).trimmed();
+        const QString value = line.section('=', 1).trimmed();
+        bool found = false;
+        for (const SettingEntry& e : kSettingsTable) {
+            if (QLatin1String(e.key) != key) continue;
+            const uint32_t raw = e.invert ? (value.toUInt() ? 0u : 1u)
+                                          : (e.isFloat ? FloatToBits(value.toFloat())
+                                                       : value.toUInt());
+            (hdr->*e.field).store(raw);
+            found = true;
+            ++loaded;
+            break;
+        }
+        if (!found) ++skipped;
+    }
+
+    hdr->controlSeq.fetch_add(1);
+    hdr->tuningSeq.fetch_add(1);
+    if (binder) binder->Reload();
     updateCompositionVisibility();
     lastSettingsBlob = settingsBlob();
     saveConfig();

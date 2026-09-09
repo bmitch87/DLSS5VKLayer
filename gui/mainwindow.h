@@ -40,6 +40,7 @@ private:
     QString findProjectDir() const;
     QString findHelperCli() const;
     QString configPath() const;
+    QString profilesDir() const;
     QString dataDir() const;
     QString defaultBinariesDir() const;
     QString effectiveBinariesDir() const;
@@ -54,6 +55,10 @@ private:
     void restoreSettings();
     void saveSettingsIfChanged();
     void resetAllSettings();
+    void applyDefaults();
+    void saveSettingsToFile();
+    void loadSettingsFromFile(const QString& path);
+    void refreshProfileList();
     QString settingsBlob() const;
     void populateRunners();
     void applyRunnerSelection(int index);
@@ -81,6 +86,8 @@ private:
 
     QPushButton* startBtn = nullptr;
     QPushButton* stopBtn = nullptr;
+    QComboBox* profileCombo = nullptr;
+    QPushButton* profileSaveBtn = nullptr;
     QPushButton* passBtn = nullptr;
     QPushButton* captureBtn = nullptr;
     QPushButton* browseRunnerBtn = nullptr;
