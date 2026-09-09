@@ -49,8 +49,8 @@ jobs:
         id: bump
         run: |
           SPEC=packaging/dlssnr.spec
-          CUR_V=$(sed -n 's/^Version:[[:space:]]*//p' "$SPEC" | head -1)
-          CUR_R=$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)
+          CUR_V=$(sed -n 's/^%{!?dlssnr_version: %global dlssnr_version \([^}]*\)}.*/\1/p' "$SPEC" | head -1)
+          CUR_R=$(sed -n 's/^%{!?dlssnr_release: %global dlssnr_release \([^}]*\)}.*/\1/p' "$SPEC" | head -1)
           [[ "$CUR_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: bad Version '$CUR_V' in $SPEC" >&2; exit 1; }
           [[ "$CUR_R" =~ ^[0-9]+$ ]] || { echo "error: bad pkg_release '$CUR_R' in $SPEC" >&2; exit 1; }
           IFS=. read -r MA MI PA <<< "$CUR_V"
