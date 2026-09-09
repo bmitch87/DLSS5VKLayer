@@ -22,3 +22,10 @@ executable('smoke', '../test_layer/smoke.cpp',
   link_args: windows_cpp_link_args,
   install: false,
 )
+
+# Keep a descriptive alias for the Windows cross build's analyzer target.
+if scan_build.found()
+  run_target('analyze-windows',
+    command: [scan_build, '--status-bugs', 'ninja', '-C', meson.project_build_root()],
+  )
+endif

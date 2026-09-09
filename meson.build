@@ -7,6 +7,15 @@ project('dlss5vklayer', 'cpp',
   ],
 )
 
+add_project_arguments('-Wno-unused-parameter', language: 'cpp')
+
+scan_build = find_program('scan-build', required: false)
+if scan_build.found()
+  run_target('analyze',
+    command: [scan_build, '--status-bugs', 'ninja', '-C', meson.project_build_root()],
+  )
+endif
+
 host_system = host_machine.system()
 host_cpu = host_machine.cpu_family()
 

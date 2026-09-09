@@ -453,7 +453,8 @@ static bool CreateContext(VkCtx& c) {
         if (vkCreateFence(c.device, &fci, nullptr, &c.fences[i]) != VK_SUCCESS) return false;
     }
     if (c.opticalFlow && c.opticalQueue && vkCreateSemaphore) {
-        VkSemaphoreCreateInfo sci{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        VkSemaphoreCreateInfo sci{};
+        sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
         if (vkCreateSemaphore(c.device, &sci, nullptr, &c.semPrep) != VK_SUCCESS ||
             vkCreateSemaphore(c.device, &sci, nullptr, &c.semFlow) != VK_SUCCESS) {
             Log("[helper] semaphore creation failed, NVOF stays synchronous");
@@ -490,7 +491,8 @@ static bool CreateContext(VkCtx& c) {
             if (vkCreateBuffer(c.device, &bci, nullptr, &c.queryStaging) == VK_SUCCESS) {
                 VkMemoryRequirements req{};
                 vkGetBufferMemoryRequirements(c.device, c.queryStaging, &req);
-                VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                VkMemoryAllocateInfo mai{};
+                mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
                 mai.allocationSize = req.size;
                 mai.memoryTypeIndex = FindHostMemoryType(c, req.memoryTypeBits, true);
                 if (mai.memoryTypeIndex != UINT32_MAX &&
@@ -575,7 +577,8 @@ static bool CreateStaging(VkCtx& c, size_t bytes) {
         if (vkCreateBuffer(c.device, &bci, nullptr, &buf) != VK_SUCCESS) return false;
         VkMemoryRequirements req{};
         vkGetBufferMemoryRequirements(c.device, buf, &req);
-        VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        VkMemoryAllocateInfo mai{};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         mai.allocationSize = req.size;
         mai.memoryTypeIndex = FindHostMemoryType(c, req.memoryTypeBits, true);
         if (mai.memoryTypeIndex == UINT32_MAX) return false;
@@ -859,7 +862,8 @@ static bool CreateImage2DUsage(VkCtx& c, VkFormat fmt, uint32_t w, uint32_t h,
     out.format = fmt; out.width = w; out.height = h; out.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkMemoryRequirements req{};
     vkGetImageMemoryRequirements(c.device, out.image, &req);
-    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = FindMemoryType(c, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mai.memoryTypeIndex == UINT32_MAX) return false;
@@ -904,7 +908,8 @@ static bool CreateImage2DOpticalFlow(VkCtx& c, VkFormat fmt, uint32_t w, uint32_
     out.format = fmt; out.width = w; out.height = h; out.layout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkMemoryRequirements req{};
     vkGetImageMemoryRequirements(c.device, out.image, &req);
-    VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = FindMemoryType(c, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (mai.memoryTypeIndex == UINT32_MAX) return false;
@@ -1263,7 +1268,8 @@ static bool EnsureMVecComputeObjects(VkCtx& c) {
     if (c.mvPipeLayout) return true;
     if (!c.mvComputeSupported) return false;
     auto makeModule = [&](const uint32_t* code, size_t len, VkShaderModule& out) {
-        VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        VkShaderModuleCreateInfo smci{};
+        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         smci.codeSize = len * sizeof(uint32_t);
         smci.pCode = code;
         return vkCreateShaderModule(c.device, &smci, nullptr, &out) == VK_SUCCESS;
@@ -1283,10 +1289,12 @@ static bool EnsureMVecComputeObjects(VkCtx& c) {
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
-    VkDescriptorSetLayoutCreateInfo dli{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    VkDescriptorSetLayoutCreateInfo dli{};
+    dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     dli.bindingCount = 2; dli.pBindings = bindings;
     if (vkCreateDescriptorSetLayout(c.device, &dli, nullptr, &c.mvDescLayout) != VK_SUCCESS) return false;
-    VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    VkPipelineLayoutCreateInfo pli{};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pli.setLayoutCount = 1; pli.pSetLayouts = &c.mvDescLayout;
     if (vkCreatePipelineLayout(c.device, &pli, nullptr, &c.mvPipeLayout) != VK_SUCCESS) {
         vkDestroyDescriptorSetLayout(c.device, c.mvDescLayout, nullptr);
@@ -1363,13 +1371,15 @@ static bool BuildMVecComputePass(NeuralState& ns, uint32_t ow, uint32_t oh) {
         return false;
     }
     VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 };
-    VkDescriptorPoolCreateInfo dpci{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    VkDescriptorPoolCreateInfo dpci{};
+    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &poolSize;
     if (vkCreateDescriptorPool(c.device, &dpci, nullptr, &f.mvPool) != VK_SUCCESS) {
         DestroyMVecComputePass(c, f);
         return false;
     }
-    VkDescriptorSetAllocateInfo dsai{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    VkDescriptorSetAllocateInfo dsai{};
+    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     dsai.descriptorPool = f.mvPool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &c.mvDescLayout;
     if (vkAllocateDescriptorSets(c.device, &dsai, &f.mvSet) != VK_SUCCESS) {
         DestroyMVecComputePass(c, f);
