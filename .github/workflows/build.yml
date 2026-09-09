@@ -41,7 +41,7 @@ jobs:
             qt6-qtbase-devel \
             pciutils \
             pkgconf-pkg-config \
-            glibc-devel.i686 libstdc++-devel.i686 libgcc.i686 \
+            glibc-devel.i686 libstdc++-devel.i686 libgcc.i686 libatomic.i686 \
             git-core bash tar gzip
 
       - name: Verify 32-bit toolchain
@@ -86,7 +86,7 @@ jobs:
             rpm-build \
             pciutils \
             pkgconf-pkg-config \
-            glibc-devel.i686 libstdc++-devel.i686 libgcc.i686 \
+            glibc-devel.i686 libstdc++-devel.i686 libgcc.i686 libatomic.i686 \
             git-core bash tar gzip
 
       - name: Verify 32-bit toolchain
