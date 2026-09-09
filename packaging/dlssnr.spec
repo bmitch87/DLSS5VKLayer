@@ -3,8 +3,8 @@
 %global _include_debuginfo_sources 0
 # Overridable version (packaging/make-dist.sh passes these from
 # DLSSNR_VERSION/DLSSNR_RELEASE via --define; defaults keep local builds working).
-%{!?dlssnr_version: %global dlssnr_version 0.2.5}
-%{!?dlssnr_release: %global dlssnr_release 6}
+%{!?dlssnr_version: %global dlssnr_version 0.2.6}
+%{!?dlssnr_release: %global dlssnr_release 1}
 %global pkg_release %{dlssnr_release}
 
 Name:           dlssnr
