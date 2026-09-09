@@ -1,0 +1,334 @@
+name: Build
+
+# Manual only: Actions -> Build -> Run workflow, then pick which part of the
+# version number to increment (read from packaging/dlssnr.spec, never
+# committed back -- the bump applies to this run via DLSSNR_VERSION /
+# DLSSNR_RELEASE overrides):
+#   major     X+1.0.0-1  (minor, patch and release reset)
+#   minor     X.Y+1.0-1  (patch and release reset)
+#   patch     X.Y.Z+1-1  (release resets)
+#   revision  X.Y.Z-R+1  (version untouched, release +1)
+#   none      rebuild the current version as-is (non-incrementing)
+#
+# After all builds succeed, the new version is committed back to the branch
+# (both spec files) and pushed as a git tag (e.g. 1.0.0-1).
+# Publish via the separate manual release-draft workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      part:
+        description: "Version part to increment"
+        required: true
+        default: none
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+          - revision
+          - none
+
+permissions:
+  contents: write
+  actions: write
+
+# Version is read from packaging/dlssnr.spec (Version: + %global pkg_release).
+
+jobs:
+  # ---- Resolve the version for this run ------------------------------------
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      release: ${{ steps.bump.outputs.release }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute bumped version
+        id: bump
+        run: |
+          SPEC=packaging/dlssnr.spec
+          CUR_V=$(sed -n 's/^%{!?dlssnr_version: %global dlssnr_version \([^}]*\)}.*/\1/p' "$SPEC" | head -1)
+          CUR_R=$(sed -n 's/^%{!?dlssnr_release: %global dlssnr_release \([^}]*\)}.*/\1/p' "$SPEC" | head -1)
+          [[ "$CUR_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: bad Version '$CUR_V' in $SPEC" >&2; exit 1; }
+          [[ "$CUR_R" =~ ^[0-9]+$ ]] || { echo "error: bad pkg_release '$CUR_R' in $SPEC" >&2; exit 1; }
+          IFS=. read -r MA MI PA <<< "$CUR_V"
+          case "${{ inputs.part }}" in
+            major)    MA=$((MA + 1)); MI=0; PA=0; R=1 ;;
+            minor)    MI=$((MI + 1)); PA=0; R=1 ;;
+            patch)    PA=$((PA + 1)); R=1 ;;
+            revision) R=$((CUR_R + 1)) ;;
+            none)     R=$CUR_R ;;
+            *) echo "error: unknown part '${{ inputs.part }}'" >&2; exit 1 ;;
+          esac
+          NEW_V="$MA.$MI.$PA"
+          echo "version=$NEW_V" >> "$GITHUB_OUTPUT"
+          echo "release=$R" >> "$GITHUB_OUTPUT"
+          echo "tag=$NEW_V-$R" >> "$GITHUB_OUTPUT"
+          echo "part=${{ inputs.part }}: $CUR_V-$CUR_R -> $NEW_V-$R"
+
+  # ---- Generic tarball (built once, on Fedora, shipped as linux-x86_64) -----
+  tarball:
+    needs: [version]
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            gcc gcc-c++ clang make \
+            glibc-devel kernel-headers libstdc++-devel \
+            libX11-devel libXi-devel libXext-devel libXrandr-devel \
+            mingw64-gcc-c++ \
+            qt6-qtbase-devel \
+            pciutils \
+            pkgconf-pkg-config \
+            glibc-devel.i686 libstdc++-devel.i686 libgcc.i686 libatomic.i686 \
+            git-core bash tar gzip
+
+      - name: Verify 32-bit toolchain
+        # Same test build.sh uses, but with stderr visible: if -m32 is broken
+        # this fails loudly with the real error instead of silently skipping
+        # the 32-bit layer later.
+        run: echo 'int main(){return 0;}' | g++ -m32 -x c++ - -o /dev/null
+
+      - name: Build tarball (public variant only)
+        env:
+          DLSSNR_SKIP_MANIFEST_INSTALL: "1"
+          DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
+        run: ./build.sh --tar
+
+      - name: List artifacts
+        run: ls -l dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: |
+            dist/dlssnr-*.tar.gz
+            !dist/dlssnr-personal-*
+
+  # ---- Fedora: .rpm only ---------------------------------------------------
+  fedora:
+    needs: [version]
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            gcc gcc-c++ clang make \
+            glibc-devel kernel-headers libstdc++-devel \
+            libX11-devel libXi-devel libXext-devel libXrandr-devel \
+            mingw64-gcc-c++ \
+            qt6-qtbase-devel \
+            rpm-build \
+            pciutils \
+            pkgconf-pkg-config \
+            glibc-devel.i686 libstdc++-devel.i686 libgcc.i686 libatomic.i686 \
+            git-core bash tar gzip
+
+      - name: Verify 32-bit toolchain
+        # Same test build.sh uses, but with stderr visible: if -m32 is broken
+        # this fails loudly with the real error instead of silently skipping
+        # the 32-bit layer later.
+        run: echo 'int main(){return 0;}' | g++ -m32 -x c++ - -o /dev/null
+
+      # NOTE: --dist still stages the tarball internally (the RPM installs it
+      # as its payload), but only the .rpm is uploaded -- the generic tarball
+      # comes from the tarball job.
+      - name: Build RPM (public variant only)
+        env:
+          DLSSNR_SKIP_MANIFEST_INSTALL: "1"
+          DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
+        run: ./build.sh --dist
+
+      - name: Smoke-check RPM contents
+        run: |
+          ls -l dist/
+          rpm -qlp dist/dlssnr-[0-9]*.fc*.x86_64.rpm | head -30
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fedora-packages
+          path: |
+            dist/*.rpm
+            !dist/dlssnr-personal*
+
+  # ---- Ubuntu: .deb only ---------------------------------------------------
+  ubuntu:
+    needs: [version]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            g++ g++-multilib make \
+            g++-mingw-w64-x86-64 \
+            qt6-base-dev qt6-base-dev-tools qmake6 \
+            clang \
+            libx11-dev libxi-dev libxext-dev libxrandr-dev \
+            pciutils \
+            pkg-config \
+            dpkg-dev debhelper \
+            git bash tar gzip
+
+      - name: Build (public variant only)
+        env:
+          DLSSNR_SKIP_MANIFEST_INSTALL: "1"
+          DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
+        run: ./build.sh --tar
+
+      - name: Build .deb package (public variant only)
+        env:
+          DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
+        run: ./packaging/make-deb.sh
+
+      - name: Smoke-check DEB contents
+        run: |
+          ls -l dist/
+          dpkg-deb -c dist/dlssnr_*_amd64.deb | head -30
+          dpkg-deb -f dist/dlssnr_*_amd64.deb Package Version Architecture Depends
+
+      # Ubuntu and Debian .debs share the same base filename, so suffix them
+      # (dpkg -i reads metadata from inside the file, the name is cosmetic).
+      - name: Suffix .deb per distro (avoid Release filename collisions)
+        run: |
+          for f in dist/dlssnr_*_amd64.deb; do
+            case "$f" in *personal*|*ubuntu24.04*) continue;; esac
+            mv "$f" "${f%_amd64.deb}_ubuntu24.04_amd64.deb"
+          done
+          ls -l dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-packages
+          path: |
+            dist/*.deb
+            !dist/dlssnr-personal*
+
+  # ---- Debian: .deb only ---------------------------------------------------
+  debian:
+    needs: [version]
+    runs-on: ubuntu-latest
+    container:
+      image: debian:13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            g++ g++-multilib make \
+            g++-mingw-w64-x86-64 \
+            qt6-base-dev qt6-base-dev-tools qmake6 \
+            clang \
+            libx11-dev libxi-dev libxext-dev libxrandr-dev \
+            pciutils \
+            pkg-config \
+            dpkg-dev debhelper \
+            git bash tar gzip
+
+      - name: Build (public variant only)
+        env:
+          DLSSNR_SKIP_MANIFEST_INSTALL: "1"
+          DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
+        run: ./build.sh --tar
+
+      - name: Build .deb package (public variant only)
+        env:
+          DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
+        run: ./packaging/make-deb.sh
+
+      - name: Smoke-check DEB contents
+        run: |
+          ls -l dist/
+          dpkg-deb -c dist/dlssnr_*_amd64.deb | head -30
+          dpkg-deb -f dist/dlssnr_*_amd64.deb Package Version Architecture Depends
+
+      # Ubuntu and Debian .debs share the same base filename, so suffix them
+      # (dpkg -i reads metadata from inside the file, the name is cosmetic).
+      - name: Suffix .deb per distro (avoid Release filename collisions)
+        run: |
+          for f in dist/dlssnr_*_amd64.deb; do
+            case "$f" in *personal*|*debian13*) continue;; esac
+            mv "$f" "${f%_amd64.deb}_debian13_amd64.deb"
+          done
+          ls -l dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: |
+            dist/*.deb
+            !dist/dlssnr-personal*
+
+  # ---- Commit the new version, then tag it ----------------------------------
+  publish:
+    needs: [version, tarball, fedora, ubuntu, debian]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Commit spec version bump (skip if already current)
+        run: |
+          VER="${{ needs.version.outputs.version }}"
+          REL="${{ needs.version.outputs.release }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          for spec in packaging/dlssnr.spec packaging/dlssnr-personal.spec; do
+            sed -i "s/^%{!?dlssnr_version: %global dlssnr_version [^}]*}/%{!?dlssnr_version: %global dlssnr_version $VER}/" "$spec"
+            sed -i "s/^%{!?dlssnr_release: %global dlssnr_release [^}]*}/%{!?dlssnr_release: %global dlssnr_release $REL}/" "$spec"
+            grep -q "dlssnr_version $VER}" "$spec" || { echo "error: version sed missed $spec" >&2; exit 1; }
+            grep -q "dlssnr_release $REL}" "$spec" || { echo "error: release sed missed $spec" >&2; exit 1; }
+          done
+          if git diff --quiet -- packaging/; then
+            echo "Specs already at $VER-$REL, nothing to commit"
+          else
+            git diff -- packaging/
+            git commit -m "Bump version to $VER-$REL" -- packaging/
+            git pull --rebase origin "${{ github.ref_name }}"
+            git push origin "HEAD:${{ github.ref_name }}"
+            echo "Committed $VER-$REL"
+          fi
+
+      - name: Push version tag unless it exists
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          git fetch origin "refs/tags/$TAG:refs/tags/$TAG" 2>/dev/null || true
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists, skipping"
+          else
+            git tag -a "$TAG" -m "dlssnr ${{ needs.version.outputs.version }}-${{ needs.version.outputs.release }}"
+            git push origin "refs/tags/$TAG"
+            echo "Pushed tag $TAG"
+          fi
