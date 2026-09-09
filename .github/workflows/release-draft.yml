@@ -34,6 +34,9 @@ jobs:
   draft:
     runs-on: ubuntu-latest
     steps:
+      # gh needs a local git checkout to resolve the base repo.
+      - uses: actions/checkout@v4
+
       - name: Find source build run
         id: find-run
         env:
