@@ -73,7 +73,7 @@ Architecture: amd64
 Maintainer: $MAINTAINER
 Section: utils
 Priority: optional
-Depends: bash, libvulkan1 | libvulkan2, libqt6widgets6, pciutils
+Depends: bash, libvulkan1 | libvulkan2, libqt6widgets6t64 | libqt6widgets6, pciutils
 Recommends: wine
 ${conflicts}${provides}Description: $description
 EOF
