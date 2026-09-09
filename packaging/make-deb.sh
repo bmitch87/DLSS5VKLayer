@@ -17,8 +17,8 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-VERSION="${DLSSNR_VERSION:-$(sed -n 's/^Version:[[:space:]]*//p' packaging/dlssnr.spec | head -1)}"
-RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)}"
+VERSION="${DLSSNR_VERSION:-$(sed -n 's/^%{!?dlssnr_version: %global dlssnr_version \([^}]*\)}.*/\1/p' packaging/dlssnr.spec | head -1)}"
+RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%{!?dlssnr_release: %global dlssnr_release \([^}]*\)}.*/\1/p' packaging/dlssnr.spec | head -1)}"
 VERSION="${VERSION:-0.2.5}"
 RELEASE="${RELEASE:-1}"
 MAINTAINER="${DEB_MAINTAINER:-DLSS5VKLayer <dlssnr@localhost>}"

@@ -21,7 +21,7 @@ esac
 
 VERSION="${DLSSNR_VERSION:-$(sed -n 's/^Version:[[:space:]]*//p' packaging/dlssnr.spec | head -1)}"
 VERSION="${VERSION:-0.2.5}"
-RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)}"
+RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%{!?dlssnr_release: %global dlssnr_release \([^}]*\)}.*/\1/p' packaging/dlssnr.spec | head -1)}"
 RELEASE="${RELEASE:-1}"
 DIST="dist"
 BUILD="${DLSSNR_BUILD_DIR:-build}"
@@ -107,7 +107,8 @@ build_rpm() {
   local spec="$1"
   local topdir="$PWD/$DIST/rpmbuild"
   mkdir -p "$topdir"
-  rpmbuild --define "_topdir $topdir" --define "_sourcedir $PWD/$DIST" -bb "$spec"
+  rpmbuild --define "_topdir $topdir" --define "_sourcedir $PWD/$DIST" \
+      --define "dlssnr_version $VERSION" --define "dlssnr_release $RELEASE" -bb "$spec"
   cp "$topdir"/RPMS/x86_64/*.rpm "$DIST/" 2>/dev/null || true
 }
 

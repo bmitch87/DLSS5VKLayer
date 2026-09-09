@@ -1,10 +1,14 @@
 %global debug_package %{nil}
 %global _enable_debug_packages 0
 %global _include_debuginfo_sources 0
-%global pkg_release 6
+# Overridable version (packaging/make-dist.sh passes these from
+# DLSSNR_VERSION/DLSSNR_RELEASE via --define; defaults keep local builds working).
+%{!?dlssnr_version: %global dlssnr_version 0.2.5}
+%{!?dlssnr_release: %global dlssnr_release 6}
+%global pkg_release %{dlssnr_release}
 
 Name:           dlssnr
-Version:        0.2.5
+Version:        %{dlssnr_version}
 Release:        %{pkg_release}%{?dist}
 Summary:        DLSS5 Neural Rendering Vulkan layer and helper
 License:        MIT
