@@ -877,11 +877,21 @@ cmd_doctor() {
   if [ -s "$DXVK_CONFIG_FILE" ]; then echo "  ok"; else echo "  will be created by start"; fi
 
   printf 'binaries: %s\n' "$det_binaries"
-  if [ -f "$det_binaries/nvngx_dlssnr.dll" ] && [ -f "$det_binaries/nvngx.dll" ] && [ -f "$det_binaries/nvapi64.dll" ]; then
-    echo "  ok"
+  if [ -f "$det_binaries/nvngx_dlssnr.dll" ]; then
+    echo "  nvngx_dlssnr.dll: ok"
   else
-    echo "  missing required NGX DLLs"
+    echo "  nvngx_dlssnr.dll: error -- missing (required)"
     ok=1
+  fi
+  if [ -f "$det_binaries/nvngx.dll" ]; then
+    echo "  nvngx.dll: ok"
+  else
+    echo "  nvngx.dll: warning -- missing (optional under Proton)"
+  fi
+  if [ -f "$det_binaries/nvapi64.dll" ]; then
+    echo "  nvapi64.dll: ok"
+  else
+    echo "  nvapi64.dll: warning -- missing (optional under Proton; DXVK-NVAPI supplies NVAPI)"
   fi
 
   printf 'runtime dir: %s\n' "$RUNTIME_DIR"
