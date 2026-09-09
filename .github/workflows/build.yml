@@ -41,8 +41,14 @@ jobs:
             qt6-qtbase-devel \
             pciutils \
             pkgconf-pkg-config \
-            glibc-devel.i686 libstdc++-devel.i686 \
+            glibc-devel.i686 libstdc++-devel.i686 libgcc.i686 \
             git-core bash tar gzip
+
+      - name: Verify 32-bit toolchain
+        # Same test build.sh uses, but with stderr visible: if -m32 is broken
+        # this fails loudly with the real error instead of silently skipping
+        # the 32-bit layer later.
+        run: echo 'int main(){return 0;}' | g++ -m32 -x c++ - -o /dev/null
 
       - name: Build tarball (public variant only)
         env:
@@ -80,8 +86,14 @@ jobs:
             rpm-build \
             pciutils \
             pkgconf-pkg-config \
-            glibc-devel.i686 libstdc++-devel.i686 \
+            glibc-devel.i686 libstdc++-devel.i686 libgcc.i686 \
             git-core bash tar gzip
+
+      - name: Verify 32-bit toolchain
+        # Same test build.sh uses, but with stderr visible: if -m32 is broken
+        # this fails loudly with the real error instead of silently skipping
+        # the 32-bit layer later.
+        run: echo 'int main(){return 0;}' | g++ -m32 -x c++ - -o /dev/null
 
       # NOTE: --dist still stages the tarball internally (the RPM installs it
       # as its payload), but only the .rpm is uploaded -- the generic tarball
