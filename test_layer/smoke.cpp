@@ -211,8 +211,17 @@ int main() {
         b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &b);
-        VkClearColorValue color{ 1.0f, 0.0f, 1.0f, 1.0f };
-        VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkClearColorValue color{};
+        color.float32[0] = 1.0f;
+        color.float32[1] = 0.0f;
+        color.float32[2] = 1.0f;
+        color.float32[3] = 1.0f;
+        VkImageSubresourceRange range{};
+        range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        range.baseMipLevel = 0;
+        range.levelCount = 1;
+        range.baseArrayLayer = 0;
+        range.layerCount = 1;
         vkCmdClearColorImage(cb, images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
         b = {};
         b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;

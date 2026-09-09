@@ -560,7 +560,7 @@ static std::string LayerObjectPath() {
 
 // True when a *different* copy of this layer is already in the chain.
 //
-// build.sh installs an implicit-layer manifest pointing at the build tree while install.sh installs
+// Local packaging installs an implicit-layer manifest pointing at the build tree while install.sh installs
 // another pointing at the install prefix, and the loader honours both: two copies of the layer, two
 // present hooks, two full round trips, and a single shared-memory file with two writers racing on
 // one sequence number. Only the first copy stays live; the rest declare themselves inert and pass
@@ -994,18 +994,21 @@ static bool SetLoaderData(DeviceChain* dc, void* object) {
 static bool CreateResources(DeviceChain* dc, SwapchainState& sc, uint32_t family) {
     VkDevice d = dc->self;
 
-    VkCommandPoolCreateInfo cpci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    VkCommandPoolCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cpci.queueFamilyIndex = family;
     if (dc->vkCreateCommandPool(d, &cpci, nullptr, &sc.pool) != VK_SUCCESS) return false;
-    VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    VkCommandBufferAllocateInfo cbai{};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbai.commandPool = sc.pool; cbai.commandBufferCount = 1;
     if (dc->vkAllocateCommandBuffers(d, &cbai, &sc.cb) != VK_SUCCESS) return false;
     if (!SetLoaderData(dc, sc.cb)) {
         Log("[layer] vkSetDeviceLoaderData failed for the present command buffer");
         return false;
     }
-    VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFenceCreateInfo fci{};
+    fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     if (dc->vkCreateFence(d, &fci, nullptr, &sc.fenceLeg1) != VK_SUCCESS) return false;
     if (dc->vkCreateFence(d, &fci, nullptr, &sc.fenceLeg2) != VK_SUCCESS) return false;
 
@@ -1169,9 +1172,11 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             sc.comp->RequestCapture(std::min<uint32_t>(frames, 64));
     }
 
-    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    VkCommandBufferBeginInfo bi{};
+    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    VkSubmitInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cb;
 

@@ -43,7 +43,7 @@ jobs:
       release: ${{ steps.bump.outputs.release }}
       tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compute bumped version
         id: bump
@@ -68,33 +68,29 @@ jobs:
           echo "tag=$NEW_V-$R" >> "$GITHUB_OUTPUT"
           echo "part=${{ inputs.part }}: $CUR_V-$CUR_R -> $NEW_V-$R"
 
-  # ---- Generic tarball (built once, on Fedora, shipped as linux-x86_64) -----
+  # ---- Generic tarball (built once, on Ubuntu 24.04, shipped as linux-x86_64) -----
   tarball:
     needs: [version]
-    runs-on: ubuntu-latest
-    container:
-      image: fedora:44
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
-          dnf install -y \
-            gcc gcc-c++ clang make \
-            glibc-devel kernel-headers libstdc++-devel \
-            libX11-devel libXi-devel libXext-devel libXrandr-devel \
-            mingw64-gcc-c++ \
-            qt6-qtbase-devel \
-            pciutils \
-            pkgconf-pkg-config \
-            glibc-devel.i686 libstdc++-devel.i686 libgcc.i686 libatomic.i686 \
-            git-core bash tar gzip
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang llvm meson ninja-build g++-multilib \
+            g++-mingw-w64-x86-64 \
+            qt6-base-dev qt6-base-dev-tools \
+            libx11-dev libxi-dev libxext-dev libxrandr-dev \
+            pciutils pkg-config \
+            git bash tar gzip
 
       - name: Verify 32-bit toolchain
-        # Same test build.sh uses, but with stderr visible: if -m32 is broken
+        # Keep the required 32-bit Clang environment visible in CI: if -m32 is broken
         # this fails loudly with the real error instead of silently skipping
         # the 32-bit layer later.
-        run: echo 'int main(){return 0;}' | g++ -m32 -x c++ - -o /dev/null
+        run: echo 'int main(){return 0;}' | clang++ -m32 -x c++ - -o /dev/null
 
       - name: Build tarball (public variant only)
         env:
@@ -102,13 +98,13 @@ jobs:
           DLSSNR_VARIANTS: public
           DLSSNR_VERSION: ${{ needs.version.outputs.version }}
           DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./build.sh --tar
+        run: tools/meson-build.sh && ./packaging/make-dist.sh tar
 
       - name: List artifacts
         run: ls -l dist/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tarball
           path: |
@@ -122,15 +118,17 @@ jobs:
     container:
       image: fedora:44
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
           dnf install -y \
-            gcc gcc-c++ clang make \
+            clang llvm meson ninja-build \
             glibc-devel kernel-headers libstdc++-devel \
             libX11-devel libXi-devel libXext-devel libXrandr-devel \
             mingw64-gcc-c++ \
+            glibc-static glibc-static.i686\
+            libstdc++-static libstdc++-static.i686\
             qt6-qtbase-devel \
             rpm-build \
             pciutils \
@@ -139,10 +137,10 @@ jobs:
             git-core bash tar gzip
 
       - name: Verify 32-bit toolchain
-        # Same test build.sh uses, but with stderr visible: if -m32 is broken
+        # Keep the required 32-bit Clang environment visible in CI: if -m32 is broken
         # this fails loudly with the real error instead of silently skipping
         # the 32-bit layer later.
-        run: echo 'int main(){return 0;}' | g++ -m32 -x c++ - -o /dev/null
+        run: echo 'int main(){return 0;}' | clang++ -m32 -x c++ - -o /dev/null
 
       # NOTE: --dist still stages the tarball internally (the RPM installs it
       # as its payload), but only the .rpm is uploaded -- the generic tarball
@@ -153,7 +151,7 @@ jobs:
           DLSSNR_VARIANTS: public
           DLSSNR_VERSION: ${{ needs.version.outputs.version }}
           DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./build.sh --dist
+        run: tools/meson-build.sh && ./packaging/make-dist.sh rpm
 
       - name: Smoke-check RPM contents
         run: |
@@ -161,7 +159,7 @@ jobs:
           rpm -qlp dist/dlssnr-[0-9]*.fc*.x86_64.rpm | head -30
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fedora-packages
           path: |
@@ -173,16 +171,15 @@ jobs:
     needs: [version]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            g++ g++-multilib make \
+            clang llvm meson ninja-build g++-multilib \
             g++-mingw-w64-x86-64 \
-            qt6-base-dev qt6-base-dev-tools qmake6 \
-            clang \
+            qt6-base-dev qt6-base-dev-tools \
             libx11-dev libxi-dev libxext-dev libxrandr-dev \
             pciutils \
             pkg-config \
@@ -195,14 +192,7 @@ jobs:
           DLSSNR_VARIANTS: public
           DLSSNR_VERSION: ${{ needs.version.outputs.version }}
           DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./build.sh --tar
-
-      - name: Build .deb package (public variant only)
-        env:
-          DLSSNR_VARIANTS: public
-          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
-          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./packaging/make-deb.sh
+        run: tools/meson-build.sh && ./packaging/make-dist.sh deb
 
       - name: Smoke-check DEB contents
         run: |
@@ -221,7 +211,7 @@ jobs:
           ls -l dist/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ubuntu-packages
           path: |
@@ -235,16 +225,15 @@ jobs:
     container:
       image: debian:13
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
           apt-get update
           apt-get install -y \
-            g++ g++-multilib make \
+            clang llvm meson ninja-build g++-multilib \
             g++-mingw-w64-x86-64 \
-            qt6-base-dev qt6-base-dev-tools qmake6 \
-            clang \
+            qt6-base-dev qt6-base-dev-tools \
             libx11-dev libxi-dev libxext-dev libxrandr-dev \
             pciutils \
             pkg-config \
@@ -257,14 +246,7 @@ jobs:
           DLSSNR_VARIANTS: public
           DLSSNR_VERSION: ${{ needs.version.outputs.version }}
           DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./build.sh --tar
-
-      - name: Build .deb package (public variant only)
-        env:
-          DLSSNR_VARIANTS: public
-          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
-          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./packaging/make-deb.sh
+        run: tools/meson-build.sh && ./packaging/make-dist.sh deb
 
       - name: Smoke-check DEB contents
         run: |
@@ -283,7 +265,7 @@ jobs:
           ls -l dist/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: debian-packages
           path: |
@@ -295,7 +277,7 @@ jobs:
     needs: [version, tarball, fedora, ubuntu, debian]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

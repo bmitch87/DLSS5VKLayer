@@ -319,46 +319,50 @@ Fallback:
 
 Install build dependencies:
 
-- `gcc-c++`
-- `mingw64-gcc-c++` for the Windows helper
-- `qt6-qtbase-devel` for the GUI (provides `qmake6`)
-- `clang` -- the GUI is linked with `clang++` plus `-Wl,-z,nocopyreloc` so its binary loads on
-  distros whose Qt exports the meta-object data symbols with protected visibility (Arch/CachyOS).
-  Without clang the GUI still builds with g++, but then it only loads on default-visibility Qt.
+- `clang`, `clang++`, `llvm-ar`, and `llvm-strip`
+- `meson` and `ninja`
+- `mingw64-gcc-c++` (MinGW headers, libraries, and runtime sysroot for the Clang Windows target)
+- `qt6-qtbase-devel` for the GUI
 - `rpm-build` if you want the RPMs
-- optional: a 32-bit multilib toolchain (`glibc-devel.i686` + `libstdc++-devel.i686`) for the
-  32-bit layer; it is skipped with a notice when absent
+- `glibc-devel.i686`, `libstdc++-devel.i686`, `libgcc.i686`, and `libatomic.i686` for the
+  required 32-bit layer
 
 Vulkan headers are vendored, so no Vulkan devel package is needed.
 
-Build only:
+Build everything with Clang:
 
 ```bash
-./build.sh
+tools/meson-build.sh
 ```
 
-A plain build also installs the layer manifest into `~/.local/share` so locally launched games pick
-it up; set `DLSSNR_SKIP_MANIFEST_INSTALL=1` to skip that.
+This coordinates native 64-bit Linux, 32-bit Linux, and Windows GNU PE targets. The Windows
+binaries are intended to run under Wine or Proton and do not require a native Windows SDK or
+compiler. Builds are side-effect free; install a package or use the packaging scripts to install
+the Vulkan layer manifest. The Linux command-line tools are fully static, and the layer/GUI embed
+their C++ runtimes where supported. The Vulkan loader, Qt, graphics, and system C libraries remain
+dynamic system dependencies.
 
 Build and package in one step:
 
 ```bash
-./build.sh --tar     # + the .tar.gz tarballs (public + personal)
-./build.sh --rpm     # + the RPMs (public + personal)
-./build.sh --dist    # + both
+./packaging/make-dist.sh tar     # + the .tar.gz tarballs (public + personal)
+./packaging/make-dist.sh rpm     # + RPMs (public + personal)
+./packaging/make-dist.sh deb     # + DEBs (public + personal)
+./packaging/make-dist.sh         # + tarballs and RPMs
+./packaging/make-dist.sh all     # + tarballs, RPMs, and DEBs
 ```
 
 Outputs:
 
 ```text
-build/layer/libVkLayer_NV_dlssnr.so     64-bit layer
-build/layer32/libVkLayer_NV_dlssnr.so   32-bit layer (when a multilib toolchain is present)
-build/dlssnr_helper.exe                 Windows NGX helper
-build/smoke.exe                         smoke-test program
-build/runner_probe                      runner discovery probe
-build/dlssnr-shmctl                     shared-memory settings CLI
-build/gui/dlssnr_gui                    Qt GUI
-build/binder_test                       GUI binder regression test (run it offscreen)
+build/native/layer_linux/libVkLayer_NV_dlssnr.so  64-bit layer
+build/linux32/layer_linux/libVkLayer_NV_dlssnr.so 32-bit layer
+build/windows/windows/dlssnr_helper.exe           Windows NGX helper
+build/windows/windows/smoke.exe                   smoke-test program
+build/native/tools/runner_probe                   runner discovery probe
+build/native/tools/dlssnr-shmctl                  shared-memory settings CLI
+build/native/gui/dlssnr_gui                       Qt GUI
+build/native/test_gui/binder_test                 GUI binder regression test
 ```
 
 ## GUI Settings
@@ -431,19 +435,19 @@ DLSSNR_DMABUF=0               disable the dma-buf zero-copy transport (host copi
 Build:
 
 ```bash
-DLSSNR_SKIP_MANIFEST_INSTALL=1 ./build.sh
+tools/meson-build.sh
 ```
 
 Test parameter ingestion:
 
 ```bash
-DLSSNR_HELPER_EXE="$PWD/build/dlssnr_helper.exe" DLSSNR_VERBOSE=1 DLSSNR_TIME=1 ./dlssnr-helper start
+DLSSNR_HELPER_EXE="$PWD/build/windows/windows/dlssnr_helper.exe" DLSSNR_VERBOSE=1 DLSSNR_TIME=1 ./dlssnr-helper start
 WINEPREFIX="$HOME/.local/share/dlssnr/prefix/pfx" \
 PROTON_ENABLE_NVAPI=1 \
 STEAM_COMPAT_DATA_PATH="$HOME/.local/share/dlssnr/prefix" \
 VKLayer_DLSS5=1 \
 DLSSNR_SMOKE_FRAMES=5 \
-"$HOME/.local/share/Steam/compatibilitytools.d/Proton-CachyOS Latest/proton" run "$PWD/build/smoke.exe"
+"$HOME/.local/share/Steam/compatibilitytools.d/Proton-CachyOS Latest/proton" run "$PWD/build/windows/windows/smoke.exe"
 ```
 
 Expected helper log lines:
@@ -494,14 +498,16 @@ light, not code.
 
 ## Packaging
 
-Everything lands in `dist/`. The tarballs are staged from `build/` (running `make-dist.sh` builds
-first if the artifacts are missing), and the RPMs install the staged tarball as their payload, so an
-RPM build also leaves the tar.gz behind.
+Everything lands in `dist/`. The tarballs are staged from the coordinated Meson build directories
+(running `make-dist.sh` builds first if the artifacts are missing), and the RPMs install the staged
+tarball as their payload, so an RPM build also leaves the tar.gz behind.
 
 ```bash
-./packaging/make-dist.sh          # tarballs + RPMs (same as ./build.sh --dist)
+./packaging/make-dist.sh          # tarballs + RPMs
 ./packaging/make-dist.sh tar      # tarballs only
 ./packaging/make-dist.sh rpm      # RPMs only
+./packaging/make-dist.sh deb      # DEBs only
+./packaging/make-dist.sh all      # tarballs + RPMs + DEBs
 ```
 
 Both variants are always staged: `dlssnr` (public, no NVIDIA DLLs) and `dlssnr-personal` (bundles the
@@ -527,11 +533,11 @@ dist/dlssnr-personal-<version>-<release>.fcXX.x86_64.rpm
 4. Build everything and package it:
 
    ```bash
-   ./build.sh --dist
+   ./packaging/make-dist.sh
    ```
 
-   The GUI is relinked automatically when the chosen compiler or linker flags change, so no stale
-   g++-built binary can slip into a tarball.
+   Meson tracks compiler and linker changes and rebuilds affected targets, so stale GCC-built
+   binaries cannot slip into a tarball.
 
 ## Uninstall
 
