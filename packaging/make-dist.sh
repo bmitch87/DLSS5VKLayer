@@ -3,15 +3,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# What to produce: tarballs only, RPMs only, or both. The RPMs install the staged
-# tarball as their payload, so "rpm" still stages (and leaves behind) the tar.gz.
+# What to produce: tarballs only, RPMs only, DEBs only, tarballs + RPMs, or all.
+# RPMs and DEBs install the staged tarball as their payload, so package-only
+# modes still stage and leave behind the tar.gz.
 # Which variants to stage: public only, personal only, or both.
 # DLSSNR_VARIANTS=public skips the -personal tarball/RPM (used by CI, which
 # never has the proprietary NGX DLLs anyway).
 MODE="${1:-both}"
 case "$MODE" in
-    tar|rpm|both) ;;
-    *) echo "usage: $0 [tar|rpm|both]" >&2; exit 1 ;;
+    tar|rpm|deb|both|all) ;;
+    *) echo "usage: $0 [tar|rpm|deb|both|all]" >&2; exit 1 ;;
 esac
 VARIANTS="${DLSSNR_VARIANTS:-both}"
 case "$VARIANTS" in
@@ -126,7 +127,7 @@ if [ "$VARIANTS" = "personal" ] || [ "$VARIANTS" = "both" ]; then
     stage_variant personal dlssnr-personal
 fi
 
-if [ "$MODE" != "tar" ]; then
+if [ "$MODE" = "rpm" ] || [ "$MODE" = "both" ] || [ "$MODE" = "all" ]; then
     if [ "$VARIANTS" = "public" ] || [ "$VARIANTS" = "both" ]; then
         build_rpm packaging/dlssnr.spec
     fi
@@ -135,11 +136,21 @@ if [ "$MODE" != "tar" ]; then
     fi
 fi
 
+if [ "$MODE" = "deb" ] || [ "$MODE" = "all" ]; then
+    DLSSNR_VARIANTS="$VARIANTS" \
+    DLSSNR_VERSION="$VERSION" \
+    DLSSNR_RELEASE="$RELEASE" \
+    ./packaging/make-deb.sh
+fi
+
 echo
 echo "artifacts:"
 if [ "$MODE" != "rpm" ]; then
     ls -1 "$DIST"/dlssnr-*.tar.gz 2>/dev/null || true
 fi
-if [ "$MODE" != "tar" ]; then
+if [ "$MODE" = "rpm" ] || [ "$MODE" = "both" ] || [ "$MODE" = "all" ]; then
     ls -1 "$DIST"/dlssnr-*.rpm 2>/dev/null || true
+fi
+if [ "$MODE" = "deb" ] || [ "$MODE" = "all" ]; then
+    ls -1 "$DIST"/*.deb 2>/dev/null || true
 fi

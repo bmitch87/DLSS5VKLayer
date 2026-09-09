@@ -20,6 +20,9 @@ gui_qt_sources = qt6.preprocess(
 executable('dlssnr_gui', gui_sources + gui_qt_sources,
   include_directories: gui_inc,
   dependencies: qt6_dep,
-  link_args: ['-pie', '-Wl,-z,nocopyreloc', '-Wl,-z,indirect-extern-access'],
+  link_args: [
+    '-static-libstdc++', '-static-libgcc',
+    '-pie', '-Wl,-z,nocopyreloc', '-Wl,-z,indirect-extern-access',
+  ],
   install: false,
 )

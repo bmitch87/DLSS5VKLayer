@@ -23,6 +23,8 @@ shared_library('VkLayer_NV_dlssnr', layer_sources,
   c_args: layer_args + ['-fPIC'],
   cpp_args: layer_args + ['-fPIC'],
   link_args: [
+    '-static-libstdc++',
+    '-static-libgcc',
     '-Wl,--version-script=' + meson.current_source_dir() / 'dlssnr.map',
     '-Wl,-Bsymbolic',
   ],

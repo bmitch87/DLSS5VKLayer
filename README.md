@@ -338,14 +338,18 @@ tools/meson-build.sh
 This coordinates native 64-bit Linux, 32-bit Linux, and Windows GNU PE targets. The Windows
 binaries are intended to run under Wine or Proton and do not require a native Windows SDK or
 compiler. Builds are side-effect free; install a package or use the packaging scripts to install
-the Vulkan layer manifest.
+the Vulkan layer manifest. The Linux command-line tools are fully static, and the layer/GUI embed
+their C++ runtimes where supported. The Vulkan loader, Qt, graphics, and system C libraries remain
+dynamic system dependencies.
 
 Build and package in one step:
 
 ```bash
 ./packaging/make-dist.sh tar     # + the .tar.gz tarballs (public + personal)
 ./packaging/make-dist.sh rpm     # + RPMs (public + personal)
-./packaging/make-dist.sh         # + both
+./packaging/make-dist.sh deb     # + DEBs (public + personal)
+./packaging/make-dist.sh         # + tarballs and RPMs
+./packaging/make-dist.sh all     # + tarballs, RPMs, and DEBs
 ```
 
 Outputs:
@@ -502,6 +506,8 @@ tarball as their payload, so an RPM build also leaves the tar.gz behind.
 ./packaging/make-dist.sh          # tarballs + RPMs
 ./packaging/make-dist.sh tar      # tarballs only
 ./packaging/make-dist.sh rpm      # RPMs only
+./packaging/make-dist.sh deb      # DEBs only
+./packaging/make-dist.sh all      # tarballs + RPMs + DEBs
 ```
 
 Both variants are always staged: `dlssnr` (public, no NVIDIA DLLs) and `dlssnr-personal` (bundles the

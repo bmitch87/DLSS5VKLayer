@@ -14,7 +14,10 @@ binder_test = executable('binder_test',
   test_qt_sources,
   include_directories: test_inc,
   dependencies: qt6_dep,
-  link_args: ['-pie', '-Wl,-z,nocopyreloc', '-Wl,-z,indirect-extern-access'],
+  link_args: [
+    '-static-libstdc++', '-static-libgcc',
+    '-pie', '-Wl,-z,nocopyreloc', '-Wl,-z,indirect-extern-access',
+  ],
   install: false,
 )
 

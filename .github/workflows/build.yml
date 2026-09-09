@@ -68,27 +68,23 @@ jobs:
           echo "tag=$NEW_V-$R" >> "$GITHUB_OUTPUT"
           echo "part=${{ inputs.part }}: $CUR_V-$CUR_R -> $NEW_V-$R"
 
-  # ---- Generic tarball (built once, on Fedora, shipped as linux-x86_64) -----
+  # ---- Generic tarball (built once, on Ubuntu 24.04, shipped as linux-x86_64) -----
   tarball:
     needs: [version]
-    runs-on: ubuntu-latest
-    container:
-      image: fedora:44
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
         run: |
-          dnf install -y \
-            clang llvm meson ninja-build \
-            glibc-devel kernel-headers libstdc++-devel \
-            libX11-devel libXi-devel libXext-devel libXrandr-devel \
-            mingw64-gcc-c++ \
-            qt6-qtbase-devel \
-            pciutils \
-            pkgconf-pkg-config \
-            glibc-devel.i686 libstdc++-devel.i686 libgcc.i686 libatomic.i686 \
-            git-core bash tar gzip
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang llvm meson ninja-build g++-multilib \
+            g++-mingw-w64-x86-64 \
+            qt6-base-dev qt6-base-dev-tools \
+            libx11-dev libxi-dev libxext-dev libxrandr-dev \
+            pciutils pkg-config \
+            git bash tar gzip
 
       - name: Verify 32-bit toolchain
         # Keep the required 32-bit Clang environment visible in CI: if -m32 is broken
@@ -194,14 +190,7 @@ jobs:
           DLSSNR_VARIANTS: public
           DLSSNR_VERSION: ${{ needs.version.outputs.version }}
           DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: tools/meson-build.sh && ./packaging/make-dist.sh tar
-
-      - name: Build .deb package (public variant only)
-        env:
-          DLSSNR_VARIANTS: public
-          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
-          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./packaging/make-deb.sh
+        run: tools/meson-build.sh && ./packaging/make-dist.sh deb
 
       - name: Smoke-check DEB contents
         run: |
@@ -255,14 +244,7 @@ jobs:
           DLSSNR_VARIANTS: public
           DLSSNR_VERSION: ${{ needs.version.outputs.version }}
           DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: tools/meson-build.sh && ./packaging/make-dist.sh tar
-
-      - name: Build .deb package (public variant only)
-        env:
-          DLSSNR_VARIANTS: public
-          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
-          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
-        run: ./packaging/make-deb.sh
+        run: tools/meson-build.sh && ./packaging/make-dist.sh deb
 
       - name: Smoke-check DEB contents
         run: |
