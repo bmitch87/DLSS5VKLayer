@@ -1,30 +1,76 @@
-name: build
+name: Build
 
-# Four jobs, one artifact type each (public variant only -- CI never has
-# the proprietary NGX DLLs, so the -personal variant is skipped everywhere):
-#   tarball  generic linux-x86_64 tarball, built on Fedora 44 (newer toolchain)
-#   fedora   native .rpm with the Fedora dist tag (.fc44)
-#   ubuntu   native .deb, built on Ubuntu 24.04
-#   debian   native .deb, built on Debian 13
-# Add a new distro by copying one of the job blocks.
+# Manual only: Actions -> Build -> Run workflow, then pick which part of the
+# version number to increment (read from packaging/dlssnr.spec, never
+# committed back -- the bump applies to this run via DLSSNR_VERSION /
+# DLSSNR_RELEASE overrides):
+#   major     X+1.0.0-1  (minor, patch and release reset)
+#   minor     X.Y+1.0-1  (patch and release reset)
+#   patch     X.Y.Z+1-1  (release resets)
+#   revision  X.Y.Z-R+1  (version untouched, release +1)
+#   none      rebuild the current version as-is (non-incrementing)
 #
-# Triggers:
-#   - every push to main and every PR (build + upload as Actions artifacts)
-#   - every version tag (build + attach to the GitHub Release)
-#   - manual "Run workflow" button
+# After all builds succeed, the bumped version is pushed as a git tag
+# (e.g. v1.0.0-1). Nothing is committed back to any branch.
+# Publish via the separate manual release-draft workflow.
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
   workflow_dispatch:
+    inputs:
+      part:
+        description: "Version part to increment"
+        required: true
+        default: none
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+          - revision
+          - none
 
-# Version is read from packaging/dlssnr.spec (Version: + %global pkg_release),
-# so tagging v0.2.5-5 builds dlssnr-0.2.5-5-*.tar.gz / .rpm / .deb.
+permissions:
+  contents: write
+  actions: write
+
+# Version is read from packaging/dlssnr.spec (Version: + %global pkg_release).
 
 jobs:
+  # ---- Resolve the version for this run ------------------------------------
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      release: ${{ steps.bump.outputs.release }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute bumped version
+        id: bump
+        run: |
+          SPEC=packaging/dlssnr.spec
+          CUR_V=$(sed -n 's/^Version:[[:space:]]*//p' "$SPEC" | head -1)
+          CUR_R=$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)
+          [[ "$CUR_V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: bad Version '$CUR_V' in $SPEC" >&2; exit 1; }
+          [[ "$CUR_R" =~ ^[0-9]+$ ]] || { echo "error: bad pkg_release '$CUR_R' in $SPEC" >&2; exit 1; }
+          IFS=. read -r MA MI PA <<< "$CUR_V"
+          case "${{ inputs.part }}" in
+            major)    MA=$((MA + 1)); MI=0; PA=0; R=1 ;;
+            minor)    MI=$((MI + 1)); PA=0; R=1 ;;
+            patch)    PA=$((PA + 1)); R=1 ;;
+            revision) R=$((CUR_R + 1)) ;;
+            none)     R=$CUR_R ;;
+            *) echo "error: unknown part '${{ inputs.part }}'" >&2; exit 1 ;;
+          esac
+          NEW_V="$MA.$MI.$PA"
+          echo "version=$NEW_V" >> "$GITHUB_OUTPUT"
+          echo "release=$R" >> "$GITHUB_OUTPUT"
+          echo "tag=v$NEW_V-$R" >> "$GITHUB_OUTPUT"
+          echo "part=${{ inputs.part }}: $CUR_V-$CUR_R -> $NEW_V-$R"
+
   # ---- Generic tarball (built once, on Fedora, shipped as linux-x86_64) -----
   tarball:
+    needs: [version]
     runs-on: ubuntu-latest
     container:
       image: fedora:44
@@ -54,6 +100,8 @@ jobs:
         env:
           DLSSNR_SKIP_MANIFEST_INSTALL: "1"
           DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
         run: ./build.sh --tar
 
       - name: List artifacts
@@ -69,6 +117,7 @@ jobs:
 
   # ---- Fedora: .rpm only ---------------------------------------------------
   fedora:
+    needs: [version]
     runs-on: ubuntu-latest
     container:
       image: fedora:44
@@ -102,6 +151,8 @@ jobs:
         env:
           DLSSNR_SKIP_MANIFEST_INSTALL: "1"
           DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
         run: ./build.sh --dist
 
       - name: Smoke-check RPM contents
@@ -119,6 +170,7 @@ jobs:
 
   # ---- Ubuntu: .deb only ---------------------------------------------------
   ubuntu:
+    needs: [version]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -141,11 +193,15 @@ jobs:
         env:
           DLSSNR_SKIP_MANIFEST_INSTALL: "1"
           DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
         run: ./build.sh --tar
 
       - name: Build .deb package (public variant only)
         env:
           DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
         run: ./packaging/make-deb.sh
 
       - name: Smoke-check DEB contents
@@ -174,6 +230,7 @@ jobs:
 
   # ---- Debian: .deb only ---------------------------------------------------
   debian:
+    needs: [version]
     runs-on: ubuntu-latest
     container:
       image: debian:13
@@ -198,11 +255,15 @@ jobs:
         env:
           DLSSNR_SKIP_MANIFEST_INSTALL: "1"
           DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
         run: ./build.sh --tar
 
       - name: Build .deb package (public variant only)
         env:
           DLSSNR_VARIANTS: public
+          DLSSNR_VERSION: ${{ needs.version.outputs.version }}
+          DLSSNR_RELEASE: ${{ needs.version.outputs.release }}
         run: ./packaging/make-deb.sh
 
       - name: Smoke-check DEB contents
@@ -229,24 +290,24 @@ jobs:
             dist/*.deb
             !dist/dlssnr-personal*
 
-  # ---- Attach everything to a GitHub Release on tag push ------------------
-  release:
-    needs: [tarball, fedora, ubuntu, debian]
-    if: startsWith(github.ref, 'refs/tags/v')
+  # ---- Tag the bumped version (no commits back) ----------------------------
+  tag:
+    needs: [version, tarball, fedora, ubuntu, debian]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          path: release-artifacts
-          merge-multiple: true
+          fetch-depth: 0
 
-      - name: List artifacts
-        run: ls -lR release-artifacts
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release-artifacts/*
-          generate_release_notes: true
+      - name: Push version tag unless it exists
+        run: |
+          TAG="${{ needs.version.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists, skipping"
+          else
+            git -c user.name="github-actions[bot]" \
+                -c user.email="github-actions[bot]@users.noreply.github.com" \
+                tag -a "$TAG" -m "dlssnr ${{ needs.version.outputs.version }}-${{ needs.version.outputs.release }}"
+            git push origin "refs/tags/$TAG"
+            echo "Pushed tag $TAG"
+          fi

@@ -19,7 +19,8 @@ case "$VARIANTS" in
     *) echo "error: DLSSNR_VARIANTS must be public, personal or both" >&2; exit 1 ;;
 esac
 
-VERSION="${DLSSNR_VERSION:-0.2.5}"
+VERSION="${DLSSNR_VERSION:-$(sed -n 's/^Version:[[:space:]]*//p' packaging/dlssnr.spec | head -1)}"
+VERSION="${VERSION:-0.2.5}"
 RELEASE="${DLSSNR_RELEASE:-$(sed -n 's/^%global pkg_release \(.*\)/\1/p' packaging/dlssnr.spec | head -1)}"
 RELEASE="${RELEASE:-1}"
 DIST="dist"
