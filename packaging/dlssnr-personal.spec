@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 %global _enable_debug_packages 0
 %global _include_debuginfo_sources 0
-%global pkg_release 5
+%global pkg_release 6
 
 Name:           dlssnr-personal
 Version:        0.2.5
@@ -80,6 +80,11 @@ fi
 /sbin/ldconfig || :
 
 %changelog
+* Wed Sep 09 2026 DLSS5VKLayer - 0.2.5-6
+- doctor: list each NGX DLL separately with per-file status. nvngx_dlssnr.dll is
+  required (error + hard stop if missing) while nvngx.dll and nvapi64.dll are
+  optional under Proton (warning only), matching the runtime requirement.
+
 * Tue Sep 08 2026 DLSS5VKLayer - 0.2.5-5
 - Runner discovery: system-wide compatibility tools are now found. On top of the per-user dirs, every
   directory in $XDG_DATA_DIRS and the XDG defaults /usr/local/share and /usr/share are scanned -- the
