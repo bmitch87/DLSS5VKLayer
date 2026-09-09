@@ -127,6 +127,8 @@ jobs:
             glibc-devel kernel-headers libstdc++-devel \
             libX11-devel libXi-devel libXext-devel libXrandr-devel \
             mingw64-gcc-c++ \
+            glibc-static glibc-static.i686\
+            libstdc++-static libstdc++-static.i686\
             qt6-qtbase-devel \
             rpm-build \
             pciutils \
