@@ -76,13 +76,13 @@ The RPMs are the packaged builds under `dist/`, produced by [Packaging](#packagi
 Public package:
 
 ```bash
-sudo dnf install ./dist/dlssnr-0.2.5-5.fc44.x86_64.rpm
+sudo dnf install ./dist/dlssnr-[0-9]*.x86_64.rpm
 ```
 
 Personal package:
 
 ```bash
-sudo dnf install ./dist/dlssnr-personal-0.2.5-5.fc44.x86_64.rpm
+sudo dnf install ./dist/dlssnr-personal-*.x86_64.rpm
 ```
 
 `wine` is a recommended package, not a hard dependency, so Proton-only users are not forced to install host Wine.
@@ -99,10 +99,10 @@ prefix survive the update:
 
 ```bash
 dlssnr-helper stop
-sudo dnf upgrade ./dist/dlssnr-0.2.5-5.fc44.x86_64.rpm
+sudo dnf upgrade ./dist/dlssnr-[0-9]*.x86_64.rpm
 ```
 
-(`rpm -Uvh ./dist/dlssnr-0.2.5-5.fc44.x86_64.rpm` does the same job on systems without `dnf`.)
+(`rpm -Uvh ./dist/dlssnr-[0-9]*.x86_64.rpm` does the same job on systems without `dnf`.)
 Relaunch any game that was presenting through the layer so it picks up the new layer library.
 
 The two variants carry the same files and conflict with each other, so switching between them is a
@@ -120,11 +120,12 @@ loads against both the default-visibility Qt (Fedora) and the protected-visibili
 older tarballs die at exec on Arch-based systems with
 `GNU_PROPERTY_1_NEEDED_INDIRECT_EXTERN_ACCESS`.
 
-Extract the tarball:
+Extract the tarball (`*` matches whatever version you just built; use the
+`dlssnr-personal-*` tarball for the personal variant):
 
 ```bash
-tar -xzf dist/dlssnr-0.2.5-5-linux-x86_64.tar.gz
-cd dlssnr-0.2.5-5-linux-x86_64
+tar -xzf dist/dlssnr-[0-9]*-linux-x86_64.tar.gz
+cd dlssnr-*-linux-x86_64
 ```
 
 User install, no root required:
@@ -152,8 +153,8 @@ over the old one -- user config, state and the managed prefix are not touched:
 
 ```bash
 dlssnr-helper stop
-tar -xzf dist/dlssnr-0.2.5-5-linux-x86_64.tar.gz
-cd dlssnr-0.2.5-5-linux-x86_64
+tar -xzf dist/dlssnr-[0-9]*-linux-x86_64.tar.gz
+cd dlssnr-*-linux-x86_64
 ./install.sh --user        # or: sudo ./install.sh --system
 ```
 
