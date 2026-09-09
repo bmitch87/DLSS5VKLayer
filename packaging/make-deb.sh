@@ -12,6 +12,7 @@
 # Output:
 #   dist/dlssnr_<version>-<release>_amd64.deb
 #   dist/dlssnr-personal_<version>-<release>_amd64.deb
+# (DLSSNR_VARIANTS=public builds only the public package.)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -23,15 +24,30 @@ RELEASE="${RELEASE:-1}"
 MAINTAINER="${DEB_MAINTAINER:-DLSS5VKLayer <dlssnr@localhost>}"
 DIST="dist"
 
+# Which variants to package: public only, personal only, or both.
+# DLSSNR_VARIANTS=public skips the -personal .deb (used by CI, which
+# never has the proprietary NGX DLLs anyway).
+VARIANTS="${DLSSNR_VARIANTS:-both}"
+case "$VARIANTS" in
+    public|personal|both) ;;
+    *) echo "error: DLSSNR_VARIANTS must be public, personal or both" >&2; exit 1 ;;
+esac
+
 if ! command -v dpkg-deb >/dev/null 2>&1; then
     echo "error: dpkg-deb not found (install dpkg-dev)" >&2
     exit 1
 fi
 
 # Stage the tarballs first if they are missing; this is a no-op otherwise.
-if ! ls "$DIST"/dlssnr-"$VERSION"-"$RELEASE"-linux-x86_64.tar.gz >/dev/null 2>&1 ||
-   ! ls "$DIST"/dlssnr-personal-"$VERSION"-"$RELEASE"-linux-x86_64.tar.gz >/dev/null 2>&1; then
-    ./packaging/make-dist.sh tar
+need_stage=0
+if [ "$VARIANTS" = "public" ] || [ "$VARIANTS" = "both" ]; then
+    ls "$DIST"/dlssnr-"$VERSION"-"$RELEASE"-linux-x86_64.tar.gz >/dev/null 2>&1 || need_stage=1
+fi
+if [ "$VARIANTS" = "personal" ] || [ "$VARIANTS" = "both" ]; then
+    ls "$DIST"/dlssnr-personal-"$VERSION"-"$RELEASE"-linux-x86_64.tar.gz >/dev/null 2>&1 || need_stage=1
+fi
+if [ "$need_stage" = 1 ]; then
+    DLSSNR_VARIANTS="$VARIANTS" ./packaging/make-dist.sh tar
 fi
 
 build_deb() {
@@ -119,8 +135,12 @@ EOF
     echo "built $deb"
 }
 
-build_deb dlssnr
-build_deb dlssnr-personal
+if [ "$VARIANTS" = "public" ] || [ "$VARIANTS" = "both" ]; then
+    build_deb dlssnr
+fi
+if [ "$VARIANTS" = "personal" ] || [ "$VARIANTS" = "both" ]; then
+    build_deb dlssnr-personal
+fi
 
 echo
 echo "artifacts:"

@@ -1,8 +1,12 @@
 name: build
 
-# Per-distro CI: each job builds natively on its own distro so the
-# tarball + native package it uploads actually match that distro's
-# toolchain, glibc and Qt. Add a new distro by copying one job block.
+# Four jobs, one artifact type each (public variant only -- CI never has
+# the proprietary NGX DLLs, so the -personal variant is skipped everywhere):
+#   tarball  generic linux-x86_64 tarball, built on Fedora 44 (newer toolchain)
+#   fedora   native .rpm with the Fedora dist tag (.fc44)
+#   ubuntu   native .deb, built on Ubuntu 24.04
+#   debian   native .deb, built on Debian 13
+# Add a new distro by copying one of the job blocks.
 #
 # Triggers:
 #   - every push to main and every PR (build + upload as Actions artifacts)
@@ -17,13 +21,47 @@ on:
 
 # Version is read from packaging/dlssnr.spec (Version: + %global pkg_release),
 # so tagging v0.2.5-5 builds dlssnr-0.2.5-5-*.tar.gz / .rpm / .deb.
-# The personal variant is staged on every run, but it only contains NGX DLLs
-# if binaries/*.dll exist in the checkout -- public CI runners never have
-# them, so the uploaded -personal files are DLL-less placeholders unless you
-# inject the DLLs (e.g. a private runner or a base64 secret).
 
 jobs:
-  # ---- Fedora: tarballs + RPMs -------------------------------------------
+  # ---- Generic tarball (built once, on Fedora, shipped as linux-x86_64) -----
+  tarball:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:44
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            gcc gcc-c++ clang make \
+            glibc-devel kernel-headers libstdc++-devel \
+            libX11-devel libXi-devel libXext-devel libXrandr-devel \
+            mingw64-gcc-c++ \
+            qt6-qtbase-devel \
+            pciutils \
+            pkgconf-pkg-config \
+            glibc-devel.i686 libstdc++-devel.i686 \
+            git-core bash tar gzip
+
+      - name: Build tarball (public variant only)
+        env:
+          DLSSNR_SKIP_MANIFEST_INSTALL: "1"
+          DLSSNR_VARIANTS: public
+        run: ./build.sh --tar
+
+      - name: List artifacts
+        run: ls -l dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: |
+            dist/dlssnr-*.tar.gz
+            !dist/dlssnr-personal-*
+
+  # ---- Fedora: .rpm only ---------------------------------------------------
   fedora:
     runs-on: ubuntu-latest
     container:
@@ -45,32 +83,29 @@ jobs:
             glibc-devel.i686 libstdc++-devel.i686 \
             git-core bash tar gzip
 
-      - name: Build + package (tarballs + RPMs)
+      # NOTE: --dist still stages the tarball internally (the RPM installs it
+      # as its payload), but only the .rpm is uploaded -- the generic tarball
+      # comes from the tarball job.
+      - name: Build RPM (public variant only)
         env:
           DLSSNR_SKIP_MANIFEST_INSTALL: "1"
+          DLSSNR_VARIANTS: public
         run: ./build.sh --dist
 
       - name: Smoke-check RPM contents
         run: |
           ls -l dist/
-          rpm -qlp dist/dlssnr-*.x86_64.rpm | head -30
-
-      - name: Suffix tarballs per distro (avoid Release filename collisions)
-        run: |
-          for f in dist/dlssnr-*-linux-x86_64.tar.gz; do
-            cp "$f" "${f%-linux-x86_64.tar.gz}-fedora44-x86_64.tar.gz"
-          done
-          ls -l dist/
+          rpm -qlp dist/dlssnr-[0-9]*.fc*.x86_64.rpm | head -30
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: fedora-packages
           path: |
-            dist/*.tar.gz
             dist/*.rpm
+            !dist/dlssnr-personal*
 
-  # ---- Ubuntu: tarballs + DEBs -------------------------------------------
+  # ---- Ubuntu: .deb only ---------------------------------------------------
   ubuntu:
     runs-on: ubuntu-24.04
     steps:
@@ -90,12 +125,15 @@ jobs:
             dpkg-dev debhelper \
             git bash tar gzip
 
-      - name: Build (tarballs)
+      - name: Build (public variant only)
         env:
           DLSSNR_SKIP_MANIFEST_INSTALL: "1"
+          DLSSNR_VARIANTS: public
         run: ./build.sh --tar
 
-      - name: Build .deb packages
+      - name: Build .deb package (public variant only)
+        env:
+          DLSSNR_VARIANTS: public
         run: ./packaging/make-deb.sh
 
       - name: Smoke-check DEB contents
@@ -104,10 +142,13 @@ jobs:
           dpkg-deb -c dist/dlssnr_*_amd64.deb | head -30
           dpkg-deb -f dist/dlssnr_*_amd64.deb Package Version Architecture Depends
 
-      - name: Suffix tarballs per distro (avoid Release filename collisions)
+      # Ubuntu and Debian .debs share the same base filename, so suffix them
+      # (dpkg -i reads metadata from inside the file, the name is cosmetic).
+      - name: Suffix .deb per distro (avoid Release filename collisions)
         run: |
-          for f in dist/dlssnr-*-linux-x86_64.tar.gz; do
-            cp "$f" "${f%-linux-x86_64.tar.gz}-ubuntu24.04-x86_64.tar.gz"
+          for f in dist/dlssnr_*_amd64.deb; do
+            case "$f" in *personal*|*ubuntu24.04*) continue;; esac
+            mv "$f" "${f%_amd64.deb}_ubuntu24.04_amd64.deb"
           done
           ls -l dist/
 
@@ -116,12 +157,69 @@ jobs:
         with:
           name: ubuntu-packages
           path: |
-            dist/*.tar.gz
             dist/*.deb
+            !dist/dlssnr-personal*
+
+  # ---- Debian: .deb only ---------------------------------------------------
+  debian:
+    runs-on: ubuntu-latest
+    container:
+      image: debian:13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            g++ g++-multilib make \
+            g++-mingw-w64-x86-64 \
+            qt6-base-dev qt6-base-dev-tools qmake6 \
+            clang \
+            libx11-dev libxi-dev libxext-dev libxrandr-dev \
+            pciutils \
+            pkg-config \
+            dpkg-dev debhelper \
+            git bash tar gzip
+
+      - name: Build (public variant only)
+        env:
+          DLSSNR_SKIP_MANIFEST_INSTALL: "1"
+          DLSSNR_VARIANTS: public
+        run: ./build.sh --tar
+
+      - name: Build .deb package (public variant only)
+        env:
+          DLSSNR_VARIANTS: public
+        run: ./packaging/make-deb.sh
+
+      - name: Smoke-check DEB contents
+        run: |
+          ls -l dist/
+          dpkg-deb -c dist/dlssnr_*_amd64.deb | head -30
+          dpkg-deb -f dist/dlssnr_*_amd64.deb Package Version Architecture Depends
+
+      # Ubuntu and Debian .debs share the same base filename, so suffix them
+      # (dpkg -i reads metadata from inside the file, the name is cosmetic).
+      - name: Suffix .deb per distro (avoid Release filename collisions)
+        run: |
+          for f in dist/dlssnr_*_amd64.deb; do
+            case "$f" in *personal*|*debian13*) continue;; esac
+            mv "$f" "${f%_amd64.deb}_debian13_amd64.deb"
+          done
+          ls -l dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-packages
+          path: |
+            dist/*.deb
+            !dist/dlssnr-personal*
 
   # ---- Attach everything to a GitHub Release on tag push ------------------
   release:
-    needs: [fedora, ubuntu]
+    needs: [tarball, fedora, ubuntu, debian]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

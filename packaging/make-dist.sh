@@ -5,10 +5,18 @@ cd "$(dirname "$0")/.."
 
 # What to produce: tarballs only, RPMs only, or both. The RPMs install the staged
 # tarball as their payload, so "rpm" still stages (and leaves behind) the tar.gz.
+# Which variants to stage: public only, personal only, or both.
+# DLSSNR_VARIANTS=public skips the -personal tarball/RPM (used by CI, which
+# never has the proprietary NGX DLLs anyway).
 MODE="${1:-both}"
 case "$MODE" in
     tar|rpm|both) ;;
     *) echo "usage: $0 [tar|rpm|both]" >&2; exit 1 ;;
+esac
+VARIANTS="${DLSSNR_VARIANTS:-both}"
+case "$VARIANTS" in
+    public|personal|both) ;;
+    *) echo "error: DLSSNR_VARIANTS must be public, personal or both" >&2; exit 1 ;;
 esac
 
 VERSION="${DLSSNR_VERSION:-0.2.5}"
@@ -102,12 +110,20 @@ build_rpm() {
   cp "$topdir"/RPMS/x86_64/*.rpm "$DIST/" 2>/dev/null || true
 }
 
-stage_variant public dlssnr
-stage_variant personal dlssnr-personal
+if [ "$VARIANTS" = "public" ] || [ "$VARIANTS" = "both" ]; then
+    stage_variant public dlssnr
+fi
+if [ "$VARIANTS" = "personal" ] || [ "$VARIANTS" = "both" ]; then
+    stage_variant personal dlssnr-personal
+fi
 
 if [ "$MODE" != "tar" ]; then
-    build_rpm packaging/dlssnr.spec
-    build_rpm packaging/dlssnr-personal.spec
+    if [ "$VARIANTS" = "public" ] || [ "$VARIANTS" = "both" ]; then
+        build_rpm packaging/dlssnr.spec
+    fi
+    if [ "$VARIANTS" = "personal" ] || [ "$VARIANTS" = "both" ]; then
+        build_rpm packaging/dlssnr-personal.spec
+    fi
 fi
 
 echo
