@@ -43,7 +43,7 @@ jobs:
       release: ${{ steps.bump.outputs.release }}
       tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Compute bumped version
         id: bump
@@ -73,7 +73,7 @@ jobs:
     needs: [version]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -104,7 +104,7 @@ jobs:
         run: ls -l dist/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tarball
           path: |
@@ -118,7 +118,7 @@ jobs:
     container:
       image: fedora:44
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -157,7 +157,7 @@ jobs:
           rpm -qlp dist/dlssnr-[0-9]*.fc*.x86_64.rpm | head -30
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fedora-packages
           path: |
@@ -169,7 +169,7 @@ jobs:
     needs: [version]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -209,7 +209,7 @@ jobs:
           ls -l dist/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ubuntu-packages
           path: |
@@ -223,7 +223,7 @@ jobs:
     container:
       image: debian:13
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -263,7 +263,7 @@ jobs:
           ls -l dist/
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: debian-packages
           path: |
@@ -275,7 +275,7 @@ jobs:
     needs: [version, tarball, fedora, ubuntu, debian]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

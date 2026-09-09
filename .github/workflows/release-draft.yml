@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # gh needs a local git checkout to resolve the base repo.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Resolve tag
         id: resolve-tag
