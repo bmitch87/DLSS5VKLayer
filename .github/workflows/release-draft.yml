@@ -1,0 +1,82 @@
+name: release-draft
+
+# Manual only: creates a DRAFT release from the artifacts of the most recent
+# successful `build` run on main (or a specific run ID you supply).
+# Nothing here runs automatically -- trigger it from the Actions tab:
+#   Actions -> release-draft -> Run workflow
+#
+# This is separate from the automatic tag release in build.yml. If a release
+# with the given tag already exists (e.g. build.yml published it on tag
+# push), the files are uploaded into it instead of failing.
+#
+# Note: artifacts expire (default repo retention, usually 90 days). If the
+# latest build's artifacts are gone, re-run `build` on main first.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag for the draft release (e.g. v0.2.5-5)"
+        required: true
+      title:
+        description: "Release title (defaults to the tag)"
+        required: false
+        default: ""
+      run_id:
+        description: "Override: use artifacts from this build run ID instead of the latest"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find source build run
+        id: find-run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.run_id }}" ]; then
+            RUN_ID="${{ inputs.run_id }}"
+          else
+            RUN_ID=$(gh run list --workflow build.yml --branch main \
+              --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          fi
+          [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ] || {
+            echo "error: no successful build run found on main" >&2
+            exit 1
+          }
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "Using build run $RUN_ID:"
+          gh run view "$RUN_ID" \
+            --json headSha,headBranch,conclusion,createdAt \
+            --jq '"  sha=\(.headSha) branch=\(.headBranch) conclusion=\(.conclusion) created=\(.createdAt)"'
+
+      - name: Download artifacts from that run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          rm -rf release-files && mkdir -p release-files
+          gh run download "${{ steps.find-run.outputs.run_id }}" --dir release-files
+          echo "Downloaded:"
+          find release-files -type f | sort
+
+      - name: Create draft release (or add to existing tag)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mapfile -t FILES < <(find release-files -type f | sort)
+          [ "${#FILES[@]}" -gt 0 ] || { echo "error: no files downloaded" >&2; exit 1; }
+          TITLE="${{ inputs.title }}"
+          [ -n "$TITLE" ] || TITLE="${{ inputs.tag }}"
+          if gh release view "${{ inputs.tag }}" >/dev/null 2>&1; then
+            echo "Release ${{ inputs.tag }} already exists, uploading assets into it"
+            gh release upload "${{ inputs.tag }}" --clobber "${FILES[@]}"
+          else
+            gh release create "${{ inputs.tag }}" \
+              --draft --title "$TITLE" --generate-notes "${FILES[@]}"
+          fi
+          echo "Done -- check the draft at releases/tag/${{ inputs.tag }}"
