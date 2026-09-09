@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag for the draft release (blank = current repo version, e.g. v0.3.0-1)"
+        description: "Tag for the draft release (blank = current repo version, e.g. 0.3.0-1)"
         required: false
         default: ""
       title:
@@ -52,7 +52,7 @@ jobs:
             REL=$(sed -n 's/^%{!?dlssnr_release: %global dlssnr_release \([^}]*\)}.*/\1/p' "$SPEC" | head -1)
             [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: bad version '$VER' in $SPEC" >&2; exit 1; }
             [[ "$REL" =~ ^[0-9]+$ ]] || { echo "error: bad release '$REL' in $SPEC" >&2; exit 1; }
-            TAG="v$VER-$REL"
+            TAG="$VER-$REL"
             echo "No tag supplied, using repo version $TAG"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"

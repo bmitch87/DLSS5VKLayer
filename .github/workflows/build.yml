@@ -11,7 +11,7 @@ name: Build
 #   none      rebuild the current version as-is (non-incrementing)
 #
 # After all builds succeed, the new version is committed back to the branch
-# (both spec files) and pushed as a git tag (e.g. v1.0.0-1).
+# (both spec files) and pushed as a git tag (e.g. 1.0.0-1).
 # Publish via the separate manual release-draft workflow.
 on:
   workflow_dispatch:
@@ -65,7 +65,7 @@ jobs:
           NEW_V="$MA.$MI.$PA"
           echo "version=$NEW_V" >> "$GITHUB_OUTPUT"
           echo "release=$R" >> "$GITHUB_OUTPUT"
-          echo "tag=v$NEW_V-$R" >> "$GITHUB_OUTPUT"
+          echo "tag=$NEW_V-$R" >> "$GITHUB_OUTPUT"
           echo "part=${{ inputs.part }}: $CUR_V-$CUR_R -> $NEW_V-$R"
 
   # ---- Generic tarball (built once, on Fedora, shipped as linux-x86_64) -----
