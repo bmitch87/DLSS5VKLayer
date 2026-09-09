@@ -5,9 +5,11 @@ name: release-draft
 # Nothing here runs automatically -- trigger it from the Actions tab:
 #   Actions -> release-draft -> Run workflow
 #
-# This is separate from the automatic tag release in build.yml. If a release
-# with the given tag already exists (e.g. build.yml published it on tag
-# push), the files are uploaded into it instead of failing.
+# Leave the tag blank to use the current repo version (packaging/dlssnr.spec),
+# which the Build action commits back after a successful run -- that tag
+# should already exist. Supply a tag explicitly to override it.
+# If a release with the resolved tag already exists, the files are uploaded
+# into it instead of failing.
 #
 # Note: artifacts expire (default repo retention, usually 90 days). If the
 # latest build's artifacts are gone, re-run `build` on main first.
@@ -15,8 +17,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag for the draft release (e.g. v0.2.5-5)"
-        required: true
+        description: "Tag for the draft release (blank = current repo version, e.g. v0.3.0-1)"
+        required: false
+        default: ""
       title:
         description: "Release title (defaults to the tag)"
         required: false
@@ -36,6 +39,23 @@ jobs:
     steps:
       # gh needs a local git checkout to resolve the base repo.
       - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: resolve-tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+            echo "Using supplied tag $TAG"
+          else
+            SPEC=packaging/dlssnr.spec
+            VER=$(sed -n 's/^%{!?dlssnr_version: %global dlssnr_version \([^}]*\)}.*/\1/p' "$SPEC" | head -1)
+            REL=$(sed -n 's/^%{!?dlssnr_release: %global dlssnr_release \([^}]*\)}.*/\1/p' "$SPEC" | head -1)
+            [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "error: bad version '$VER' in $SPEC" >&2; exit 1; }
+            [[ "$REL" =~ ^[0-9]+$ ]] || { echo "error: bad release '$REL' in $SPEC" >&2; exit 1; }
+            TAG="v$VER-$REL"
+            echo "No tag supplied, using repo version $TAG"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Find source build run
         id: find-run
@@ -73,13 +93,17 @@ jobs:
         run: |
           mapfile -t FILES < <(find release-files -type f | sort)
           [ "${#FILES[@]}" -gt 0 ] || { echo "error: no files downloaded" >&2; exit 1; }
+          TAG="${{ steps.resolve-tag.outputs.tag }}"
           TITLE="${{ inputs.title }}"
-          [ -n "$TITLE" ] || TITLE="${{ inputs.tag }}"
-          if gh release view "${{ inputs.tag }}" >/dev/null 2>&1; then
-            echo "Release ${{ inputs.tag }} already exists, uploading assets into it"
-            gh release upload "${{ inputs.tag }}" --clobber "${FILES[@]}"
+          [ -n "$TITLE" ] || TITLE="$TAG"
+          if ! gh release view "$TAG" >/dev/null 2>&1 && ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && ! git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+            echo "note: tag $TAG does not exist yet -- gh will create it at the current checkout"
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, uploading assets into it"
+            gh release upload "$TAG" --clobber "${FILES[@]}"
           else
-            gh release create "${{ inputs.tag }}" \
+            gh release create "$TAG" \
               --draft --title "$TITLE" --generate-notes "${FILES[@]}"
           fi
-          echo "Done -- check the draft at releases/tag/${{ inputs.tag }}"
+          echo "Done -- check the draft at releases/tag/$TAG"
