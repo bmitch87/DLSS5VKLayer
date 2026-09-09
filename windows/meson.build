@@ -6,6 +6,7 @@ windows_cpp_link_args = [
   '-lstdc++',
   '-lwinpthread',
   '-Wl,--end-group',
+  '-pthread',
 ]
 
 executable('dlssnr_helper',
@@ -13,8 +14,9 @@ executable('dlssnr_helper',
   '../core/ngx_snippet.cpp',
   '../core/guard.cpp',
   include_directories: windows_inc,
-  link_args: windows_cpp_link_args + ['-mwindows'],
+  link_args: windows_cpp_link_args,
   install: false,
+  gui_app: true
 )
 
 executable('smoke', '../test_layer/smoke.cpp',
