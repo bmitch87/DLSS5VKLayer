@@ -1,0 +1,63 @@
+# Maintainer: DLSS5VKLayer contributors
+_pkgbuild_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+pkgver="${DLSSNR_VERSION:-$(sed -n 's/^%{!?dlssnr_version: %global dlssnr_version \([^}]*\)}.*/\1/p' "${_pkgbuild_dir}/dlssnr.spec" | head -1)}"
+pkgrel="${DLSSNR_RELEASE:-$(sed -n 's/^%{!?dlssnr_release: %global dlssnr_release \([^}]*\)}.*/\1/p' "${_pkgbuild_dir}/dlssnr.spec" | head -1)}"
+pkgver="${pkgver:-0.2.5}"
+pkgrel="${pkgrel:-1}"
+
+pkgname=dlssnr
+pkgdesc='DLSS5 Neural Rendering Vulkan layer and helper'
+arch=('x86_64')
+url='https://github.com/bmitch87/DLSS5VKLayer'
+license=('MIT')
+depends=('bash' 'vulkan-icd-loader' 'qt6-base' 'pciutils')
+makedepends=('clang' 'llvm' 'meson' 'ninja' 'gcc-multilib' 'mingw-w64-gcc')
+optdepends=('wine: fallback Windows NGX runner')
+source=("${pkgname}-${pkgver}-${pkgrel}::git+https://github.com/bmitch87/DLSS5VKLayer.git#tag=${pkgver}-${pkgrel}")
+sha256sums=('SKIP')
+
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}-${pkgrel}"
+  tools/meson-build.sh
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}-${pkgrel}"
+
+  install -Dm755 build/native/layer_linux/libVkLayer_NV_dlssnr.so \
+    "${pkgdir}/usr/lib/dlssnr/layer/libVkLayer_NV_dlssnr.so"
+  install -Dm755 build/linux32/layer_linux/libVkLayer_NV_dlssnr.so \
+    "${pkgdir}/usr/lib/dlssnr/layer32/libVkLayer_NV_dlssnr.so"
+  install -Dm755 build/windows/windows/dlssnr_helper.exe \
+    "${pkgdir}/usr/lib/dlssnr/helper/dlssnr_helper.exe"
+  install -Dm755 build/native/tools/runner_probe \
+    "${pkgdir}/usr/lib/dlssnr/bin/runner_probe"
+  install -Dm755 build/native/tools/dlssnr-shmctl \
+    "${pkgdir}/usr/lib/dlssnr/bin/dlssnr-shmctl"
+  install -Dm755 build/native/gui/dlssnr_gui \
+    "${pkgdir}/usr/bin/dlssnr-gui"
+  install -Dm755 dlssnr-helper "${pkgdir}/usr/bin/dlssnr-helper"
+
+  install -Dm755 third_party/dxvk/2.7.1/x64/vulkan-1.dll \
+    "${pkgdir}/usr/lib/dlssnr/dxvk/2.7.1/vulkan-1.dll"
+  install -Dm644 third_party/dxvk/2.7.1/LICENSE.txt \
+    "${pkgdir}/usr/share/licenses/${pkgname}/dxvk-license.txt"
+  install -Dm644 packaging/dlssnr.desktop \
+    "${pkgdir}/usr/share/applications/dlssnr.desktop"
+
+  ln -s ../lib/dlssnr/bin/runner_probe \
+    "${pkgdir}/usr/bin/dlssnr-runner-probe"
+  ln -s ../lib/dlssnr/bin/dlssnr-shmctl \
+    "${pkgdir}/usr/bin/dlssnr-shmctl"
+
+  install -d "${pkgdir}/usr/share/vulkan/implicit_layer.d"
+  sed -e 's#./libVkLayer_NV_dlssnr.so#/usr/lib/dlssnr/layer/libVkLayer_NV_dlssnr.so#' \
+      -e 's#"implementation_version"#"library_arch": "64",\n    "implementation_version"#' \
+      layer_linux/manifest/VK_LAYER_NV_dlssnr.json \
+      > "${pkgdir}/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.x86_64.json"
+  sed -e 's#./libVkLayer_NV_dlssnr.so#/usr/lib/dlssnr/layer32/libVkLayer_NV_dlssnr.so#' \
+      -e 's#"VK_LAYER_NV_dlssnr"#"VK_LAYER_NV_dlssnr_32"#' \
+      -e 's#"implementation_version"#"library_arch": "32",\n    "implementation_version"#' \
+      layer_linux/manifest/VK_LAYER_NV_dlssnr.json \
+      > "${pkgdir}/usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.i686.json"
+}

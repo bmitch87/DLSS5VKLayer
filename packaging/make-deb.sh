@@ -6,7 +6,7 @@
 #
 # This reuses the same staged payload the RPMs install
 # (dist/<pkg>-<version>-<release>-linux-x86_64/root/usr),
-# so run ./packaging/make-dist.sh tar (or ./build.sh --tar) first --
+# so run ./packaging/make-dist.sh deb first --
 # this script does that for you if the tarballs are missing.
 #
 # Output:

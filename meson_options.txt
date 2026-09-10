@@ -1,0 +1,2 @@
+option('layer32', type: 'boolean', value: true,
+  description: 'Build the 32-bit layer (used by the Linux 32-bit cross build)')
