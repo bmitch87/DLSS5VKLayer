@@ -3,6 +3,10 @@
 #include <QString>
 #include <QVector>
 #include <QPair>
+#include <QStyledItemDelegate>
+#include <QModelIndex>
+#include <QPainter>
+#include <QStyleOptionViewItem>
 #include "../common/shm_protocol.h"
 
 class QProcess;
@@ -20,6 +24,15 @@ class QFormLayout;
 class QAction;
 class ShmBinder;
 
+class ProfileDelegate : public QStyledItemDelegate {
+public:
+    explicit ProfileDelegate(QObject* parent = nullptr) : QStyledItemDelegate(parent) {}
+    void paint(QPainter* painter, const QStyleOptionViewItem& option,
+               const QModelIndex& index) const override;
+private:
+    QRect buttonRect(const QStyleOptionViewItem& option) const;
+};
+
 class MainWindow : public QWidget {
     Q_OBJECT
 public:
@@ -28,6 +41,7 @@ public:
 
 protected:
     void closeEvent(QCloseEvent* event) override;
+    bool eventFilter(QObject* obj, QEvent* event) override;
 
 private slots:
     void startHelper();

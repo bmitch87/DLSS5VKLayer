@@ -9,6 +9,8 @@
 #include <QActionGroup>
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QEvent>
+#include <QMouseEvent>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDesktopServices>
@@ -175,6 +177,33 @@ static QString settingText(const SettingEntry& e, uint32_t raw) {
     return e.isFloat ? QString::number(BitsToFloat(raw), 'g', 9) : QString::number(raw);
 }
 
+// ── ProfileDelegate ──────────────────────────────────────────────────────
+static const int kButtonDiameter = 14;
+
+QRect ProfileDelegate::buttonRect(const QStyleOptionViewItem& option) const {
+    const int r = kButtonDiameter / 2;
+    return QRect(option.rect.right() - r * 2 - 2,
+                 option.rect.center().y() - r,
+                 kButtonDiameter, kButtonDiameter);
+}
+
+void ProfileDelegate::paint(QPainter* painter, const QStyleOptionViewItem& option,
+                            const QModelIndex& index) const {
+    QStyledItemDelegate::paint(painter, option, index);
+    if (index.row() == 0) return;
+
+    if (!(option.state & QStyle::State_MouseOver)) return;
+
+    const QRect br = buttonRect(option);
+    painter->save();
+    painter->setPen(option.palette.color(QPalette::Text));
+    QFont xFont = option.font;
+    xFont.setBold(true);
+    painter->setFont(xFont);
+    painter->drawText(br, Qt::AlignCenter, "x");
+    painter->restore();
+}
+
 MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     setWindowTitle("DLSS5VKLayer Helper");
 
@@ -259,6 +288,15 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
         if (idx > 0) loadSettingsFromFile(profileCombo->itemData(idx).toString());
         else applyDefaults();
     });
+
+    // Install custom delegate that renders a ✕ button next to each profile.
+    auto* delegate = new ProfileDelegate(this);
+    profileCombo->setItemDelegate(delegate);
+
+    // The QComboBox popup is a QAbstractItemView whose viewport handles the mouse.
+    // We install an event filter there so we can detect clicks on the ✕ button.
+    auto* listView = profileCombo->view();
+    listView->viewport()->installEventFilter(this);
 
     refreshProfileList();
     // Re-fit once the window is shown: the font (and thus the metrics) the style
@@ -397,6 +435,51 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     if (helperCliPath.isEmpty()) helperCliPath = findHelperCli();
     if (!helperCliPath.isEmpty()) QProcess::startDetached(helperCliPath, {"stop"});
     QWidget::closeEvent(event);
+}
+
+bool MainWindow::eventFilter(QObject* obj, QEvent* event) {
+    // Intercept mouse release on the profile combo box's list view to detect
+    // clicks on the small ✕ delete button painted by ProfileDelegate.
+    if (event->type() != QEvent::MouseButtonRelease) return false;
+
+    auto* view = profileCombo->view();
+    if (obj != view->viewport()) return false;
+
+    const auto* me = static_cast<QMouseEvent*>(event);
+    const QPoint vpPos = me->pos();
+    const QModelIndex idx = view->indexAt(vpPos);
+    if (idx.isValid() && idx.row() > 0) {
+        // Build the same button rect the delegate uses.
+        QStyleOptionViewItem opt;
+        opt.rect = view->visualRect(idx);
+        const int r = kButtonDiameter / 2;
+        const QRect br(opt.rect.right() - r * 2 - 2,
+                       opt.rect.center().y() - r,
+                       kButtonDiameter, kButtonDiameter);
+        if (br.contains(vpPos)) {
+            const QString path = profileCombo->itemData(idx.row()).toString();
+            const QString name = profileCombo->itemText(idx.row());
+            if (path.isEmpty()) return false;
+
+            const int ret = QMessageBox::question(
+                this, "Delete profile",
+                QString("Delete profile \"%1\"?").arg(name),
+                QMessageBox::Yes | QMessageBox::No);
+            if (ret != QMessageBox::Yes) return false;
+
+            if (!QFile::remove(path)) {
+                QMessageBox::warning(this, "DLSS5VKLayer",
+                                     "Could not delete:\\n" + path);
+                return false;
+            }
+            if (lastProfilePath == path) {
+                applyDefaults();
+            }
+            refreshProfileList();
+            return true;
+        }
+    }
+    return false;
 }
 
 QString MainWindow::findProjectDir() const {
