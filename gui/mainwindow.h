@@ -59,6 +59,7 @@ private:
     void saveSettingsToFile();
     void loadSettingsFromFile(const QString& path);
     void refreshProfileList();
+    void updateReloadBtn();
     QString settingsBlob() const;
     void populateRunners();
     void applyRunnerSelection(int index);
@@ -109,4 +110,7 @@ private:
     ShmBinder* binder = nullptr;
     QString lastSettingsBlob;
     QString lastProfilePath;
+    QString profileBlob;
+    QString defaultsBlob;
+    QToolButton* profileReloadBtn = nullptr;
 };

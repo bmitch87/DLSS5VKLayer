@@ -54,7 +54,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-// Size the profile combo to its current entry, capped at 200px so a long profile
+// Hard ceiling on the profile combo's width, so even a capped name leaves the
+// reload and Save buttons room in the row.
+static constexpr int kProfileComboMaxWidth = 150;
+
+// Size the profile combo to its current entry, capped so a long profile
 // name can't crowd the buttons beside it.
 static void fitProfileCombo(QComboBox* combo) {
     const QFontMetrics fm(combo->font());
@@ -64,17 +68,17 @@ static void fitProfileCombo(QComboBox* combo) {
     combo->setFixedWidth(qMin(
         combo->style()->sizeFromContents(QStyle::CT_ComboBox, &opt,
                                          QSize(w, fm.height()), combo).width(),
-        200));
+        kProfileComboMaxWidth));
 }
 
-// Pixels of text width the profile combo leaves for a name inside its 200px cap.
+// Pixels of text width the profile combo leaves for a name inside its cap.
 static int profileTextPixelBudget(const QComboBox* combo) {
     const QFontMetrics fm(combo->font());
     QStyleOptionComboBox opt;
     opt.initFrom(const_cast<QComboBox*>(combo));
     const int chrome = combo->style()->sizeFromContents(
         QStyle::CT_ComboBox, &opt, QSize(0, fm.height()), combo).width();
-    return qMax(fm.horizontalAdvance(QLatin1Char('W')), 200 - chrome);
+    return qMax(fm.horizontalAdvance(QLatin1Char('W')), kProfileComboMaxWidth - chrome);
 }
 
 // Widen the dropdown so the longest entry is never elided: the popup's item rect
@@ -237,19 +241,34 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     stopBtn = new QPushButton("Stop helper", this);
     profileCombo = new QComboBox(this);
     profileCombo->setToolTip("Select a saved profile to load, or choose '(default)' to reset.");
+    profileReloadBtn = new QToolButton(this);
+    profileReloadBtn->setText(QString::fromUtf8("\xe2\x86\xbb"));  // "clockwise open circle arrow"
+    profileReloadBtn->setToolTip("Settings changed since this selection was loaded. Click to reload it.");
     profileSaveBtn = new QPushButton("Save", this);
     profileSaveBtn->setToolTip("Save current settings to the selected profile.");
+    profileReloadBtn->setVisible(false);
     buttons->addWidget(startBtn);
     buttons->addWidget(stopBtn);
     buttons->addStretch(1);
+    buttons->addWidget(profileReloadBtn);
     buttons->addWidget(profileCombo);
     buttons->addWidget(profileSaveBtn);
     root->addLayout(buttons);
+    connect(profileReloadBtn, &QToolButton::clicked, this, [this] {
+        const int idx = profileCombo->currentIndex();
+        if (idx > 0) loadSettingsFromFile(profileCombo->itemData(idx).toString());
+        else applyDefaults();
+    });
 
     refreshProfileList();
     // Re-fit once the window is shown: the font (and thus the metrics) the style
     // settles on can differ from the app default used during construction.
-    QTimer::singleShot(0, this, [this] { fitProfileCombo(profileCombo); });
+    QTimer::singleShot(0, this, [this] {
+        fitProfileCombo(profileCombo);
+        const int h = profileSaveBtn->height();
+        profileCombo->setFixedHeight(h);
+        profileReloadBtn->setFixedHeight(h);
+    });
 
     root->addWidget(buildSettings(), 1);
 
@@ -587,6 +606,17 @@ void MainWindow::saveSettingsIfChanged() {
     if (b == lastSettingsBlob) return;
     lastSettingsBlob = b;
     saveConfig();
+    updateReloadBtn();
+}
+
+// The reload button exists only while the live settings have drifted from what
+// the selection stands for -- the saved profile file, or the factory defaults
+// when "(default)" is selected -- the state where re-loading is meaningful.
+void MainWindow::updateReloadBtn() {
+    if (!profileReloadBtn) return;
+    if (!hdr) { profileReloadBtn->setVisible(false); return; }
+    const QString& baseline = profileCombo->currentIndex() > 0 ? profileBlob : defaultsBlob;
+    profileReloadBtn->setVisible(!baseline.isEmpty() && settingsBlob() != baseline);
 }
 
 void MainWindow::resetAllSettings() {
@@ -611,6 +641,9 @@ void MainWindow::applyDefaults() {
     }
     updateCompositionVisibility();
     lastSettingsBlob = settingsBlob();
+    profileBlob.clear();
+    defaultsBlob = lastSettingsBlob;
+    updateReloadBtn();
     saveConfig();
 }
 
@@ -629,8 +662,14 @@ void MainWindow::refreshProfileList() {
     // Reopen on the profile the last session had selected. The signal is blocked here, so this
     // only moves the dropdown; the settings themselves come back via the config's set_* keys.
     const int saved = lastProfilePath.isEmpty() ? -1 : profileCombo->findData(lastProfilePath);
-    if (saved > 0)
+    if (saved > 0) {
         profileCombo->setCurrentIndex(saved);
+        // The config's set_* keys are the profile's values as the last session left
+        // them, so the reopened session starts in sync with the profile.
+        profileBlob = settingsBlob();
+    } else {
+        defaultsBlob = settingsBlob();
+    }
     fitProfileCombo(profileCombo);
     fitProfilePopup(profileCombo);
 }
@@ -704,6 +743,9 @@ void MainWindow::saveSettingsToFile() {
     }
     fitProfileCombo(profileCombo);
     fitProfilePopup(profileCombo);
+    // The file now holds exactly what is live, profile and settings in sync.
+    profileBlob = settingsBlob();
+    updateReloadBtn();
 }
 
 // Load settings from a specific file path and apply them immediately.
@@ -746,6 +788,8 @@ void MainWindow::loadSettingsFromFile(const QString& path) {
     if (binder) binder->Reload();
     updateCompositionVisibility();
     lastSettingsBlob = settingsBlob();
+    profileBlob = lastSettingsBlob;
+    updateReloadBtn();
     saveConfig();
 }
 
