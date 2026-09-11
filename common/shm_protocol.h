@@ -44,6 +44,11 @@ static constexpr uint32_t kShmVersion = 10;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
+// And a floor. A game that presents a 1x1 probe swapchain -- NWN:EE does, behind its real window --
+// used to have the model built at that size, and the first submit hung the GPU channel outright
+// (Xid 109, CTX SWITCH TIMEOUT), taking the game down with it. 300x300 is known good; nothing below
+// this is a frame worth composing anyway.
+static constexpr uint32_t kMinW = 64, kMinH = 64;
 // Eight bytes a pixel: the float16 proxy needs them, and the 8-bit path simply uses the first half of
 // each region. The mapping is file-backed and sparse, so an SDR session never commits the second half.
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 8;

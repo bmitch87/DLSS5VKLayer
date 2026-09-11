@@ -336,7 +336,7 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
                           void* modelOut, bool proxyInRegion, bool answerFromFd, bool hdrEncode) {
     if (s.dead) return false;
     if (!ShmOpen(s)) { s.dead = true; return false; }
-    if (w > kMaxW || h > kMaxH) return false;
+    if (w > kMaxW || h > kMaxH || w < kMinW || h < kMinH) return false;
     if (bytes != size_t(w) * h * 4 && bytes != size_t(w) * h * 8) return false;
     if (s.hdr->quit.load()) { s.dead = true; return false; }
 
@@ -932,13 +932,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateSwapchainKHR(
     sc.hdrKind = DetectHdrKind(sc.format, pCreateInfo->imageColorSpace);
     sc.width = pCreateInfo->imageExtent.width;
     sc.height = pCreateInfo->imageExtent.height;
-    sc.passThrough = !SupportedFormat(sc.format) || sc.width > kMaxW || sc.height > kMaxH;
+    const bool tooSmall = sc.width < kMinW || sc.height < kMinH;
+    sc.passThrough = !SupportedFormat(sc.format) || sc.width > kMaxW || sc.height > kMaxH || tooSmall;
 
     std::lock_guard<std::mutex> lk(dc->lock);
     Log("[layer] swapchain %p %ux%u fmt=%d hdr=%u passThrough=%d%s", (void*)*pSwapchain,
         pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height,
         (int)pCreateInfo->imageFormat, sc.hdrKind, (int)sc.passThrough,
-        sc.passThrough ? (SupportedFormat(sc.format) ? " (too large)" : " (unsupported format)") : "");
+        sc.passThrough ? (!SupportedFormat(sc.format) ? " (unsupported format)"
+                          : tooSmall ? " (too small)" : " (too large)") : "");
     dc->swapchains[*pSwapchain] = std::move(sc);
     return VK_SUCCESS;
 }

@@ -525,6 +525,13 @@ static void ApplyHdrContract(NgxSnippet& s) {
 bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height,
                    VkCommandBuffer recordingCmd) {
     if (s.disabled || !s.params || pass >= kMaxPasses) return false;
+    // The layer already refuses to send these, but this is the process that touches the GPU, so it
+    // is the one that has to be safe against any client: at 1x1 the model builds happily and the
+    // first submit hangs the channel (Xid 109), which kills the game as well as this helper.
+    if (width < kMinW || height < kMinH) {
+        Log("[ngx] refusing feature at %ux%u: below the %ux%u floor", width, height, kMinW, kMinH);
+        return false;
+    }
     if (s.features[pass]) return true;
 
     ApplyHdrContract(s);
