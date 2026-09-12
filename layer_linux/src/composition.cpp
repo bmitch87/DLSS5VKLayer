@@ -85,6 +85,59 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
     s.holdFrame = h->holdFrame.load();
     s.downscaler = h->scalingDownscaler.load();
     s.compositionBypass = h->compositionBypass.load();
+    {
+        // DLSSNR_SETTLE, in the same hundredths, so the ramp can be swept from a launch option --
+        // including back to 100, which is the behaviour before it existed.
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_SETTLE");
+            return v && *v ? atoi(v) : -1;
+        }();
+    }
+    {
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_GHOST_SLACK");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forced >= 0) s.ghostSlack = float(forced) / 100.0f;
+        if (!std::isfinite(s.ghostSlack) || s.ghostSlack < 0.0f) s.ghostSlack = 0.5f;
+    }
+    {
+        s.ratioSmooth = float(h->ratioSmoothPercent.load()) / 100.0f;
+        static const int forcedRs = [] {
+            const char* v = getenv("DLSSNR_RATIO_SMOOTH");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forcedRs >= 0) s.ratioSmooth = float(forcedRs) / 100.0f;
+        if (!std::isfinite(s.ratioSmooth) || s.ratioSmooth < 0.0f) s.ratioSmooth = 0.0f;
+        if (s.ratioSmooth > 1.0f) s.ratioSmooth = 1.0f;
+
+        s.colourTrust = float(h->colourTrustPercent.load()) / 100.0f;
+        static const int forcedCt = [] {
+            const char* v = getenv("DLSSNR_COLOUR_TRUST");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forcedCt >= 0) s.colourTrust = float(forcedCt) / 100.0f;
+        if (!std::isfinite(s.colourTrust) || s.colourTrust < 0.0f) s.colourTrust = 1.0f;
+        if (s.colourTrust > 8.0f) s.colourTrust = 8.0f;
+
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_MOTION_SMOOTH");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forced >= 0) s.motionSmooth = float(forced) / 100.0f;
+        if (!std::isfinite(s.motionSmooth) || s.motionSmooth < 0.0f) s.motionSmooth = 0.0f;
+        if (s.motionSmooth > 1.0f) s.motionSmooth = 1.0f;
+    }
+    {
+        static const int forced = [] {
+            const char* v = getenv("DLSSNR_EDIT_BLUR");
+            return v && *v ? atoi(v) : -1;
+        }();
+        if (forced >= 0) s.editBlur = float(forced) / 1000.0f;
+        if (!std::isfinite(s.editBlur) || s.editBlur < 0.0f) s.editBlur = 0.0f;
+        if (s.editBlur > 0.25f) s.editBlur = 0.25f;
+    }
+
 
     s.whitePointManual = BitsToFloat(h->whitePointBits.load());
     s.whitePointScale = BitsToFloat(h->whitePointScaleBits.load());
@@ -113,7 +166,10 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
 
     // Native + edit is mode 2; the clamp used to stop at 1 and silently killed it.
     if (s.transfer > 2) s.transfer = 2;
-    if (s.debugView > 3) s.debugView = 0;
+    // 4 and 5 are the two views of the colour bound. This clamp is why they did nothing when they
+    // were added: the shader grew the cases and the validation did not, so the GUI offered them, the
+    // header carried them, and the layer quietly rewrote them to 0 on the way past.
+    if (s.debugView > 5) s.debugView = 0;
     if (s.compareMode > 2) s.compareMode = 0;
     if (s.reversibleMode >= kReversibleModeCount) s.reversibleMode = kReversibleKnee;
     return s;
@@ -744,7 +800,7 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
         MakeImage(_frame, width, height, work, sampled | dst) &&
         MakeImage(_keep, width, height, _keepFormat, sampled | storage) &&
         MakeImage(_proxy, width, height, proxyFormat, sampled | storage | src) &&
-        MakeImage(_model, modelW, modelH, proxyFormat, sampled | dst) &&
+        MakeImage(_model, modelW, modelH, proxyFormat, sampled | src | dst) &&
         MakeImage(_composed, width, height, work, storage | src);
 
     // The transport pair is sized to the model raster and rebuilt against whatever mapping is
@@ -929,7 +985,7 @@ bool Composition::ImportAnswerFd(int fd, uint32_t w, uint32_t h) {
     ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (_vk->vkCreateImage(_device, &ci, nullptr, &_answerXfer.image) != VK_SUCCESS) {
@@ -1084,6 +1140,8 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     c.ExposurePreMul = 1.0f;
     c.HdrProxy = _hdrProxy ? 1u : 0u;
     c.HdrTransfer = _hdrProxy ? _hdrTransfer : 0u;
+    c.ColourTrust = s.colourTrust;
+    c.RatioSmooth = s.ratioSmooth;
     return c;
 }
 
@@ -1288,6 +1346,10 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     // The flag is the layer's own decision from before the request went out, so it and the helper
     // agree on which surface holds this frame's answer.
     const bool dmaAnswer = AnswerViaFd();
+    const bool rawCopy = s.compositionBypass != 0 && s.compareMode == 0 && !_capture.Active() &&
+                         !_superSample && !_hdrProxy && !_linearHdr &&
+                         _modelW == _width && _modelH == _height &&
+                         (dmaAnswer ? _answerXfer.format : _model.format) == _workFormat;
     if (dmaAnswer) {
         // Acquire from FOREIGN, then into the layout the resolve samples in. The first barrier's
         // old layout is the one the exporter left it in; the image's own tracking says UNDEFINED
@@ -1295,16 +1357,19 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
         VkImageMemoryBarrier acq{};
         acq.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         acq.srcAccessMask = 0;
-        acq.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        acq.dstAccessMask = rawCopy ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_SHADER_READ_BIT;
         acq.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        acq.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        acq.newLayout = rawCopy ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         acq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
         acq.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         acq.image = _answerXfer.image;
         acq.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                  rawCopy ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                   0, 0, nullptr, 0, nullptr, 1, &acq);
-        _answerXfer.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        _answerXfer.layout = rawCopy ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     } else {
         Transition(cb, _model, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy region{};
@@ -1320,6 +1385,31 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
     // because from its point of view the model effectively ran at the frame's own resolution.
     Image* answer = dmaAnswer ? &_answerXfer : &_model;
     Image* source = _work.image ? &_work : &_proxy;
+    if (rawCopy) {
+        Transition(cb, *answer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        CopyWholeImage(cb, answer->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, swapchainImage,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, _width, _height);
+        TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+        if (dmaAnswer) {
+            VkImageMemoryBarrier rel{};
+            rel.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            rel.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            rel.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            rel.newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            rel.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            rel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+            rel.image = _answerXfer.image;
+            rel.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &rel);
+            _answerXfer.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        }
+        return true;
+    }
     if (_superSample) {
         Transition(cb, _modelNative, VK_IMAGE_LAYOUT_GENERAL);
         if (!_superDown->Dispatch(cb, answer->view, _modelNative.view, _modelW, _modelH, _width, _height))

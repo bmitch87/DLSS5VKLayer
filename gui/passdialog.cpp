@@ -26,7 +26,7 @@ PassDialog::PassDialog(ShmHeader* header, QWidget* parent) : QDialog(parent), hd
 
     tabs = new QTabWidget(this);
     // Only the passes that can actually run are offered; the ceiling is a real limit, not a hint.
-    const uint32_t shown = hdr ? ShmPassCeiling(hdr) : kDefaultMaxPasses;
+    const uint32_t shown = hdr ? ShmPassCeiling(hdr) : kMaxPasses;
     for (uint32_t i = 0; i < shown; ++i) {
         auto* page = new QWidget(tabs);
         buildPage(i, page);

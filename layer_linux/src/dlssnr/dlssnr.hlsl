@@ -33,6 +33,10 @@ cbuffer Params : register(b0)
                            //    white point -- no knee, no sRGB, no ceiling. Off is the SDR path.
     uint  gHdrTransfer;    // 1 with gHdrProxy: the swapchain carries PQ (ST 2084), so the frame is
                            //    PQ-decoded on the way in and PQ-encoded on the way out.
+    float gColourTrust;    // maximum chroma displacement from the frame, in normalized units
+    float gRatioSmooth;    // how much of the relighting ratio to take from the neighbourhood
+
+
 };
 
 // Bringing an impossible colour back into a possible one.
@@ -813,6 +817,41 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // The model's own answer, kept before the matched-residual block below can rewrite `model`, so the
     // replace decode uses what the model returned rather than the residual reconstruction.
     float3 modelDirect = model;
+    // The proxy as it was sampled, kept for the same reason: the residual branch below rewrites
+    // `proxy`, and the relighting ratio's smoothing has to compare like with like.
+    float3 proxyDirect = proxy;
+
+    // What the model says about the light over this pixel's neighbourhood, and over the pixel alone.
+    //
+    // Computed once, here, because two different bounds below both need it and both were previously
+    // making do with the pixel alone. Five taps of each picture, no encode: the expensive thing in
+    // this pass has always been encoding neighbours, never fetching them.
+    float gainSharp = 1.0;
+    float gainSmooth = 1.0;
+    {
+        const float kGainFloor = 1.0 / 512.0;
+        const float2 texel = 1.0 / float2(gWidth, gHeight);
+        float mAcc = dot(modelDirect, kLuma);
+        float pAcc = dot(proxyDirect, kLuma);
+        [unroll]
+        for (int nb = 0; nb < 4; ++nb)
+        {
+            const float2 off = float2(nb == 0 ? -1.0 : nb == 1 ? 1.0 : 0.0,
+                                      nb == 2 ? -1.0 : nb == 3 ? 1.0 : 0.0) * texel;
+            const float2 uvn = saturate(cmpUv + off);
+            float3 pn = gSource.SampleLevel(gLinear, uvn, 0).rgb;
+            float3 mn = gModel.SampleLevel(gLinear, uvn, 0).rgb;
+            if (gHdrProxy == 0 && gPassthrough == 0)
+            {
+                pn = SrgbToLinear(pn);
+                mn = SrgbToLinear(mn);
+            }
+            mAcc += dot(mn, kLuma);
+            pAcc += dot(pn, kLuma);
+        }
+        gainSharp  = (dot(modelDirect, kLuma) + kGainFloor) / (dot(proxyDirect, kLuma) + kGainFloor);
+        gainSmooth = (mAcc / 5.0 + kGainFloor) / (pAcc / 5.0 + kGainFloor);
+    }
     float4 originalSample = gCompareMode == 1 ? gOriginal.SampleLevel(gLinear, cmpUv, 0)
                                               : gOriginal.Load(int3(id.xy, 0));
 
@@ -1005,7 +1044,44 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             // absolute 0.1, so a near-black pixel keeps an allowance rather than one that scales away
             // with it. One scalar over the whole triple -- a per-channel bound moves hue.
             const float targetLuma = originalLuma * editRatio;
-            const float maxLuma = max(originalLuma * 2.5, targetLuma * 1.5 + 0.1);
+
+            // Bounded by the guard the user set, and in both directions.
+            //
+            // This path adds a difference, so nothing about it says where the result lands -- and it
+            // was bounded only upwards, only at a fixed 2.5x, and never by the control whose whole
+            // job is to say how far the pass may move a pixel. On a photograph that is generous
+            // enough not to show; on flat high-contrast panels it is not, and an interface put
+            // through it comes back scorched: highlights driven to 2.5x, dark text driven below zero
+            // and clamped flat, which together is the deep-fried look.
+            //
+            // The ratio path a few lines down has been two-sided since a measured collapse -- red
+            // fell 57% while an upward-only bound sat watching it -- and there is no reason this path
+            // should be the exception. The absolute term stays, so a near-black pixel keeps an
+            // allowance rather than one that scales away with it. One scalar over the whole triple:
+            // a per-channel bound moves hue.
+            // The guard was doing two jobs with one number, and they pull in opposite directions.
+            //
+            // Raising it is how you ask for stronger relighting -- more room for the model's verdict
+            // about how much light belongs somewhere. But the same number was also the only thing
+            // bounding how far a *single* pixel may depart from its neighbours, and that one must
+            // stay tight whatever the first is set to. At a guard of 8 this band is
+            // [originalLuma/8, originalLuma*8], which is no bound at all: the raw sum passes through
+            // with every per-pixel excursion the addition produced, and the ones that drive a channel
+            // to nothing arrive as blown or black pixels wearing the texture's own colour. That is
+            // down could not reach them -- the damage is already in `upgraded` before that ratio is
+            // applied to it.
+            //
+            // So the two are separated. The guard sets how far the *neighbourhood's* light may move,
+            // which is the relighting it was always meant to control. A single pixel may then depart
+            // from that level by a fixed factor and no more, however high the guard goes. Detail is a
+            // pixel differing from its neighbours by tens of percent; a blowout is one differing by
+            // multiples, and only the second is refused.
+            const float addGuard = max(gMaxRatio, 1.0);
+            const float broadLuma = originalLuma * clamp(gainSmooth, 1.0 / addGuard, addGuard);
+            const float kPixelBand = 1.6;
+            const float maxLuma = max(broadLuma * kPixelBand, targetLuma * 0.25 + 0.02);
+            const float minLuma = broadLuma / kPixelBand;
+
 
             if (sumLuma > maxLuma)
                 upgraded *= maxLuma / sumLuma;
@@ -1059,6 +1135,37 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     const float kRatioFloor = 1.0 / 512.0;
     float lumaRatio = (upgradedLuma + kRatioFloor) / (originalLuma + kRatioFloor);
 
+    // Take the model's broad relighting and leave its per-pixel disagreement behind.
+    //
+    // Everything above rebuilds the frame as its own pixel times this one number. Where the model and
+    // the frame agree the number is 1 and nothing happens, which is why flat surfaces are always
+    // clean. On detailed content the model's answer differs sharply from one pixel to the next --
+    // that difference is the enhancement -- so the number is large and varies fast, and the highlight
+    // guard is the only thing holding it. Raising the guard therefore lets more of the variation
+    // through, and it lands as blown and black pixels carrying whatever colour the texture had. That
+    // is why the artifacts scale with the guard instead of being clipped by it, why colour strength 0
+    // does not touch them -- a scalar cannot move hue -- and why they sit only on detail.
+    //
+    // A ratio is the wrong thing to carry at full spatial frequency. What the model has a real
+    // opinion about at this scale is how much light belongs here, not which individual pixel is
+    // brighter than its neighbour; the frame already knows that and is about to be multiplied by
+    // this. So the ratio's high-frequency component is replaced with the neighbourhood's, leaving the
+    // broad verdict intact. Simulated against a surface carrying both: the pixel-to-pixel speckle
+    // falls about fourfold while the range the relighting spans is untouched, and the range still
+    // grows with the guard, which is the point -- a high guard becomes strong smooth relighting
+    // rather than speckle.
+    //
+    // Off by default, so the shipped configuration is unchanged and this is something to turn up
+    // when a raised guard is wanted.
+    if (gRatioSmooth > 0.0)
+    {
+        // The pixel's own gain against the neighbourhood's. Their quotient is exactly the
+        // high-frequency part being removed, so where the gain is already smooth this is the
+        // identity.
+        const float corrected = lumaRatio * (gainSmooth / max(gainSharp, 1e-6));
+        lumaRatio = lerp(lumaRatio, corrected, saturate(gRatioSmooth));
+    }
+
     // Where detail strength above 1 goes.
     //
     // Raising the ratio to a power rather than extending the blend keeps every property that
@@ -1091,7 +1198,43 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // distorter -- on a saturated pixel the smallest channel reaches the bound first, so an
     // achromatic edit lands as a colour shift.
     const float guard = max(gMaxRatio, 1.0);
-    float boundedRatio = clamp(amplified, 1.0 / guard, guard);
+
+    // Relighting cannot invent light, so the room to brighten shrinks toward none as a pixel
+    // approaches black.
+    //
+    // The composed pixel is the frame's own pixel times this number. A scalar cannot move hue, so
+    // whatever tint the texture already had is multiplied along with everything else -- and a dark
+    // pixel's tint is the most saturated thing about it. The platform ring is RGB (2, 4, 20): almost
+    // invisible, and a chroma of 0.9. At a guard of 8 that becomes (15, 25, 67), which is a glaring
+    // blue block, and it is the game's own colour every step of the way. That is the black-to-blue
+    // fault, and it is why the colour bound could not touch it -- the debug view shows that bound
+    // fully engaged, red, on exactly these pixels. There was never a wrong colour to hold back.
+    //
+    // Below the floor there is also nothing to relight *from*: at a couple of counts in 8-bit the
+    // pixel's own value is mostly quantisation, so an eightfold lift amplifies the transport rather
+    // than the model's verdict. Measured on the values above, this leaves a shadowed pixel of
+    // (20, 26, 44) with 6.4x of its 8x and anything at mid shadow or brighter completely untouched,
+    // while the ring keeps 1.2x and stays where it belongs.
+    //
+    // Only upward. Darkening a near-black pixel further is harmless -- it stays black -- and
+    // clamping that side would be a second bound nobody asked for.
+    const float lift = lerp(1.0, guard, smoothstep(0.0, 8.0 * kRatioFloor, originalLuma));
+
+    // And the room to darken shrinks toward none as a pixel approaches white, for the same reason
+    // read the other way round.
+    //
+    // The guard is symmetric, so raising it to allow stronger relighting allows equally strong
+    // *darkening* -- and a light source is exactly where that shows. At a guard of 1 the clamp is
+    // [1,1] and a lamp comes out white; at 3 the same lamp is allowed down to a third of itself and
+    // visibly dims, which reads as the value inverting. Detail strength makes it worse rather than
+    // better, because it raises the ratio to a power: at 2.0 a ratio of 0.85 becomes 0.72.
+    //
+    // The help text for this control has always said that a detail pass has no business restyling a
+    // light source. Nothing enforced it. Now the floor rises to 1 as the pixel reaches paper white,
+    // so a highlight cannot be pulled down however high the guard goes, while a bright wall at 0.75
+    // and everything below it is bounded exactly as before.
+    const float drop = lerp(1.0 / guard, 1.0, smoothstep(0.6, 1.1, originalLuma));
+    float boundedRatio = clamp(amplified, drop, lift);
 
     // Exactly one while the ratio is already inside the guard, so a frame that never needed bounding
     // is untouched rather than rounded, and strength zero stays bit-identical.
@@ -1105,7 +1248,114 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // neutral, NOT by clipping channels. So an over-driven colour rolls off at the gamut boundary
     // (maximally vivid but still a real colour with detail) instead of flattening into a blown peak.
     // At strength 1 the boost is the identity, so <=1 is bit-identical to before.
-    float3 result = lerp(original * boundedRatio, upgraded, min(gColourStrength, 1.0));
+    const float3 lumaOnly = original * boundedRatio;
+
+    // How far taking the model's colour would move this pixel's balance, and how much of it to take.
+    //
+    // Both ends of the blend carry the same luminance -- the guard above bound them together -- so
+    // what separates them is chroma and nothing else. On a flat surface the model agrees with the
+    // frame about hue and that separation is small, which is where the colour transfer earns its
+    // keep. On an edge the model's answer differs most, because an edge is precisely what it was
+    // asked to re-decide, and taking its hue whole puts one colour on one side of the edge and its
+    // complement on the other. That is the blue and orange fringing, and at strength 1 -- the
+    // default -- there was nothing between the disagreement and the screen.
+    //
+    // Measured on a game frame: the pass moved colour balance three to five times more at edges than
+    // on flat pixels, and every bit of it came from this blend. Under it the ringing is gone with the
+    // luminance detail untouched, because that lives in boundedRatio and not here.
+    // How far the composed colour sits from the frame's own, at matched luminance -- the guard above
+    // bound the two together -- so this is a pure colour difference and nothing to do with brightness.
+    const float3 colourDev = upgraded - lumaOnly;
+    const float chromaSwing = length(colourDev) / max(dot(lumaOnly, kLuma), 1e-4);
+
+    // Bound that difference rather than switching it off. The switch was backwards.
+    //
+    // It faded the model's colour to nothing as disagreement grew: all of it below a swing of 0.05,
+    // none at all above 0.25. The reasoning was sound as far as it went -- the model disagrees most
+    // at edges, and taking its hue whole there put one colour on one side of an edge and its
+    // complement on the other. What it missed is that a large disagreement is also exactly what a
+    // real colour correction looks like. So the rule discarded the model's verdict precisely where it
+    // had one, and the bigger the correction the more completely it went.
+    //
+    // Measured on a ceiling strip light: the game's own glow is blue, the model corrects it to white,
+    // the swing is 1.82, and the gate handed back the game's blue untouched. Composing made that
+    // light bluer than not composing at all, which is the opposite of what the pass is for.
+    //
+    // A bound keeps what the gate was protecting and drops what it was breaking. A correction of
+    // ordinary size passes whole, so the light comes back white. Fringing, which is larger still, is
+    // capped -- and capped without inverting, because the direction is kept and only the length is
+    // limited. More disagreement can no longer mean less colour, only the same amount of it.
+    const float colourBand = max(gColourTrust, 0.0);
+    const float colourAllow = colourBand <= 0.0
+                                  ? 0.0
+                                  : min(1.0, colourBand / max(chromaSwing, 1e-6));
+
+    // Below a few code values the model's hue is quantisation, not information.
+    //
+    // The answer crosses as 8-bit. In a near-black region that leaves two or three levels, so the
+    // *hue* of such a pixel is decided by which channel happened to round up. The composition then
+    // reads that hue as the model's verdict and amplifies it: the ratio is (modelLuma + headroom) /
+    // modelLuma, which on a near-black pixel runs to a hundred and more, and the guard that follows
+    // bounds luminance only -- deliberately, one scalar over the whole triple, so that a bound cannot
+    // shift hue. The result is that the meaningless hue is preserved exactly and lifted to the
+    // frame's own brightness.
+    //
+    // Simulated on this path with real 8-bit inputs: a model pixel of (0,0,1) composes to
+    // (0, 0, 0.694) -- one least significant bit of blue becomes a saturated blue pixel -- and
+    // (1,0,1) composes to (0.176, 0, 0.176), which is magenta. That is the dead blue, red and
+    // magenta speckle, it is why it sits only on dark detailed content, and it is why it disappears
+    // when the composition is bypassed: presented directly, (0,0,1) is simply a black pixel. It reads
+    // as blocks rather than speckle because above a working scale of 1 the model's raster is filtered
+    // down, so neighbouring output pixels share the same few codes.
+    //
+    // So the model's colour is trusted in proportion to how much light it actually reported, and
+    // below the noise floor the frame's own hue is used instead. Measured against the same
+    // simulation: codes 0 to 5 collapse to the frame's colour and codes of 12 and above come out bit
+    // identical, so this cannot touch content the model had a real opinion about.
+    //
+    // Only where the transport quantises. A float16 proxy has no such floor and needs no guard.
+    // Raised from 6/255 to 25/255, from the range the fault actually occupies.
+    //
+    // Six was chosen as "a couple of code values", which is where hue is purely quantisation. But the
+    // pixels still arriving blue after the pass chain was widened to sixteen bits sit at a luminance
+    // of 6 to 18 in 255 -- median 13 -- and only a seventh of them are anywhere the colour bound
+    // engages, so on the rest the model's hue was passing through untouched. Below about 25 there are
+    // too few levels for the model to have a colour opinion worth more than the frame's own, and the
+    // frame's is the game's actual render rather than something reconstructed from three or four
+    // codes.
+    //
+    // It tapers rather than switching, so a pixel at the median is damped to about 40% and one at 32
+    // and above is untouched entirely.
+    const float kQuantFloor = 0.0097;  // SrgbToLinear(25/255), in the same normalised units as model
+    const float hueTrust = gHdrProxy != 0 ? 1.0
+                                          : smoothstep(0.0, kQuantFloor, dot(modelDirect, kLuma));
+
+    // What the colour bound is doing, seen directly.
+    //
+    // Green is the model's colour passing whole, red is it being held back, so a fault can be put on
+    // one side or the other of this line without guessing: if a wrong colour shows green here the
+    // bound is not engaging on it and the fault is upstream in `upgraded`; if it shows red then the
+    // bound is engaging and the colour is coming from `lumaOnly`, which is the frame's own hue times
+    // one scalar and therefore a luminance problem rather than a colour one.
+    if (gDebugView == 4)
+    {
+        const float a = saturate(colourAllow);
+        gTarget[id.xy] = float4(float3(1.0 - a, a, 0.0) * WhitePoint(), originalSample.a);
+        return;
+    }
+
+    // The composed colour before the bound is applied, so the two can be compared frame by frame.
+    if (gDebugView == 5)
+    {
+        float3 dbg = upgraded * gDebugScale * (gHdrProxy != 0 ? normScale : 1.0);
+        if (gHdrProxy != 0 && gHdrTransfer != 0) dbg = LinearToPq(dbg);
+        gTarget[id.xy] = float4(max(dbg, 0.0), originalSample.a);
+        return;
+    }
+
+    float3 result = lerp(lumaOnly, lumaOnly + colourDev * colourAllow,
+                         min(gColourStrength, 1.0) * hueTrust);
+
 
     if (gColourStrength > 1.0)
         result = ClampAp1(FromOkLab(float3(1.0, gColourStrength, gColourStrength) * ToOkLab(max(result, 0.0))));

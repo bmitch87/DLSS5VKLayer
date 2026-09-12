@@ -32,15 +32,12 @@
 // 'GNR2'. Bumped from the v1 magic on purpose: a stale v1 mapping left in XDG_RUNTIME_DIR must be
 // re-initialised rather than half-read, because the header grew and every offset moved.
 static constexpr uint32_t kShmMagic = 0x32524E47;
-// v7: the pixel regions moved from 8 KiB to 64 KiB. VK_EXT_external_memory_host -- which lets the
-// GPU write the proxy straight into this file's pages instead of through a staging copy -- demands
-// the imported pointer be aligned to minImportedHostPointerAlignment, and NVIDIA's driver answers
-// 64 KiB. A stale v6 mapping must be re-created, not half-read at the wrong offsets.
-// v10: the HDR proxy. The pixel regions grew to eight bytes a pixel so a float16 frame fits, the
-// header carries the HDR decision and the proxy's real format, and a stale v9 mapping would put the
-// answer region at the wrong offset.
-static constexpr uint32_t kShmVersion = 10;
-
+// v14: this branch and upstream both grew the header, so neither side's number describes it.
+// From upstream: the pixel regions are eight bytes a pixel for the float16 HDR proxy, the header is
+// 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
+// minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
+// and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
+static constexpr uint32_t kShmVersion = 19;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -54,11 +51,9 @@ static constexpr uint32_t kMinW = 64, kMinH = 64;
 static constexpr size_t kMaxFrame = size_t(kMaxW) * kMaxH * 8;
 static constexpr size_t kHeaderBytes = 65536;
 
-// The ceiling on how many times the model runs over one frame, and what the slider offers unless the
-// ceiling is lifted. Both are OptiScaler's numbers (DlssNr::kMaxPasses / kDefaultMaxPasses) and the
-// arrays here are sized for the first.
+// The ceiling on how many times the model runs over one frame. It is OptiScaler's
+// DlssNr::kMaxPasses and sizes the per-pass arrays below.
 static constexpr uint32_t kMaxPasses = 30;
-static constexpr uint32_t kDefaultMaxPasses = 5;
 
 static constexpr size_t kReasonBytes = 192;
 static constexpr size_t kNameBytes = 128;
@@ -448,6 +443,76 @@ struct ShmHeader {
     // images over, and the helper refuses a frame whose width does not match what it built -- which
     // is one presented-as-is frame at a toggle, never a misread one.
     std::atomic<uint32_t> hdrEncode;
+
+    // trip, which is what it has always been; N takes an answer up only on a frame whose count is a
+    // multiple of N.
+    //
+    // round trip does not divide the frame time, so those changes fall at uneven intervals. Each one
+    // is a step -- the edit jumps from an old answer warped a long way to a fresh one warped a short
+    // way -- and a step at an uneven interval reads as judder where the same step at an even one does
+    // not. This pins the interval.
+    //
+    // What is paced is the send, not the collect: the answer is still taken up the moment it lands,
+    // so it is as fresh as the round trip allows and the interval is pinned because each update is
+    // the same round trip after an evenly spaced send. Measured on a 4000-frame pan at three passes,
+    // the average answer stayed 13 frames old at every stride from 0 to 32 -- the cadence costs no
+    // freshness at all, which is not what was assumed when this was written.
+    //
+    // It is also cheaper. Sending less often is less work for the helper, and the frames it stops
+    // doing come back as frame rate: 577 fps at 0, 596 at 16, 675 at 24, 729 at 32 on that same run.
+    //
+    // A stride shorter than the round trip cannot be honoured and is not faked -- the send waits for
+    // the next multiple at which the helper is free, so the cadence stays a multiple of N rather than
+    // drifting off it.
+
+    // How hard the measured displacement is filtered over time, in hundredths. 0 applies the estimate
+    // exactly as measured, which is what happened before this existed; 100 is the full filter.
+    //
+    // The estimate scatters by a few pixels from frame to frame however it is tuned -- the search can
+    // only name a cell, and the gradient solve refines within one rather than removing the cell-to-
+    // cell instability. The edit is warped by that number, so the scatter shows up as the whole
+    // picture shaking a different way each frame. Neither of the two obvious culprits was it: halving
+    // the staleness did not reduce the scatter, and pinning the cadence the answers arrive on did not
+    // either.
+    //
+    // the standard answer. It is applied to the velocity rather than to the displacement, because the
+    // displacement steps every time a new answer moves the reference and only the velocity is
+    // continuous across that. See PASS_SMOOTH in globalmotion.comp.
+    //
+    // Measured on a 2 px/frame pan, the frame-to-frame scatter in the estimate falls from 1.70 px to
+    // 0.37 with this at 100, and the estimate tracks the true speed instead of stepping 0, 1, 3, 4
+    // pixels at a time to average it.
+
+    // How much of the chroma-agreement gate to apply, in hundredths. 100 is the gate as written; 0
+    // switches it off and takes the model's colour everywhere.
+    //
+    // The gate exists because the model's colour disagrees with the frame's most at edges -- an edge
+    // being precisely what it was asked to re-decide -- and taking that hue whole put one colour on
+    // one side of an edge and its complement on the other. Measured, the pass moved colour balance
+    // three to five times more at edges than on flat pixels.
+    //
+    // The cost of it is that where the gate closes, the composed pixel falls back to the frame's own
+    // colour scaled by one luminance ratio -- so on a detailed frame the model's chroma detail is
+    // dropped exactly where the model had most to say. That is a real part of "composition only ever
+    // removes detail", and it was never separable from the colour strength control, because the gate
+    // multiplies that control rather than being one.
+    std::atomic<uint32_t> colourTrustPercent;
+
+    // How much of the relighting ratio is taken from the pixel's neighbourhood instead of the pixel,
+    // in hundredths. 0 is the behaviour that shipped before it existed.
+    //
+    // The composition rebuilds the frame as its own pixel times one per-pixel number. On detailed
+    // content that number varies sharply, because the model's answer differs sharply there, and the
+    // highlight guard is all that holds it -- so raising the guard lets the variation through as
+    // blown and black pixels wearing whatever colour the texture had. Carrying a ratio at full
+    // spatial frequency is the mistake: what the model knows at this scale is how much light belongs
+    // here, not which pixel is brighter than its neighbour, and the frame already knows that.
+    std::atomic<uint32_t> ratioSmoothPercent;
+
+    // SDR uses 8-bit ping-pong images by default. Enable 16-bit UNORM to avoid quantising between
+    // passes at higher memory and bandwidth cost.
+    std::atomic<uint32_t> sdr16Multipass;
+
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -463,7 +528,8 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1952, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1964, "the header layout changed -- bump kShmVersion");
+
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
@@ -544,6 +610,11 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->seq_ok.store(0);
     h->compositionBypass.store(1);
     h->rebuildSettleMs.store(250);
+    h->colourTrustPercent.store(200);
+
+    h->ratioSmoothPercent.store(100);
+    h->sdr16Multipass.store(0);
+
 
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         h->pass[i].overrideMask.store(0);
@@ -561,7 +632,8 @@ inline void ShmInitDefaults(ShmHeader* h) {
 }
 
 inline uint32_t ShmPassCeiling(const ShmHeader* h) {
-    return h->unlockPasses.load() ? kMaxPasses : kDefaultMaxPasses;
+    (void)h;
+    return kMaxPasses;
 }
 
 inline uint32_t ShmPasses(const ShmHeader* h) {

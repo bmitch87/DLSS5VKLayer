@@ -59,6 +59,22 @@ struct FrameSettings {
     // 1: present the model's raw answer as the frame -- no blend, no guard, no compare.
     uint32_t compositionBypass = 0;
 
+    // How much of the way toward a newly arrived answer the running pair moves each frame, 0..1.
+
+    float ghostSlack = 0.5f;
+
+    // Radius splitting the stale edit's safe half from the half that can ghost, in uv.
+    float editBlur = 0.04f;
+
+    float motionSmooth = 1.0f;
+
+    // How much of the chroma-agreement gate to apply. See colourTrustPercent.
+    float colourTrust = 1.0f;
+
+    // How much of the relighting ratio comes from the neighbourhood. See ratioSmoothPercent.
+    float ratioSmooth = 0.0f;
+
+
     static FrameSettings Read(const ShmHeader* h);
 };
 

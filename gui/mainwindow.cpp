@@ -135,7 +135,6 @@ struct SettingEntry {
 static const SettingEntry kSettingsTable[] = {
     {"set_enabled", &ShmHeader::enabled, false},
     {"set_passes", &ShmHeader::passes, false},
-    {"set_unlock_passes", &ShmHeader::unlockPasses, false},
     {"set_rebuild_settle_ms", &ShmHeader::rebuildSettleMs, false},
     {"set_model_resolution", &ShmHeader::workingScaleBits, true},
     {"set_down_leg_filter", &ShmHeader::scalingDownscaler, false},
@@ -157,6 +156,7 @@ static const SettingEntry kSettingsTable[] = {
     {"set_motion_units", &ShmHeader::mvecScaleMode, false},
     {"set_colour_mode", &ShmHeader::colourMode, false},
     {"set_hdr_mode", &ShmHeader::hdrMode, false},
+    {"set_sdr_16bit_multipass", &ShmHeader::sdr16Multipass, false},
     {"set_white_point_source", &ShmHeader::whitePointSource, false},
     {"set_paper_white", &ShmHeader::whitePointBits, true},
     {"set_white_point_scale", &ShmHeader::whitePointScaleBits, true},
@@ -1256,12 +1256,6 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                        "Every pass is another full run of the model and another feature holding its "
                        "own history, so the cost is close to linear.",
                        ShmBinder::AtCreate);
-        binder->AddBool(f, "Lift the pass limit", &ShmHeader::unlockPasses,
-                         QString("Raises the ceiling from %1 to %2.\n"
-                                 "Past a few passes the model is enhancing its own output, which is "
-                                 "outside what it was trained for.")
-                             .arg(kDefaultMaxPasses)
-                             .arg(kMaxPasses));
         binder->AddPercent(f, "Model resolution", &ShmHeader::workingScaleBits, 25, 200,
                            "What fraction of the frame the model works at. The frame itself is never "
                            "reduced.\n"
@@ -1277,7 +1271,7 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
         f->addRow(passBtn);
     }
 
-    scrollTab("Motion", &col);
+    scrollTab("Quality", &col);
     {
         auto* f = group(col, "Motion");
         binder->AddBool(f, "Estimate motion vectors", &ShmHeader::mvecEnabled,
@@ -1294,6 +1288,24 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                           "What the numbers in the field mean to the model.\n"
                           "Pixels is what the estimate produces; the others are for matching a model "
                           "that expects them.");
+    }
+    {
+        auto* f = group(col, "Input and precision");
+        binder->AddChoice(f, "HDR input", &ShmHeader::hdrMode,
+                          { "Auto", "Off", "Force float16" },
+                          "Let the model see the frame's real light instead of a tone-mapped copy.\n"
+                          "Auto turns it on when the swapchain is HDR -- a float swapchain, or 10-bit "
+                          "with a PQ colour space -- and the proxy then crosses as float16 carrying "
+                          "linear light, PQ-decoded first when the swapchain carries PQ.\n"
+                          "Off keeps the 8-bit proxy whatever the game presents.\n"
+                          "Force feeds the float proxy to an SDR swapchain too, which is an A/B tool "
+                          "rather than a preference.\n"
+                          "The model has the last word: if it refuses float input the pass falls back "
+                          "to 8-bit on its own.");
+        binder->AddBool(f, "16-bit SDR intermediates", &ShmHeader::sdr16Multipass,
+                        "Keep the images between SDR model passes at 16-bit. Disable to keep them "
+                        "8-bit and reduce VRAM and GPU bandwidth use; HDR is always float16.",
+                        ShmBinder::AtCreate);
     }
 
     scrollTab("Composition", &col);
@@ -1317,39 +1329,86 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                                             "At zero the frame is bit-identical to the game's own.");
         compositionRows << binder->AddFloat(f, "Color strength", &ShmHeader::colourStrengthBits,
                                             0.0, 4.0, 0.05,
-                                            "How much of the model's color comes with its light.\n"
-                                            "At zero the frame keeps the game's hue exactly.");
+                                            "How much of the model's color comes with its light. At "
+                                            "zero the frame keeps the game's hue exactly.");
+        compositionRows << binder->AddInt(f, "Color bound (%)", &ShmHeader::colourTrustPercent,
+                       0, 800,
+                       "How far the model may move a pixel's color away from the game's own.\n\n"
+                       "The model disagrees about color most at edges, and taking its hue whole "
+                       "there can put one color on one side of an edge and its complement on the "
+                       "other. But a large disagreement is also what a real correction looks like -- "
+                       "a strip light the game glows blue and the model returns white -- so a rule "
+                       "that backs off as disagreement grows throws away the verdict exactly where "
+                       "there is one.\n\nThis bounds the move instead of refusing it. A correction "
+                       "of ordinary size passes through whole; anything several times larger is "
+                       "capped, keeping its direction and losing only its length, so it can never "
+                       "invert.\n\n200 is the default. Lower it if colored fringes appear along "
+                       "high-contrast edges; 0 keeps the game's hue exactly, which is the same as "
+                       "setting Color strength to 0.",
+                       ShmBinder::Live);
+        compositionRows << binder->AddInt(f, "Smooth the relighting (%)", &ShmHeader::ratioSmoothPercent,
+                       0, 100,
+                       "What lets the Highlight guard be raised without the picture going patchy.\n\n"
+                       "Classic and Matched residual rebuild the frame as its own pixel times one "
+                       "number. Where the model and the frame agree that number is 1 and nothing "
+                       "happens, which is why flat surfaces are always clean. On detailed content the "
+                       "model's answer differs sharply from pixel to pixel -- that difference is the "
+                       "enhancement -- so the number varies fast, and the guard is the only thing "
+                       "holding it. Raise the guard and that variation lands as blown and black "
+                       "pixels wearing whatever colour the texture had.\n\nThis takes the number "
+                       "from the pixel's neighbourhood instead of the pixel. What the model knows at "
+                       "this scale is how much light belongs here, not which pixel is brighter than "
+                       "its neighbour -- the frame already knows that, and is what gets "
+                       "multiplied.\n\n0 is the old per-pixel behaviour. Raise it toward 100 if you "
+                       "want a high guard: the relighting keeps its full range and stops "
+                       "speckling.",
+                       ShmBinder::Live);
+
         compositionRows << binder->AddFloat(f, "Highlight guard", &ShmHeader::maxRatioBits, 1.0, 30.0,
                                             0.5,
-                                            "The most the pass may brighten or darken a pixel.\n"
-                                            "A detail pass has no business restyling a light source, "
-                                            "whatever the model returns.");
-        compositionRows << binder->AddChoice(f, "Enlargement", &ShmHeader::transfer,
+                                            "How far the pass may move the light. A detail pass has "
+                                            "no business restyling a light source, whatever the "
+                                            "model returns.\n\nThis sets how far the light over a "
+                                            "pixel's neighbourhood may move, which is the relighting "
+                                            "you are asking for when you raise it. How far a single "
+                                            "pixel may then depart from its own neighbourhood is a "
+                                            "separate, fixed bound that does not move with this -- "
+                                            "so raising the guard buys range without buying speckle. "
+                                            "It used to be one number doing both jobs, and at a high "
+                                            "setting the per-pixel half stopped bounding anything, "
+                                            "which is what put blown and black pixels on detailed "
+                                            "surfaces.\n\nDetail is a pixel differing from its "
+                                            "neighbours by tens of percent. A blowout is one "
+                                            "differing by multiples. Only the second is refused.");
+        compositionRows << binder->AddChoice(f, "How the answer is applied", &ShmHeader::transfer,
                                              { "Classic", "Matched residual", "Native + edit" },
-                                             "How a model that worked below the frame's size is "
-                                             "brought back.\n"
-                                             "Matched residual carries only the model's difference up, "
-                                             "so the two pictures being composed are at the same "
-                                             "scale.\n"
-                                             "Native + edit composes nothing at all: the frame's own "
-                                             "pixels are the result and only the model's difference is "
-                                             "added to them, so geometry, text and edges the model "
-                                             "left alone stay at native sharpness.\n"
-                                             "Only does anything below a working scale of 1.");
+                                             "How a model that worked at a different size from the "
+                                             "frame is brought back. Active at any working scale "
+                                             "other than 1 -- above it as well as below, since what "
+                                             "matters is only that the model's raster differs from "
+                                             "the frame.\n\nClassic and Matched residual both "
+                                             "rebuild the output by scaling the frame's own pixel by "
+                                             "a per-pixel luminance ratio between the model's answer "
+                                             "and the frame. Where the two agree that ratio is 1 and "
+                                             "nothing happens, which is why flat surfaces are always "
+                                             "clean. On detailed content the model's answer differs "
+                                             "from the frame a great deal from one pixel to the next "
+                                             "-- that difference is the enhancement -- so the ratio "
+                                             "becomes large and varies sharply, and the Highlight "
+                                             "guard below then bounds it. Raising that guard lets "
+                                             "more of the variation through and it shows as patches "
+                                             "of over- and under-bright texture on exactly the "
+                                             "detailed things you were trying to enhance.\n\nNative "
+                                             "+ edit has no ratio at all. The frame's own pixels are "
+                                             "the result and only the model's difference is added to "
+                                             "them, so geometry, text and edges the model left alone "
+                                             "stay at native sharpness -- and there is no per-pixel "
+                                             "division to blow up. Use this one if raising the "
+                                             "Highlight guard makes detailed surfaces go patchy.");
+
     }
     {
         auto* f = group(col, "Color");
-        binder->AddChoice(f, "HDR input", &ShmHeader::hdrMode,
-                          { "Auto", "Off", "Force float16" },
-                          "Let the model see the frame's real light instead of a tone-mapped copy.\n"
-                          "Auto turns it on when the swapchain is HDR -- a float swapchain, or 10-bit "
-                          "with a PQ colour space -- and the proxy then crosses as float16 carrying "
-                          "linear light, PQ-decoded first when the swapchain carries PQ.\n"
-                          "Off keeps the 8-bit proxy whatever the game presents.\n"
-                          "Force feeds the float proxy to an SDR swapchain too, which is an A/B tool "
-                          "rather than a preference.\n"
-                          "The model has the last word: if it refuses float input the pass falls back "
-                          "to 8-bit on its own.");
         binder->AddChoice(f, "Frame holds", &ShmHeader::colourMode,
                           { "Auto", "A finished picture", "Linear light" },
                           "Whether the swapchain carries a frame the game already tone mapped or "
@@ -1386,9 +1445,15 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                           "Soft knee is the default and the two replace modes are known to flash on "
                           "bright lights.");
         binder->AddChoice(f, "Debug view", &ShmHeader::debugView,
-                          { "Off", "The picture the model saw", "Its raw answer", "What it changed" },
-                          "The last one is amplified and centred on grey, so both directions of the "
-                          "edit are visible at once.");
+                          { "Off", "The picture the model saw", "Its raw answer", "What it changed",
+                            "Where the color bound engages", "The color before the bound" },
+                          "\"What it changed\" is amplified and centred on grey, so both directions "
+                          "of the edit are visible at once.\n\n\"Where the color bound engages\" is "
+                          "green where the model's color passes whole and red where it is held back. "
+                          "It puts a wrong color on one side or the other of that line: green means "
+                          "the bound is not engaging and the fault is upstream; red means the bound "
+                          "is working and the color is coming from the frame's own hue times one "
+                          "scalar, which makes it a brightness problem rather than a color one.");
         binder->AddFloat(f, "Debug scale", &ShmHeader::debugScaleBits, 0.01, 100.0, 0.1,
                          "What the debug views are multiplied by on their way out.");
         binder->AddChoice(f, "Compare", &ShmHeader::compareMode, { "Off", "Side by side", "Wipe" },
