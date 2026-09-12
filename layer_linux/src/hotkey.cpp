@@ -14,7 +14,11 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <iterator>
+#include <set>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 namespace dlssnr {
@@ -127,7 +131,9 @@ bool Hotkeys::OpenEvdev() {
 }
 
 // Opens any keyboard not already open, and drops any that has gone away. Cheap: a readdir of
-// /dev/input and an ioctl per new device, a few times a second at most.
+// /dev/input, and an ioctl only for a device nobody has looked at yet. Devices that turn out not to
+// be keyboards are remembered as such -- see _notKeyboard -- because opening and closing them again
+// every second is not cheap at all.
 void Hotkeys::RescanEvdev() {
     // Devices that have gone away, asked with an ioctl rather than a read.
     //
@@ -150,16 +156,35 @@ void Hotkeys::RescanEvdev() {
     DIR* dir = opendir("/dev/input");
     if (!dir) return;
 
+    // Names seen this pass, so rejections for nodes that have since disappeared can be forgotten
+    // rather than accumulating for the life of the process.
+    std::set<std::string> seen;
+
     while (dirent* e = readdir(dir)) {
         if (std::strncmp(e->d_name, "event", 5) != 0) continue;
         const std::string name = e->d_name;
+        seen.insert(name);
         if (_known.count(name)) continue;
 
         const std::string path = "/dev/input/" + name;
+
+        // Already judged not to be a keyboard? Only trust that verdict if it is still the same
+        // node: a stat is two orders of magnitude cheaper than the open/ioctl/close it replaces.
+        struct stat st{};
+        const bool statOk = ::stat(path.c_str(), &st) == 0;
+        if (statOk) {
+            const auto it = _notKeyboard.find(name);
+            if (it != _notKeyboard.end()) {
+                if (it->second == st.st_ino) continue;
+                _notKeyboard.erase(it);  // same path, different device -- look again
+            }
+        }
+
         const int fd = open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0) continue;
         if (!LooksLikeAKeyboard(fd)) {
             close(fd);
+            if (statOk) _notKeyboard[name] = st.st_ino;
             continue;
         }
         _fds.push_back(fd);
@@ -168,6 +193,12 @@ void Hotkeys::RescanEvdev() {
         if (_announced) Log("[hotkey] picked up a keyboard that appeared later: %s", path.c_str());
     }
     closedir(dir);
+
+    // Forget rejections for nodes that are gone, so the set tracks /dev/input rather than growing
+    // without bound on a machine that plugs and unplugs a lot.
+    for (auto it = _notKeyboard.begin(); it != _notKeyboard.end();)
+        it = seen.count(it->first) ? std::next(it) : _notKeyboard.erase(it);
+
     _announced = true;
 }
 
