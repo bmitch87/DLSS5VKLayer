@@ -4,7 +4,7 @@
 # Overridable version (packaging/make-dist.sh passes these from
 # DLSSNR_VERSION/DLSSNR_RELEASE via --define; defaults keep local builds working).
 %{!?dlssnr_version: %global dlssnr_version 0.3.0}
-%{!?dlssnr_release: %global dlssnr_release 1}
+%{!?dlssnr_release: %global dlssnr_release 2}
 %global pkg_release %{dlssnr_release}
 
 Name:           dlssnr-personal
