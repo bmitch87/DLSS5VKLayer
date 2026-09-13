@@ -26,8 +26,10 @@
 // increasingly not what people run.
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
+#include <sys/types.h>
 #include <vector>
 
 namespace dlssnr {
@@ -66,6 +68,17 @@ class Hotkeys {
     // Which device files are already open, so a rescan is cheap and does not double-open.
     std::set<std::string> _known;
     std::vector<std::string> _knownOrder;
+
+    // Which device files were looked at and turned out not to be keyboards. Remembering the
+    // rejections is what makes a rescan cheap: without this every mouse, audio jack and lid switch
+    // is re-opened and re-closed every second, and closing an evdev node is not free -- measured at
+    // 4-16 ms each on a machine with 24 of them, all of it on the present thread.
+    //
+    // Keyed by inode, not just by name. devtmpfs hands out a fresh inode when a node is destroyed
+    // and recreated, so an unplug/replug that reuses "event6" still looks new here and is probed
+    // again. Name alone would cache the verdict for whatever device lands on that path next, which
+    // is the same class of bug the EVIOCGVERSION check above exists to avoid.
+    std::map<std::string, ino_t> _notKeyboard;
 
     // A keyboard plugged in mid-game has to be picked up, but a readdir every present would be silly.
     // Once a second is far below what anyone would notice and does not vary with frame rate.
