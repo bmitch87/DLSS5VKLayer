@@ -580,6 +580,9 @@ struct DeviceChain {
     ShmMap shm;
     uint64_t framesComposed = 0;
     uint64_t framesPassedThrough = 0;
+    // Every present that reached the hook on this device, composed or not. The denominator for
+    // every per-frame number the header publishes; see layerPresents in common/shm_protocol.h.
+    uint64_t presentsSeen = 0;
     // Phase 5: the dma-buf exchange. The export sequences last imported; a new sequence means the
     // image behind the descriptor changed and the reference is taken again.
     uint32_t proxySeqSeen = 0;
@@ -1737,6 +1740,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
     if (!dc || !dc->vkQueuePresentKHR) return VK_ERROR_INITIALIZATION_FAILED;
     dc->lastPresentMs.store(NowMs(), std::memory_order_relaxed);
 
+    // Counted here and nowhere else: before the enable gate, before the primary claim, before any
+    // decision about this frame. A present the layer declined to touch is still a present the game
+    // made, and it is precisely the ones we decline that make this number differ from layerFrames.
+    ++dc->presentsSeen;
+    if (dc->shm.hdr)
+        ShmStore64(dc->shm.hdr->layerPresentsLo, dc->shm.hdr->layerPresentsHi, dc->presentsSeen);
+
     // Whether this call's wait semaphores have already been consumed by a submit of ours. They are
     // handed to the first swapchain we actually process; every path after that presents with none,
     // because a semaphore signalled once may only be waited on once. Presenting with them a second
@@ -1754,8 +1764,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         if (!ShmNeuralEnabled(dc->shm)) return dc->vkQueuePresentKHR(queue, pPresentInfo);
         if (DryRun()) {
             // The bottom rung. The hooks are installed, the mapping is attached, the hotkeys are
-            // polled -- and nothing else happens. No command buffer, no submit, no transport, no
-            // helper.
+            // polled and the counters above have already moved -- and nothing else happens. No
+            // command buffer, no submit, no transport, no helper.
             //
             // If the symptom survives this, it is not ours: what remains is the loader, the hook
             // itself, and whatever else is in the chain. Nothing under this file's control runs.
@@ -1828,9 +1838,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         if (TimeEnabled()) {
             static int frameNo = 0;
             if (++frameNo % TimeInterval() == 0) {
-                Log("[layer] composed=%llu passed through=%llu",
+                Log("[layer] presents=%llu composed=%llu passed through=%llu (%.2f presents "
+                    "per round trip)",
+                    (unsigned long long)dc->presentsSeen,
                     (unsigned long long)dc->framesComposed,
-                    (unsigned long long)dc->framesPassedThrough);
+                    (unsigned long long)dc->framesPassedThrough,
+                    dc->framesComposed ? double(dc->presentsSeen) / double(dc->framesComposed) : 0.0);
             }
         }
     }

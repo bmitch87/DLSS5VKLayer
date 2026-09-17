@@ -218,11 +218,20 @@ void PrintStatus(const ShmHeader* h) {
                 double(BitsToFloat(h->helperEvalMsBits.load())),
                 double(BitsToFloat(h->helperUploadMsBits.load())),
                 double(BitsToFloat(h->helperReadbackMsBits.load())));
+    const uint64_t roundTrips = ShmLoad64(h->layerFramesLo, h->layerFramesHi);
+    const uint64_t presents = ShmLoad64(h->layerPresentsLo, h->layerPresentsHi);
     std::printf("layer_pid=%u\nlayer_composition_up=%u\nlayer_frames=%llu\nlayer_ms=%.2f\n",
                 h->layerPid.load(),
                 h->layerCompositionUp.load(),
-                (unsigned long long) ShmLoad64(h->layerFramesLo, h->layerFramesHi),
+                (unsigned long long) roundTrips,
                 double(BitsToFloat(h->layerMsBits.load())));
+    // The denominator, printed next to what it divides. layer_frames counts round trips;
+    // layer_presents counts what the game handed the display. Every millisecond figure above is
+    // per round trip, so the two being equal is the only case in which they are also per present.
+    std::printf("layer_presents=%llu\n", (unsigned long long) presents);
+    if (presents > 0)
+        std::printf("layer_presents_per_round_trip=%.2f\n",
+                    roundTrips ? double(presents) / double(roundTrips) : 0.0);
     std::printf("measured_white_point=%g\n", double(BitsToFloat(h->layerMeasuredWhiteBits.load())));
     std::printf("hdr_mode=%u\nhdr_detected=%u\nhdr_active=%u\nproxy_format=%u\nhdr_encode=%u\n",
                 h->hdrMode.load(), h->hdrDetected.load(), h->hdrActive.load(),

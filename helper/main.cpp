@@ -3909,7 +3909,10 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     if (time) {
         static int frameNo = 0;
         if (++frameNo % TimeInterval() == 0) {
-            Log("[time] passes=%u/%u flow=%s upload=%.2f eval=%.2f (gpu %.2f over %u) "
+            // Per round trip, which is this process's only unit -- the helper never sees a
+            // present. Divide by the frame rate and the answer is wrong by however far the
+            // layer's layerPresents has run ahead of its layerFrames.
+            Log("[time] per round trip: passes=%u/%u flow=%s upload=%.2f eval=%.2f (gpu %.2f over %u) "
                 "readback=%.2f total=%.2f ms",
                 passes, wanted, ns.flow.enabled ? "on" : "off",
                 tUpload - t0, tEval - tUpload, evalGpuMs, timedPasses, tDone - tEval, tDone - t0);

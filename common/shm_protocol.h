@@ -37,7 +37,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 21;
+static constexpr uint32_t kShmVersion = 22;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -547,6 +547,22 @@ struct ShmHeader {
     // holdFrame is not a substitute. It is a setting, it says what the LAYER is doing, and
     // it is not written next to the pixels; this is a property of one request.
     std::atomic<uint32_t> frameRepeat;
+
+    // Presents seen by the layer, against layerFrames (round trips). Two counters, not one, because
+    // they are not the same event and the gap between them is the number every per-frame cost here
+    // has to be divided by.
+    //
+    // Every timing this header publishes is per ROUND TRIP. A reader that divides by the frame rate
+    // is asking a different question and gets a flattering answer, and the discrepancy is invisible
+    // while the two happen to be equal. They are not equal whenever a swapchain is passed through, a
+    // frame fails leg 1, the composition is disabled mid-session -- or something downstream of us
+    // generates frames we never saw, which is the case that cannot be detected from in here and can
+    // at least be counted from out here.
+    //
+    // Counted for every present that reaches the hook on a live device, including the ones that are
+    // passed straight through, because the denominator is what the game asked the display for.
+    std::atomic<uint32_t> layerPresentsLo;
+    std::atomic<uint32_t> layerPresentsHi;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -562,7 +578,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1972, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1980, "the header layout changed -- bump kShmVersion");
 
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
@@ -629,6 +645,7 @@ inline void ShmResetSettings(ShmHeader* h) {
         uint32_t answerExportSeq, answerPid, answerFd, answerGen;
         uint32_t layerProxySeq, layerAnswerSeq;
         uint32_t hdrDetected, hdrActive, proxyFormat, hdrEncode, frameRepeat;
+        uint32_t layerPresentsLo, layerPresentsHi;
     } v;
 #define DLSSNR_SAVE(f) v.f = h->f.load()
     DLSSNR_SAVE(seq_req); DLSSNR_SAVE(seq_resp); DLSSNR_SAVE(width); DLSSNR_SAVE(height);
@@ -647,7 +664,7 @@ inline void ShmResetSettings(ShmHeader* h) {
     DLSSNR_SAVE(answerExportSeq); DLSSNR_SAVE(answerPid); DLSSNR_SAVE(answerFd);
     DLSSNR_SAVE(answerGen); DLSSNR_SAVE(layerProxySeq); DLSSNR_SAVE(layerAnswerSeq);
     DLSSNR_SAVE(hdrDetected); DLSSNR_SAVE(hdrActive); DLSSNR_SAVE(proxyFormat); DLSSNR_SAVE(hdrEncode);
-    DLSSNR_SAVE(frameRepeat);
+    DLSSNR_SAVE(frameRepeat); DLSSNR_SAVE(layerPresentsLo); DLSSNR_SAVE(layerPresentsHi);
 #undef DLSSNR_SAVE
     char helperReason[kReasonBytes], layerReason[kReasonBytes], gameName[kNameBytes];
     std::memcpy(helperReason, h->helperReason, sizeof(helperReason));
@@ -672,7 +689,7 @@ inline void ShmResetSettings(ShmHeader* h) {
     DLSSNR_LOAD(answerExportSeq); DLSSNR_LOAD(answerPid); DLSSNR_LOAD(answerFd);
     DLSSNR_LOAD(answerGen); DLSSNR_LOAD(layerProxySeq); DLSSNR_LOAD(layerAnswerSeq);
     DLSSNR_LOAD(hdrDetected); DLSSNR_LOAD(hdrActive); DLSSNR_LOAD(proxyFormat); DLSSNR_LOAD(hdrEncode);
-    DLSSNR_LOAD(frameRepeat);
+    DLSSNR_LOAD(frameRepeat); DLSSNR_LOAD(layerPresentsLo); DLSSNR_LOAD(layerPresentsHi);
 #undef DLSSNR_LOAD
     std::memcpy(h->helperReason, helperReason, sizeof(helperReason));
     std::memcpy(h->layerReason, layerReason, sizeof(layerReason));

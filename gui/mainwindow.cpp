@@ -1269,12 +1269,29 @@ void MainWindow::updateStatus() {
         const uint32_t vram = hdr->helperVramMB.load();
         const uint32_t feats = hdr->helperFeatures.load();
         if (evalMs > 0.0 || vram) {
+            // "per round trip", not "per frame". The distinction is invisible while the two are
+            // equal and wrong in the flattering direction the moment they are not: a swapchain
+            // passed through, a frame that failed leg 1, or anything downstream generating frames
+            // we never saw all leave presents above round trips, and a cost divided by the frame
+            // rate would then read lower than it is.
             detail = QString("&nbsp;&nbsp;&nbsp;<span style=\"color:#9e9e9e;\">"
-                             "%1 pass%2 &middot; %3 ms &middot; %4 MiB</span>")
+                             "%1 pass%2 &middot; %3 ms/round trip &middot; %4 MiB</span>")
                          .arg(feats)
                          .arg(feats == 1 ? "" : "es")
                          .arg(evalMs, 0, 'f', 2)
                          .arg(vram);
+            // And say how far apart they are, but only once they are. Rounding noise on a handful
+            // of frames is not a finding; a persistent ratio above 1.05 is, and it is the only
+            // place the window admits that not every present is a round trip.
+            const quint64 rt = ShmLoad64(hdr->layerFramesLo, hdr->layerFramesHi);
+            const quint64 pres = ShmLoad64(hdr->layerPresentsLo, hdr->layerPresentsHi);
+            if (rt > 0 && pres > rt) {
+                const double ratio = double(pres) / double(rt);
+                if (ratio >= 1.05)
+                    detail += QString("&nbsp;&nbsp;<span style=\"color:#9e9e9e;\">"
+                                      "(%1 presents per round trip)</span>")
+                                  .arg(ratio, 0, 'f', 2);
+            }
         }
     }
     statusLabel->setText(
