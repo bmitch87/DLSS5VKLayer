@@ -1453,7 +1453,18 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                        "speckling.",
                        ShmBinder::Live);
 
-        compositionRows << binder->AddFloat(f, "Highlight guard", &ShmHeader::maxRatioBits, 1.0, 30.0,
+        // The minimum is 1.1 and not 1.0. At exactly 1.0 the luminance path is identity by
+        // construction -- addGuard's clamp becomes [1,1], and lift and drop are both
+        // lerp(x, x, t) -- so boundedRatio is 1 everywhere and the model's whole luminance
+        // verdict is divided back out. The slider's own minimum was an off switch for half
+        // the pass, at the end of a control whose other end is 30. Colour still moves at
+        // 1.0 through the colour strength and the OkLab hue path, so it is not a bypass;
+        // it is worse than a bypass, because it looks like a setting.
+        //
+        // dlssnr-shmctl can still set 1.0 deliberately -- "show me the pass with the
+        // luminance bound fully closed" is a legitimate thing to ask for, and a diagnostic
+        // should not be unreachable -- and it says what it is doing when asked.
+        compositionRows << binder->AddFloat(f, "Highlight guard", &ShmHeader::maxRatioBits, 1.1, 30.0,
                                             0.5,
                                             "How far the pass may move the light. A detail pass has "
                                             "no business restyling a light source, whatever the "

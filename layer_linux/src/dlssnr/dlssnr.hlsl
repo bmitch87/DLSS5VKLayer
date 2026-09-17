@@ -1227,7 +1227,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     //
     // The guard is symmetric, so raising it to allow stronger relighting allows equally strong
     // *darkening* -- and a light source is exactly where that shows. At a guard of 1 the clamp is
-    // [1,1] and a lamp comes out white; at 3 the same lamp is allowed down to a third of itself and
+    // [1,1] and a lamp comes out white -- and note that this is not only a property to reason
+    // about, it was reachable from the interface: the slider's minimum was 1.0, where lift and drop
+    // are both lerp(x, x, t) = 1 and boundedRatio is 1 everywhere, so the whole luminance verdict
+    // is divided back out and half the pass silently stops. The slider now starts at 1.1; the CLI
+    // can still ask for 1.0 on purpose and says what that does; at 3 the same lamp is allowed down to a third of itself and
     // visibly dims, which reads as the value inverting. Detail strength makes it worse rather than
     // better, because it raises the ratio to a power: at 2.0 a ratio of 0.85 becomes 0.72.
     //

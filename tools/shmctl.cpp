@@ -150,6 +150,16 @@ bool ApplySetting(ShmHeader* h, const char* name, const char* value) {
     for (const auto& s : kSettings) {
         if (std::strcmp(s.name, name) != 0) continue;
         const double v = std::atof(value);
+        // A guard of exactly 1 pins the composition's luminance path to identity: the
+        // clamp becomes [1,1] and the model's luminance verdict is divided straight back
+        // out, so half the pass stops. That is a legitimate diagnostic and stays reachable
+        // from here -- the GUI's slider starts at 1.1 -- but it should never be reached by
+        // accident and thought to be a setting.
+        if (std::strcmp(name, "guard") == 0 && v <= 1.0) {
+            std::fprintf(stderr,
+                         "note: guard=%g pins the luminance path to identity; the model's "
+                         "luminance change is fully undone. Colour still moves.\n", v);
+        }
         (h->*s.field).store(s.isFloat ? FloatToBits(float(v)) : uint32_t(v < 0 ? 0 : v));
         h->controlSeq.fetch_add(1);
         // Anything the model latches when its feature is built also bumps the tuning sequence, which
