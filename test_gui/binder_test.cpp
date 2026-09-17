@@ -80,6 +80,41 @@ int main(int argc, char** argv) {
     check("reload pulls percent", scale->value() == 75);
     check("reload does not write back", hdr.controlSeq.load() == ctrl);
 
+    // Defaults against bounds.
+    //
+    // Three separate places say what a setting's sensible values are -- ShmInitDefaults, the
+    // control's range here, and the entry in dlssnr-shmctl -- and nothing used to make them agree.
+    // When they drift the symptom is quiet: the window clamps a default it was never meant to
+    // touch, so opening it rewrites the settings and "reset to defaults" stops producing the
+    // defaults. What is asserted here is the mechanism, not the current table; the real window runs
+    // the same check over every control it builds and warns.
+    check("the real controls above are all inside their bounds", binder.DefaultProblems().empty());
+
+    {
+        QWidget bad;
+        auto* badForm = new QFormLayout(&bad);
+        ShmBinder probe(&hdr, &bad);
+        // passes defaults to 1; a control starting at 4 would clamp it on sight.
+        probe.AddInt(badForm, "TooHigh", &ShmHeader::passes, 4, 30, "");
+        check("an int default below the range is caught", probe.DefaultProblems().size() == 1);
+
+        // skinStructure defaults to -1, which a 0..4 control cannot show.
+        probe.AddFloat(badForm, "NoSentinel", &ShmHeader::skinStructureBits, 0.0, 4.0, 0.05, "");
+        check("a float default below the range is caught", probe.DefaultProblems().size() == 2);
+
+        // mvecPixelSize defaults to index 2; two choices cannot reach it.
+        probe.AddChoice(badForm, "TooFew", &ShmHeader::mvecPixelSize, { "a", "b" }, "");
+        check("a choice default past the last item is caught", probe.DefaultProblems().size() == 3);
+
+        // workingScale defaults to 1.0, i.e. 100%, which a 25..75% control would clamp.
+        probe.AddPercent(badForm, "TooNarrow", &ShmHeader::workingScaleBits, 25, 75, "");
+        check("a percent default above the range is caught", probe.DefaultProblems().size() == 4);
+
+        // And the check must not fire on a control that is right.
+        probe.AddInt(badForm, "Fine", &ShmHeader::sceneCutThreshold, 0, 255, "");
+        check("a correct control adds no problem", probe.DefaultProblems().size() == 4);
+    }
+
     std::printf("%s\n", failures ? "FAILURES" : "all binder paths ok");
     return failures ? 1 : 0;
 }

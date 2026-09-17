@@ -26,6 +26,7 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QDebug>
 #include <QLabel>
 #include <QIcon>
 #include <QLineEdit>
@@ -1473,8 +1474,15 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                            "What fraction of the frame the model works at. The frame itself is never "
                            "reduced.\n"
                            "Below 100% also cuts what crosses shared memory, quadratically.\n"
-                           "Above 100% the model supersamples, which on this transport is expensive: "
-                           "at 200% on a 4K frame it is 132 MB each way, every frame.");
+                           "Above 100% does not supersample in the usual sense and is unlikely to "
+                           "help. Supersampling finds detail by taking MORE samples of the scene; "
+                           "this pass is shown a frame the game has already finished and presented, "
+                           "so there are no further samples anywhere in this architecture to find. "
+                           "Enlarging first only gives the model more pixels carrying the same "
+                           "information.\n"
+                           "It is also expensive: at 200% on a 4K frame the transport carries 132 MB "
+                           "each way, every frame. Treat it as an experiment, not a quality "
+                           "setting.");
         binder->AddChoice(f, "Down-leg filter", &ShmHeader::scalingDownscaler,
                           { "(fsr1, unsupported)", "Bicubic", "Catmull-Rom", "Lanczos2", "Lanczos3",
                             "Kaiser2", "Kaiser3", "Magic" },
@@ -1799,5 +1807,15 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
     binder->Reload();
     updateCompositionVisibility();
     updateSkinStructureEnabled();
+
+    // Every control has now declared its bounds, so the binder can say whether any of them would
+    // clamp the value ShmInitDefaults puts in its field. A disagreement is quiet and specific --
+    // the window silently rewrites a default the moment it opens, so "reset to defaults" stops
+    // producing the defaults -- and it is exactly the kind of thing three separate tables of
+    // sensible values drift into. Loud, because there is no correct response except to fix it.
+    for (const QString& problem : binder->DefaultProblems())
+        qWarning("dlssnr: control default disagrees with its bounds -- %s",
+                 qUtf8Printable(problem));
+
     return tabs;
 }

@@ -73,11 +73,27 @@ class ShmBinder : public QObject {
     // Pull every bound control's value out of the header. Safe to call at any time.
     void Reload();
 
+    // Every control whose range does not contain the value ShmInitDefaults would put in its field.
+    //
+    // Three places state what a setting's sensible values are -- the header's default, this
+    // control's bounds, and the entry in dlssnr-shmctl -- and nothing made them agree. When they
+    // disagree the symptom is quiet and specific: the interface clamps a default it was never meant
+    // to change, so a fresh profile silently becomes a different profile the first time the window
+    // is opened, and "reset to defaults" produces something that is not the defaults.
+    //
+    // Checked against ShmInitDefaults rather than against the live header, because the live header
+    // holds whatever the user last chose, and the question is about the defaults.
+    const std::vector<QString>& DefaultProblems() const { return _defaultProblems; }
+
   private:
     void Write(Field field, uint32_t raw, Latch latch);
+    // The value ShmInitDefaults puts in `field`. One scratch header, built once.
+    uint32_t DefaultRaw(Field field) const;
+    void NoteDefault(const QString& label, bool ok, const QString& detail);
 
     ShmHeader* _hdr = nullptr;
     QWidget* _parent = nullptr;
     std::vector<std::function<void()>> _reloaders;
+    std::vector<QString> _defaultProblems;
     bool _reloading = false;
 };
