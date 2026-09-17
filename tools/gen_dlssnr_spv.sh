@@ -1,37 +1,55 @@
 #!/usr/bin/env bash
 # Regenerate the composition shader's SPIR-V and its embedded header.
 #
-# dlssnr.hlsl is compiled with dxc, exactly as upstream does it: the checked-in module was built by
-# dxc 1.9 and recompiling it with the same version reproduces it byte for byte, so a regen that only
-# changes the cbuffer tail can be reviewed as a real diff rather than a toolchain reshuffle.
+# The checked-in module is a GLSLC build, and this script used to prefer dxc.
 #
-# Prefers dxc. Set DXC=/path/to/dxc, or drop the linux release binary at build/dxc.
-# glslc is accepted as a Fedora-friendly fallback for this HLSL compute module.
-# (https://github.com/microsoft/DirectXShaderCompiler/releases -- unpack, bin/dxc is the file).
+# `spirv-dis DlssNr_Shader_Vk.spv | head -3` says "Generator: Google Shaderc over Glslang", not dxc,
+# so the comment that used to sit here -- "compiled with dxc, exactly as upstream does it ...
+# reproduces it byte for byte" -- was wrong about the file it was describing. On a machine with dxc
+# installed the script silently produced a different compiler's module: 46468 bytes against 40992,
+# a 5 KB diff in the one file that does all of this project's colour work, presented as if it were
+# the same shader. That is not a regen anybody can review.
+#
+# So the compiler is now an explicit choice and the default is the one the module was built with.
+# Today's glslc against the checked-in module differs in 39 lines of disassembly out of about seven
+# thousand, all of them constant-folding precision on a handful of literals (0.18, 5.5555, a * 16)
+# -- version drift, not a different shader.
+#
+#   SPV_COMPILER=glslc   (default) matches the checked-in module
+#   SPV_COMPILER=dxc     a deliberate toolchain change; expect a whole-file diff and say so
+#   GLSLC=/path, DXC=/path   override either binary
 #
 # The .h is regenerated from the .spv by hand rather than with xxd -i because the file's shape --
 # twelve bytes a line, the array named dlssnr_spv -- is what the layer includes.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+WANT="${SPV_COMPILER:-glslc}"
+GLSLC="${GLSLC:-$(command -v glslc || true)}"
 DXC="${DXC:-build/dxc}"
 if [ ! -x "$DXC" ]; then
     DXC="$(command -v dxc || true)"
 fi
-GLSLC="$(command -v glslc || true)"
 
 SRC=layer_linux/src/dlssnr/dlssnr.hlsl
 SPV=layer_linux/src/dlssnr/DlssNr_Shader_Vk.spv
 HDR=layer_linux/src/dlssnr/DlssNr_Shader_Vk.h
 
-if [ -n "${DXC:-}" ] && [ -x "$DXC" ]; then
-    "$DXC" -spirv -D VK_MODE -T cs_6_0 -E CSMain -Fo "$SPV" "$SRC"
-elif [ -n "$GLSLC" ]; then
+case "$WANT" in
+  glslc)
+    [ -n "$GLSLC" ] || { echo "glslc not found (set GLSLC=, or SPV_COMPILER=dxc)" >&2; exit 1; }
+    echo "compiling with $GLSLC ($("$GLSLC" --version 2>&1 | head -1))"
     "$GLSLC" -x hlsl -fshader-stage=compute -DVK_MODE -fentry-point=CSMain -O -c -o "$SPV" "$SRC"
-else
-    echo "neither dxc nor glslc was found" >&2
-    exit 1
-fi
+    ;;
+  dxc)
+    [ -n "${DXC:-}" ] && [ -x "$DXC" ] || { echo "dxc not found (set DXC=)" >&2; exit 1; }
+    echo "compiling with $DXC -- NOT the compiler the checked-in module was built with;"
+    echo "the diff will be the whole file, so say so in the commit."
+    "$DXC" -spirv -D VK_MODE -T cs_6_0 -E CSMain -Fo "$SPV" "$SRC"
+    ;;
+  *)
+    echo "SPV_COMPILER must be glslc or dxc" >&2; exit 1 ;;
+esac
 
 python3 - "$SPV" "$HDR" <<'EOF'
 import sys
