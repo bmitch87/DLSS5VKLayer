@@ -65,8 +65,20 @@ struct NgxSnippet {
 extern HMODULE g_layerModule;
 
 
-// What the model latches when a feature is built. Writing any of it at evaluate time does nothing at
-// all, which is why every one of these controls appeared to be dead: the model reads them once, here.
+// The model's tuning. This comment used to say that all of it is latched when a feature is
+// built and that writing any of it at evaluate does nothing at all. That was wrong, and it
+// was stated as settled fact, so a lot of machinery was built on it.
+//
+// Measured, with the parameter container instrumented over a live session
+// (DLSSNR_FORCE_OWNPARAM=1, OwnParam::DumpUnread): only the PRESET is read at create.
+// Intensity, localTone, localStructure, skinStructure, style and autoMask are read at every
+// EVALUATE. They are written per pass by NgxSetEvaluateTuning; NgxSetCreateTuning still
+// writes the lot before a create, which is harmless and keeps the preset correct.
+//
+// What still depends on a rebuild is therefore the preset alone. MaintainPasses, tuningSeq
+// and the GUI's AtCreate split are all sized for seven latched values and only one of them
+// is -- worth revisiting, but that is a behaviour change and wants a picture behind it,
+// because a key being READ at evaluate is not yet proof the model acts on it there.
 struct NgxTuning {
     float intensity = 1.0f;
     float localTone = 1.0f;
@@ -105,11 +117,13 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
                      const NVSDK_NGX_Resource_VK& out, const NVSDK_NGX_Resource_VK& mv,
                      const NVSDK_NGX_Resource_VK& depth, uint32_t width, uint32_t height);
 void NgxSetReset(NgxSnippet& s, bool reset, bool logValue = false);
-// The one strength the model reads at evaluate rather than at create, so it follows the setting
-// without a rebuild. The others were removed from this interface deliberately: writing them here did
-// nothing at all, which is what made every one of them look like a control that was simply ignored.
-// They live in NgxTuning and are read when the feature is built.
+// A no-op that logs once. This model has no sharpness parameter under any name -- see the
+// definition. It was believed to be "the one strength the model reads at evaluate"; it is
+// the one strength the model does not have.
 void NgxSetSharpness(NgxSnippet& s, float sharpness);
+// The six the model reads at EVERY evaluate, written per pass from that pass's own resolved
+// tuning. Only the preset is latched at create; see NgxTuning.
+void NgxSetEvaluateTuning(NgxSnippet& s, const NgxTuning& t);
 // How the motion field's units are read. Written every evaluate, because it goes with the field.
 void NgxSetMotionScale(NgxSnippet& s, float scaleX, float scaleY);
 bool NgxEvaluatePass(NgxSnippet& s, uint32_t pass, VkCommandBuffer recordingCmd);

@@ -173,13 +173,21 @@ struct OwnParam final : NVSDK_NGX_Parameter {
         if (!n || !v) return NVSDK_NGX_Result_FAIL_InvalidParameter;
         auto it = m.find(n); if (it == m.end()) { *v = nullptr; return miss(n); }
         it->second.readMask |= NgxCurrentPhase();
-        // An integer is a legitimate way to carry an address and we use it ourselves:
-        // DLSSNRComputeScalingRatioCallback is written with Set(u64), and the DLL does
-        // read that key. A FLOAT is not: reinterpreting one handed back a non-null
-        // garbage pointer where a miss was the honest answer, and a resource query that
-        // receives a plausible-looking address does not fail, it faults.
-        if (it->second.p) {
-            *v = it->second.p;
+        // Three cases, and the middle one was a regression until a live session caught it.
+        //
+        // A key SET as a pointer answers with that pointer even when it is null: we bind
+        // DLSSNR.ControlMask, UI, UIAlpha, Backbuffer and BidirectionalDistortionField as
+        // deliberate nulls, the DLL asks for all five at every evaluate, and "no resource"
+        // is the answer it is meant to get. Reporting a miss there both changed the answer
+        // and logged five lines a session blaming the DLL for keys we set on purpose.
+        //
+        // An integer is also a legitimate way to carry an address, and we use it ourselves.
+        //
+        // A float or double is not. Reinterpreting one handed back a non-null garbage
+        // pointer where a miss was the honest answer, and a resource query that receives a
+        // plausible-looking address does not fail, it faults.
+        if (it->second.kind == 4) {
+            *v = it->second.p;  // stored as a pointer; null is a real answer
         } else if (it->second.kind == 1) {
             *v = (void*)(uintptr_t)it->second.u;
         } else {
@@ -237,6 +245,10 @@ struct OwnParam final : NVSDK_NGX_Parameter {
     }
 };
 
+// Currently unwired. It was handed to the DLL under DLSSNRComputeScalingRatioCallback, which
+// is a real string in the binary but which an instrumented session shows is never called for
+// -- the model takes DLSSNR.ScalingRatio directly, and we set that. Kept because it is four
+// lines and it is the right answer if a build ever does ask.
 inline NVSDK_NGX_Result NVSDK_CONV ScalingRatioCallback(NVSDK_NGX_Parameter* parameters) noexcept {
     if (!parameters) return NVSDK_NGX_Result_FAIL_InvalidParameter;
     parameters->Set("DLSSNR.ScalingRatio", 1.0f);

@@ -2933,8 +2933,19 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         FillResource(rd, ns.depth, false);
         NgxSetResources(ns.ngx, rc, ro, rm, rd, w, h);
 
-        // Sharpness is the one strength the model reads at evaluate, so it follows the setting
-        // without a rebuild; everything else was latched when this pass's feature was built.
+        // This pass's own tuning, written immediately before this pass's evaluate.
+        //
+        // The model reads intensity, local tone, local structure, skin structure, style and
+        // the auto mask at EVERY evaluate -- only the preset is latched at create. Writing
+        // them only at create therefore did not make them latched: it left every pass
+        // evaluating with whatever the most recently built feature had put in the shared
+        // parameter block, so in a chain with per-pass overrides each pass ran with some
+        // other pass's values. Writing the resolved per-pass tuning here is what makes a
+        // per-pass override mean anything.
+        //
+        // Sharpness is set alongside it out of habit and does nothing: this model has no
+        // sharpness parameter. See NgxSetSharpness.
+        NgxSetEvaluateTuning(ns.ngx, TuningFor(shm.hdr, pass));
         const PassTuning ps = ShmResolvePass(shm.hdr, pass);
         NgxSetSharpness(ns.ngx, ClampF(ps.sharpness, 0.0f, 1.0f));
 

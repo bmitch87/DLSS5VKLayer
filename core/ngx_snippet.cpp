@@ -111,10 +111,6 @@ static bool ParamSetUI(NVSDK_NGX_Parameter* p, const char* n, unsigned int v, DW
     Guarded([&] { p->Set(n, v); return true; }, false, seh);
     return *seh == 0;
 }
-static bool ParamSetULL(NVSDK_NGX_Parameter* p, const char* n, unsigned long long v, DWORD* seh) {
-    Guarded([&] { p->Set(n, v); return true; }, false, seh);
-    return *seh == 0;
-}
 static bool ParamSetF(NVSDK_NGX_Parameter* p, const char* n, float v, DWORD* seh) {
     Guarded([&] { p->Set(n, v); return true; }, false, seh);
     return *seh == 0;
@@ -371,61 +367,62 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
         if (!ok) { s.disabled = true; return false; }
     }
 
-    // Create parameters (extracted_pipeline_notes.md section 4).
+    // Create parameters.
+    //
+    // This block used to be twice this size. The keys that are gone were never read by the
+    // DLL -- established two ways that agree: no such literal exists in nvngx_dlssnr.dll's
+    // string table, and a live session with the parameter container instrumented
+    // (DLSSNR_FORCE_OWNPARAM=1, see OwnParam::DumpUnread) reported 38 of 83 keys never
+    // asked for. Removed: DLSSNR.{InputWidth,InputHeight,OutputWidth,OutputHeight,
+    // Output.Width,Output.Height,Upscaling,Scale,AutoExposure,Hdr,SDR,Jitter.Offset.X,
+    // Jitter.Offset.Y}, the six literal NVSDK_NGX_Parameter_* spellings, the undotted
+    // aliases (Color/Output/Depth/MVec/MotionVectors/Reset/Width/Height/JitterOffset*),
+    // Feature_Flags, Sharpness, InPreExposure, InExposureScale and PerfQualityValue.
+    //
+    // They were not free. Each one reads to a maintainer as "we told the model this", and
+    // two of them were load-bearing in comments elsewhere that were therefore wrong.
+    //
+    // What actually pins this pass to 1:1 is DLSSNR.ScalingRatio, which IS read, at create
+    // and again at every evaluate. DLSSNR.Upscaling never existed; the comment that said it
+    // was what kept the model from upscaling was describing a key the DLL does not have.
+    //
+    // DLSSNRComputeScalingRatioCallback is also gone: it is a real name in the binary, but
+    // the probe shows it is never called for, because ScalingRatio is supplied directly.
+    // PerfQualityValue is a real name too, with its own error strings in the DLL, and was
+    // still never read on this path -- it belongs to a scaling-ratio route we do not take.
     DWORD seh = 0;
     bool ps = true;
     ps &= ParamSetUI(s.params, "DLSSNR.Width", width, &seh);
     ps &= ParamSetUI(s.params, "DLSSNR.Height", height, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.InputWidth", width, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.InputHeight", height, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.OutputWidth", width, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.OutputHeight", height, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.Output.Width", width, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.Output.Height", height, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.Upscaling", 0u, &seh);
-    ps &= ParamSetF(s.params, "DLSSNR.Scale", 1.0f, &seh);
     ps &= ParamSetF(s.params, "DLSSNR.ScalingRatio", 1.0f, &seh);
-    ps &= ParamSetULL(s.params, "DLSSNRComputeScalingRatioCallback",
-                      (unsigned long long)(void*)&ScalingRatioCallback, &seh);
     ps &= ParamSetUI(s.params, "DLSSNR.Hint.Render.Preset", 0u, &seh);
-    ps &= ParamSetUI(s.params, "Width", width, &seh);
-    ps &= ParamSetUI(s.params, "Height", height, &seh);
-    // Was 3u with "// Balanced" beside it. 3 is UltraPerformance -- a three-times upscale
-    // from a third-resolution render -- and this pass upscales nothing. The value is
-    // unchanged here on purpose: it is what every session so far has run with, the key is
-    // read and validated by the DLL, and changing it is a measurement rather than a
-    // rename. extracted_pipeline_notes.md records the verified reference as passing
-    // Balanced, so the note and the code have disagreed for some time.
-    ps &= ParamSetUI(s.params, "PerfQualityValue",
-                     (unsigned)NVSDK_NGX_PerfQuality_Value_UltraPerformance, &seh);
     ps &= ParamSetUI(s.params, "CreationNodeMask", 1u, &seh);
     ps &= ParamSetUI(s.params, "VisibilityNodeMask", 1u, &seh);
-    ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_PerfQualityValue",
-                     (unsigned)NVSDK_NGX_PerfQuality_Value_UltraPerformance, &seh);
-    ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_CreationNodeMask", 1u, &seh);
-    ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_VisibilityNodeMask", 1u, &seh);
 
-    // Create flags: sharpening is applied by the net when the runtime float is
-    // nonzero (see NgxSetSharpness); auto-exposure keeps adaptation state in the
-    // DLL so it survives normal dynamic lighting without host-side resets.
-    unsigned int createFlags = NVSDK_NGX_DLSS_Feature_Flags_DoSharpening |
-                               NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    // No Feature_Flags, and this is the correction that matters most in this file.
+    //
+    // DoSharpening, AutoExposure and IsHDR were computed here and written to Feature_Flags
+    // and its macro-name twin. Neither key exists in the DLL and the probe confirms neither
+    // is ever read, so none of those three flags has ever reached the model -- by this
+    // route or any other, because everything the model receives goes through the parameter
+    // block. There is no flags key among the 61 DLSSNR.* names either.
+    //
+    // So whatever the HDR path achieves, it achieves through what the layer does to the
+    // pixels and through the resource formats we bind, not through a signal the model was
+    // given. ApplyHdrContract still re-derives hdrActive because the rest of the helper
+    // keys off it -- the crossing image formats, the proxy width, the rebuild -- and that
+    // part is real. What is not real is the idea that the model was told.
+    //
+    // The same goes for exposure: InPreExposure, InExposureScale and DLSSNR.AutoExposure
+    // were all unread. A scan of the binary finds no exposure parameter under any name,
+    // while it does contain a CUDA kernel called cuda_capture_output_exposure_scale_kernel
+    // -- the model scales its output by an exposure it computes internally, with nothing to
+    // steer it. The only exposure control anyone has over this model is what the proxy
+    // looks like, which is the white-point meter's job.
     const char* hdrEnv = getenv("DLSSNR_HDR");
     const bool wantHdr = s.hdrActive || (hdrEnv && hdrEnv[0] == '1');
-    if (wantHdr) createFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
-    ps &= ParamSetUI(s.params, "Feature_Flags", createFlags, &seh);
-    ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_Feature_Flags", createFlags, &seh);
-
-    // Non-destructive exposure: identity pre-exposure/exposure-scale (never
-    // re-pinned per frame) + SDR tonemapped hint unless the HDR path is asked
-    // for and the snippet's feature flags advertise HDR.
-    ps &= ParamSetF(s.params, "InPreExposure", 1.0f, &seh);
-    ps &= ParamSetF(s.params, "InExposureScale", 1.0f, &seh);
-    ps &= ParamSetF(s.params, "NVSDK_NGX_Parameter_PreExposure", 1.0f, &seh);
-    ps &= ParamSetF(s.params, "NVSDK_NGX_Parameter_ExposureScale", 1.0f, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.AutoExposure", 1u, &seh);
-    Log("[params] create contract set: %s (seh=%#x) flags=%#x hdr=%d",
-        ps ? "ok" : "FAILED", seh, createFlags, int(wantHdr));
+    Log("[params] create contract set: %s (seh=%#x) hdr=%d", ps ? "ok" : "FAILED", seh,
+        int(wantHdr));
 
     // Snippet Init_Ext: (appId, path, instance, pd, device, version, featureInfo=nullptr)
     NVSDK_NGX_Result initResult = NVSDK_NGX_Result_FAIL_NotInitialized;
@@ -475,14 +472,13 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
         }
     }
 
-    // Tonemapping hint now that the snippet's feature flags are known: SDR by default (the input is
-    // LDR RGBA8); HDR only when both asked for and advertised.
+    // The tonemap hint that used to be written here -- DLSSNR.Hdr / DLSSNR.SDR -- is gone:
+    // neither key is in the DLL and neither was ever read. The decision itself still
+    // matters to us, so it is still computed and logged; it just is not sent anywhere.
     {
-        DWORD seh2 = 0;
         const bool hdrPath = wantHdr && s.hdrCapable;
-        ParamSetUI(s.params, "DLSSNR.Hdr", hdrPath ? 1u : 0u, &seh2);
-        ParamSetUI(s.params, "DLSSNR.SDR", hdrPath ? 0u : 1u, &seh2);
-        Log("[params] tonemap hint: %s (featureFlags=%#x)", hdrPath ? "HDR" : "SDR", s.featureFlags);
+        Log("[params] hdr path: %s (featureFlags=%#x) -- not sent, the model has no such key",
+            hdrPath ? "HDR" : "SDR", s.featureFlags);
     }
 
     // Last, so neither the create contract above nor the tonemap hint can overwrite it. Its preset
@@ -547,20 +543,21 @@ void NgxSetHdr(NgxSnippet& s, bool want) {
     s.hdrActive = want;
 }
 
-// The HDR contract, rewritten from s.hdrActive before every create. The create flags and the
-// tonemap hint are ordinary string-keyed parameters, so restating them here is exactly what the
-// init-time block did once -- and doing it at create is what lets a toggle take effect on the next
-// feature build rather than never.
+// There is no HDR contract to write, and finding that out is what this function is now for.
+//
+// It used to set Feature_Flags (with IsHDR), its macro-name twin, DLSSNR.Hdr and DLSSNR.SDR
+// before every create, on the reasoning that restating them at create is what lets an HDR
+// toggle take effect on the next feature build rather than never. The reasoning was sound
+// and the keys were not: none of those four exists in nvngx_dlssnr.dll, and an instrumented
+// session confirms none is ever read. The model has never been told whether the frame is
+// HDR.
+//
+// Kept as a named no-op rather than deleted, because the call sites read as a contract and
+// somebody will otherwise re-add one. What actually carries HDR is on our side of the
+// boundary: the layer's encode, the crossing image formats, and hdrActive driving the
+// rebuild. Those are real and unaffected.
 static void ApplyHdrContract(NgxSnippet& s) {
-    if (!s.params) return;
-    DWORD seh = 0;
-    unsigned int flags = NVSDK_NGX_DLSS_Feature_Flags_DoSharpening |
-                         NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-    if (s.hdrActive) flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
-    ParamSetUI(s.params, "Feature_Flags", flags, &seh);
-    ParamSetUI(s.params, "NVSDK_NGX_Parameter_Feature_Flags", flags, &seh);
-    ParamSetUI(s.params, "DLSSNR.Hdr", s.hdrActive ? 1u : 0u, &seh);
-    ParamSetUI(s.params, "DLSSNR.SDR", s.hdrActive ? 0u : 1u, &seh);
+    (void)s;
 }
 
 bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height,
@@ -623,11 +620,14 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
         s.params->Set("DLSSNR.UIAlpha", (const NVSDK_NGX_Resource_VK*)nullptr);
         s.params->Set("DLSSNR.Backbuffer", (const NVSDK_NGX_Resource_VK*)nullptr);
         s.params->Set("DLSSNR.BidirectionalDistortionField", (const NVSDK_NGX_Resource_VK*)nullptr);
-        s.params->Set("Color", &s.resColor);
-        s.params->Set("Output", &s.resOut);
-        s.params->Set("Depth", hasDepth ? &s.resDepth : (const NVSDK_NGX_Resource_VK*)nullptr);
-        s.params->Set("MotionVectors", &s.resMV);
-        s.params->Set("MVec", &s.resMV);
+        // The undotted aliases (Color, Output, Depth, MotionVectors, MVec) are gone: the
+        // probe reports them never read, and the DLSSNR.* names above are the ones the model
+        // asks for. The five nulls stay -- the DLL asks for all five every evaluate, and
+        // "no resource" is the answer it is meant to get.
+        //
+        // It also asks for the four subrect keys of each of those five, which we do not set;
+        // that is harmless while the resources are null, and it confirms that the DLL infers
+        // no subrect from a resource. Anything that ever binds one of them owes it a subrect.
         return true;
     }, false, &seh);
 
@@ -643,15 +643,10 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
         ParamSetUI(s.params, n[2], width, &seh);
         ParamSetUI(s.params, n[3], height, &seh);
     }
+    // Gone from this block, all confirmed never read: the dotted and undotted jitter keys
+    // (this pass has no jitter anyway), the undotted Reset/Width/Height aliases whose
+    // DLSSNR.* twins are the ones the model asks for, and Sharpness -- see NgxSetSharpness.
     bool ps = true;
-    ps &= ParamSetF(s.params, "DLSSNR.Jitter.Offset.X", 0.0f, &seh);
-    ps &= ParamSetF(s.params, "DLSSNR.Jitter.Offset.Y", 0.0f, &seh);
-    ps &= ParamSetF(s.params, "JitterOffsetX", 0.0f, &seh);
-    ps &= ParamSetF(s.params, "JitterOffsetY", 0.0f, &seh);
-    ps &= ParamSetUI(s.params, "Reset", 1u, &seh);
-    ps &= ParamSetF(s.params, "Sharpness", 0.0f, &seh);
-    ps &= ParamSetUI(s.params, "Width", width, &seh);
-    ps &= ParamSetUI(s.params, "Height", height, &seh);
     ps &= ParamSetF(s.params, "DLSSNR.MVecScaleX", 1.0f, &seh);
     ps &= ParamSetF(s.params, "DLSSNR.MVecScaleY", 1.0f, &seh);
     ps &= ParamSetUI(s.params, "DLSSNR.DepthInverted", 1u, &seh);
@@ -661,15 +656,28 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
     ps &= ParamSetUI(s.params, "DLSSNR.Reset", 1u, &seh);
     ps &= ParamSetUI(s.params, "DLSSNR.UICorrection", 0u, &seh);
 
-    // Style, Intensity, LocalTone, LocalStructure, SkinStructure and UseAutoMask are deliberately
-    // absent. They used to be written here, every frame, as constants -- which did two harmful
-    // things: it had no effect on the running feature, because the model latches them at creation,
-    // and it left the parameter block holding those constants for whatever created a feature next.
-    // A feature built at any moment other than immediately after NgxSetCreateTuning therefore got
-    // defaults no matter what the user had chosen. They belong to NgxTuning and to create time.
+    // Style, Intensity, LocalTone, LocalStructure, SkinStructure and UseAutoMask are absent
+    // HERE and written per pass by NgxSetEvaluateTuning instead. The distinction is the
+    // whole point and the old comment in this place had it backwards.
     //
-    // UseAutoMask was the clearest case: the constant written here was 0, so the automatic skin mask
-    // was forced off regardless of the setting, whose default is on.
+    // They used to be written here as CONSTANTS, every frame, which was a real bug: it left
+    // the parameter block holding those constants for whatever created a feature next, so a
+    // feature built at any moment other than immediately after NgxSetCreateTuning got
+    // defaults whatever the user had chosen. UseAutoMask was the clearest case -- the
+    // constant was 0, forcing the automatic skin mask off regardless of the setting.
+    //
+    // Removing the constants was right. The conclusion bolted onto it -- "the model latches
+    // them at creation, so writing them at evaluate does nothing at all" -- was wrong, and
+    // it was stated as settled fact here and in core/ngx_snippet.h for a long time. An
+    // instrumented session says otherwise: DLSSNR.{Intensity,LocalToneStrength,
+    // LocalStructureStrength,SkinStructureStrength,Style,UseAutoMask} are read at EVALUATE,
+    // every frame. The only one of the seven read at create is DLSSNR.Hint.Render.Preset.
+    //
+    // That inverts the consequence. Writing them only at create does not make them latched;
+    // it means every pass evaluates with whatever the most recently built feature left in
+    // the block -- so in a multi-pass chain with per-pass overrides, every pass ran with
+    // some other pass's tuning. The fix is not to put constants back, it is to write each
+    // pass's own resolved values immediately before that pass's evaluate.
     // Read back once per change rather than once per pass per frame: this runs on every evaluate in
     // a multipass chain, and the readback is a diagnostic, not a step.
     unsigned int autoMask = 0;
@@ -693,14 +701,14 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
 void NgxSetReset(NgxSnippet& s, bool reset, bool logValue) {
     if (!s.params) return;
     DWORD seh = 0;
+    // One key, not two: the undotted "Reset" alias was written beside this one and the probe
+    // reports it never read. DLSSNR.Reset is the name the model asks for, at every evaluate.
     const bool ok1 = ParamSetUI(s.params, "DLSSNR.Reset", reset ? 1u : 0u, &seh);
-    const bool ok2 = ParamSetUI(s.params, "Reset", reset ? 1u : 0u, &seh);
     if (!logValue) return;
-    unsigned int back = 0, back2 = 0;
+    unsigned int back = 0;
     ParamGetUI(s.params, "DLSSNR.Reset", &back, &seh);
-    ParamGetUI(s.params, "Reset", &back2, &seh);
-    Log("[params] DLSSNR.Reset(slot11) requested=%u readback=%u alias=%u ok=%d/%d seh=%#x",
-        reset ? 1u : 0u, back, back2, int(ok1), int(ok2), seh);
+    Log("[params] DLSSNR.Reset requested=%u readback=%u ok=%d seh=%#x",
+        reset ? 1u : 0u, back, int(ok1), seh);
 }
 
 void NgxSetMotionScale(NgxSnippet& s, float scaleX, float scaleY) {
@@ -714,16 +722,40 @@ void NgxSetMotionScale(NgxSnippet& s, float scaleX, float scaleY) {
     Log("[params] MVecScaleX=%.6f MVecScaleY=%.6f (seh=%#x)", x, y, seh);
 }
 
+// The six values the model reads at every evaluate, written per pass from that pass's own
+// resolved tuning. Never constants: writing constants here is the bug the comment in
+// NgxSetResources describes, and the difference is that these are the caller's values.
+void NgxSetEvaluateTuning(NgxSnippet& s, const NgxTuning& t) {
+    if (s.disabled || !s.params) return;
+    DWORD seh = 0;
+    ParamSetUI(s.params, "DLSSNR.Style", t.style, &seh);
+    ParamSetF(s.params, "DLSSNR.Intensity", t.intensity, &seh);
+    ParamSetF(s.params, "DLSSNR.LocalToneStrength", t.localTone, &seh);
+    ParamSetF(s.params, "DLSSNR.LocalStructureStrength", t.localStructure, &seh);
+    ParamSetF(s.params, "DLSSNR.SkinStructureStrength", t.skinStructure, &seh);
+    ParamSetUI(s.params, "DLSSNR.UseAutoMask", t.autoMask, &seh);
+}
+
+// There is no sharpness parameter in this model, so this does nothing and says so once.
+//
+// It used to write "Sharpness" every evaluate, and the comment called it "the one strength
+// the model reads at evaluate" -- the value the GUI's per-pass sharpness slider feeds. Two
+// independent checks say the key does not exist: no string containing "sharp" appears
+// anywhere in nvngx_dlssnr.dll or nvngx.dll, in ASCII or UTF-16, and an instrumented
+// session never sees it read. The create flag it was paired with, DoSharpening, went the
+// same way -- Feature_Flags is not a key this model has either.
+//
+// Kept as a function rather than deleted so the one caller stays readable and so this
+// explanation sits where someone will look for it. The slider that feeds it is a dead
+// control and should be removed or relabelled; that is a GUI change and a protocol
+// question, not this file's to make.
 void NgxSetSharpness(NgxSnippet& s, float sharpness) {
     if (!s.params) return;
-    DWORD seh = 0;
-    // The runtime sharpness float has to reach the DLL on every evaluate dispatch: DoSharpening is
-    // enabled at create, and this is the per-frame amount it applies.
-    ParamSetF(s.params, "Sharpness", sharpness, &seh);
-    if (Verbose()) {
-        float back = 0.0f;
-        ParamGetF(s.params, "Sharpness", &back, &seh);
-        Log("[params] Sharpness=%.4f readback=%.4f (seh=%#x)", sharpness, back, seh);
+    (void)sharpness;
+    static bool said = false;
+    if (!said) {
+        said = true;
+        Log("[params] sharpness is not a parameter of this model; the control has no effect");
     }
 }
 
