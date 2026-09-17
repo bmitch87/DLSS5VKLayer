@@ -1591,6 +1591,12 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     }
 
     dlssnr::FrameSettings fs = dlssnr::FrameSettings::Read(dc->shm.hdr);
+    // "Hold the next frame": this one is captured fresh, and the hold latches below once it has
+    // actually been through the model. Not consumed by a repaint, which re-composes a picture the
+    // layer already had rather than taking a new one.
+    const bool arming = !repaint && fs.holdFrame == kHoldArm;
+    if (arming) fs.holdFrame = kHoldOff;
+
     // A repaint holds the captured frame, whatever the setting says.
     //
     // Held, the frame is not read back from the swapchain while the encode, the model and the resolve
@@ -1814,6 +1820,13 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         }
     }
     sc.comp->MarkModelFrame();
+    // The round trip completed, so the frame now sitting in the composition has a real answer
+    // against it. Latch the hold; the next present freezes on this picture.
+    if (arming && dc->shm.hdr) {
+        dc->shm.hdr->holdFrame.store(kHoldOn);
+        dc->shm.hdr->controlSeq.fetch_add(1);
+        Log("[comp] hold armed: holding the frame that just completed a round trip");
+    }
     const double tHelper = time ? NowMs() : 0.0;
 
     // ---- leg 2: the answer, composed back ----

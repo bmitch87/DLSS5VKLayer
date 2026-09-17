@@ -169,6 +169,22 @@ enum ProxyFormat : uint32_t {
     kProxyRgba16F = 2,
 };
 
+// What holdFrame means. A third value rather than a second field: the size and the existing two
+// meanings are unchanged, so every reader that only understands off and on is still right about
+// both of them.
+enum HoldFrameMode : uint32_t {
+    kHoldOff = 0,
+    kHoldOn = 1,
+    // Capture the NEXT frame that completes a round trip, then become kHoldOn by itself.
+    //
+    // The frame it arms on is captured fresh -- the arm is not a hold, it is a request for one --
+    // and the latch happens only after that frame has been through the model, so what ends up held
+    // is a frame with a complete answer rather than one caught mid-flight. An idle repaint does not
+    // consume it: a repaint re-composes a picture the layer already had, which is not the "next
+    // frame" anybody meant.
+    kHoldArm = 2,
+};
+
 enum MVecScaleMode : uint32_t {
     kMVecNormalized = 0,
     kMVecPixels = 1,
@@ -355,6 +371,10 @@ struct ShmHeader {
     // In this architecture it is cheaper than upstream: the layer already holds the captured proxy
     // and the model's last answer, so holding means not re-capturing rather than keeping a frame
     // alive somewhere it would not otherwise be.
+    //
+    // Three values, not two -- see HoldFrameMode. Off and on are what they always were; arm exists
+    // because on a moving picture "hold" always lands one frame too late. You see the frame you
+    // want, you reach for the control, and by the time it is set the scene has moved on.
     std::atomic<uint32_t> holdFrame;
 
     // The filter for the supersampling down-leg. See Downscaler; only read when workingScale > 1.

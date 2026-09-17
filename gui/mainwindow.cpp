@@ -1691,10 +1691,15 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
         binder->AddBool(f, "Apply the model's edit", &ShmHeader::applyModel,
                         "Off keeps the whole pass running and shows the clean frame, so the cost is "
                         "unchanged and only the picture differs.");
-        binder->AddBool(f, "Hold frame", &ShmHeader::holdFrame,
-                        "Freeze the frame the pass works on, so changing a setting re-runs the model "
-                        "and the composition on the same picture.\n"
-                        "The only clean way to compare two settings.");
+        binder->AddChoice(f, "Frame hold", &ShmHeader::holdFrame,
+                          { "Running", "Holding", "Hold next frame" },
+                          "Freeze the frame the pass works on, so changing a setting re-runs the "
+                          "model and the composition on the same picture.\n"
+                          "The only clean way to compare two settings.\n"
+                          "\"Hold next frame\" arms it: the next frame that completes a round trip "
+                          "is captured and then held, and this box returns to Holding by itself. On "
+                          "a moving picture that is the difference between holding the frame you "
+                          "meant and holding the one after you reached for the control.");
         binder->AddChoice(f, "Proxy", &ShmHeader::reversibleMode,
                           { "Soft knee", "Neutwo", "Neutwo, replace", "Hybrid", "Hybrid, replace" },
                           "Which picture the model is shown, and whether its answer is composed onto "

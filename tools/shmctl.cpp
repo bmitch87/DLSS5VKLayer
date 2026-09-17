@@ -81,7 +81,8 @@ const Setting kSettings[] = {
     { "colourmode", &ShmHeader::colourMode, false, "0 auto, 1 display-referred, 2 linear HDR" },
     { "reversible", &ShmHeader::reversibleMode, false, "0 knee, 1 neutwo, 2 replace, 3 hybrid, 4 hybrid+replace" },
     { "applymodel", &ShmHeader::applyModel, false, "0 show the clean frame, 1 apply the edit" },
-    { "hold", &ShmHeader::holdFrame, false, "0/1 freeze the frame the pass works on" },
+    { "hold", &ShmHeader::holdFrame, false,
+      "0 running, 1 hold, 2 hold the next frame that completes a round trip" },
     { "togglekey", &ShmHeader::toggleKey, false, "Linux KEY_ code the layer watches, 0 for none" },
 };
 
