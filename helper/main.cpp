@@ -1553,6 +1553,28 @@ static bool QueryOpticalFlowFormat(VkCtx& c, VkOpticalFlowUsageFlagsNV usage,
 // ---------------------------------------------------------------------------
 // GPU MVec post pass (decode + deadzone + upscale), zero host readback
 // ---------------------------------------------------------------------------
+// Bilinear or nearest when the grid is upsampled to full resolution. The shader has
+// supported both since it was written and this was hardcoded to 1, so there was no way to
+// try the other without a rebuild.
+//
+// Four independent projects prefer nearest, one of them with a measured 12-16 px
+// disocclusion band behind it: across a motion boundary the neighbouring cells describe
+// different surfaces, and interpolating them manufactures a vector no cell measured, which
+// widens the band instead of narrowing it. Where the field is smooth it varies far more
+// slowly than one cell and the two filters agree anyway.
+//
+// The default stays 1 regardless, because their grids are 1-4 px on 1080p video and ours is
+// whatever the session negotiated at the game's raster -- at grid 4 with heavy
+// magnification the blockiness argument is stronger for us than for them. This makes the
+// experiment possible, not decided.
+static uint32_t MVecBilinear() {
+    static const uint32_t v = [] {
+        const char* p = getenv("DLSSNR_MVEC_BILINEAR");
+        return p && p[0] == '0' ? 0u : 1u;
+    }();
+    return v;
+}
+
 static float MVecDeadzone() {
     static const float v = [] {
         const char* p = getenv("DLSSNR_MVEC_DEADZONE");
@@ -1647,7 +1669,7 @@ static bool BuildMVecComputePass(NeuralState& ns, uint32_t ow, uint32_t oh) {
     data.srcW = ow; data.srcH = oh;
     data.dstW = ns.mv.width; data.dstH = ns.mv.height;
     data.deadzone = MVecDeadzone();
-    data.bilinear = 1u;
+    data.bilinear = MVecBilinear();
     // Constants 0-4, 6, 7; there is no constant 5 any more -- the format moved from a
     // specialization constant to the choice of module.
     VkSpecializationMapEntry entries[7] = {
@@ -1704,6 +1726,7 @@ static bool BuildMVecComputePass(NeuralState& ns, uint32_t ow, uint32_t oh) {
     f.gpuCompute = true;
     Log("[mvec] GPU deadzone pass ready grid=%u flow=%ux%u mvec=%ux%u fixed5=%u deadzone=%.3f",
         data.grid, ow, oh, data.dstW, data.dstH, fixed5 ? 1u : 0u, data.deadzone);
+    Log("[mvec] upsample filter: %s", data.bilinear ? "bilinear" : "nearest");
     return true;
 }
 
