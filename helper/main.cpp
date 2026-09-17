@@ -242,6 +242,7 @@ struct VkCtx {
     void* queryMap = nullptr;
     bool flowQueryAvailable = false;
     bool fenceTimedOut = false;  // the GPU stopped retiring our work; stand down
+    VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
     bool pinMissed = false;      // DLSSNR_GPU_UUID/INDEX named a device that is not here
     // The model's own cost, on the graphics queue. Deliberately a separate pool from the
     // flow one: they are written from different queue families, and the whole GPU-timing
@@ -311,6 +312,43 @@ static bool CreateContext(VkCtx& c) {
         // debug_utils unavailable: retry without it
         ici.enabledExtensionCount = 1;
         if (vkCreateInstance(&ici, nullptr, &c.instance) != VK_SUCCESS) { Log("[helper] vkCreateInstance failed"); return false; }
+    }
+
+    // The instance has asked for VK_EXT_debug_utils since it was written and never created a
+    // messenger, so anything the validation layers had to say went nowhere. That made a
+    // validation run unable to answer the question it is for -- whether the layouts we
+    // record still match what the images are in after the NGX snippet has recorded its own
+    // work into our command buffer. Zero messages is only evidence if messages had a path.
+    //
+    // Off unless asked for: the callback itself is free, but running with validation enabled
+    // is not, and this is a diagnostic rather than a mode.
+    if (getenv("DLSSNR_VK_DEBUG")) {
+        auto create = (PFN_vkCreateDebugUtilsMessengerEXT)g_gipa(c.instance,
+                                                                 "vkCreateDebugUtilsMessengerEXT");
+        if (create) {
+            VkDebugUtilsMessengerCreateInfoEXT dci{};
+            dci.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+            dci.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                                  VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            dci.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                              VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+            dci.pfnUserCallback = [](VkDebugUtilsMessageSeverityFlagBitsEXT sev,
+                                     VkDebugUtilsMessageTypeFlagsEXT,
+                                     const VkDebugUtilsMessengerCallbackDataEXT* data,
+                                     void*) -> VkBool32 {
+                Log("[vk-%s] %s", sev & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error"
+                                                                                      : "warn",
+                    data && data->pMessage ? data->pMessage : "(no message)");
+                return VK_FALSE;
+            };
+            if (create(c.instance, &dci, nullptr, &c.debugMessenger) == VK_SUCCESS)
+                Log("[helper] vulkan debug messenger installed");
+            else
+                Log("[helper] vulkan debug messenger could not be created");
+        } else {
+            Log("[helper] DLSSNR_VK_DEBUG set but VK_EXT_debug_utils is unavailable");
+        }
     }
 
 #define LOAD(name) name = (PFN_##name)g_gipa(c.instance, #name);
@@ -3279,6 +3317,11 @@ int main() {
     if (ns.vk.flowQuery) vkDestroyQueryPool(ns.vk.device, ns.vk.flowQuery, nullptr);
     if (ns.vk.queryStaging) vkDestroyBuffer(ns.vk.device, ns.vk.queryStaging, nullptr);
     if (ns.vk.queryMem) vkFreeMemory(ns.vk.device, ns.vk.queryMem, nullptr);
+    if (ns.vk.debugMessenger) {
+        auto destroy = (PFN_vkDestroyDebugUtilsMessengerEXT)g_gipa(ns.vk.instance,
+                                                                   "vkDestroyDebugUtilsMessengerEXT");
+        if (destroy) destroy(ns.vk.instance, ns.vk.debugMessenger, nullptr);
+    }
     if (ns.vk.evalQuery) vkDestroyQueryPool(ns.vk.device, ns.vk.evalQuery, nullptr);
     if (ns.vk.evalStaging) vkDestroyBuffer(ns.vk.device, ns.vk.evalStaging, nullptr);
     if (ns.vk.evalMem) vkFreeMemory(ns.vk.device, ns.vk.evalMem, nullptr);
