@@ -251,6 +251,7 @@ struct VkCtx {
     // the optical-flow session granted, because a pool sized for one rung has to be torn
     // down and rebuilt for another.
     bool pushDescriptors = false;
+    uint32_t driverMajor = 0, driverMinor = 0;
     // 1x1 stand-ins for the two optional bindings, so every declared binding always has a
     // valid descriptor whatever rung the session took.
     GpuImage dummyCost{};
@@ -451,7 +452,13 @@ static bool CreateContext(VkCtx& c) {
         ++qualifying;
         if (!take || c.physical) continue;
         c.physical = p;
-        Log("[helper] device: %s", props.deviceName);
+        // NVIDIA packs its own version into driverVersion; the Vulkan-wide major/minor/patch
+        // split is not it. The driver version is the single most requested fact in every
+        // report in this niche and this tree read it nowhere at all.
+        c.driverMajor = props.driverVersion >> 22;
+        c.driverMinor = (props.driverVersion >> 14) & 0xffu;
+        Log("[helper] device: %s  driver %u.%02u", props.deviceName, c.driverMajor,
+            c.driverMinor);
         if (!wantUuid && wantIndex < 0) break;  // first-wins: nothing after this can change it
     }
     if (!c.physical && (wantUuid || wantIndex >= 0)) {
@@ -3136,6 +3143,27 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
 
     if (!BeginCmd(ns.vk.cmdCreate)) return false;
     bool ok = NgxLoadAndInit(ns.ngx, ns.vk.instance, ns.vk.physical, ns.vk.device, w, h, ns.vk.cmdCreate, first);
+
+    // The model states the driver it needs; compare against the driver we have, once. A floor
+    // read out of the binary beats a hardcoded table and stays correct when the model is
+    // swapped -- which is the whole problem with the published floors for this feature, which
+    // disagree with each other by six major versions.
+    //
+    // A warning and not a refusal: this is the model's own opinion about a Windows driver
+    // number, read on Linux through Wine, and our failure mode if it is right is already
+    // fail-open. Being told why beats being stopped.
+    static bool driverChecked = false;
+    if (!driverChecked && g_modelMinDriver > 0.0 && ns.vk.driverMajor) {
+        driverChecked = true;
+        const double have = double(ns.vk.driverMajor) + double(ns.vk.driverMinor) / 100.0;
+        if (have < g_modelMinDriver)
+            Log("[helper] driver %u.%02u is BELOW the %.2f this model declares it needs; if the "
+                "model refuses to initialise, that is the first thing to change",
+                ns.vk.driverMajor, ns.vk.driverMinor, g_modelMinDriver);
+        else
+            Log("[helper] driver %u.%02u meets the model's declared minimum of %.2f",
+                ns.vk.driverMajor, ns.vk.driverMinor, g_modelMinDriver);
+    }
     if (!SubmitAndWait(ns.vk, ns.vk.cmdCreate) || !ok) {
         if (ns.hdrBuilt) {
             // The float contract was refused. That is the model saying no, not the model being

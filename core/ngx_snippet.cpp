@@ -8,6 +8,7 @@
 #include "ngx_param.h"
 #include <chrono>
 #include <cstring>
+#include <vector>
 
 namespace dlssnr {
 
@@ -195,6 +196,63 @@ static void RegisterPeRange(const char* name, HMODULE mod) {
 // ---------------------------------------------------------------------------
 // Load + init (everything up to and including CreateFeature(18))
 // ---------------------------------------------------------------------------
+// The minimum driver the loaded model says it needs, 0 when it did not say.
+double g_modelMinDriver = 0.0;
+
+// Which model is this, exactly?
+//
+// The load used to log an address and nothing else, so a bug report could not say which
+// model produced it -- at a point where several projects have established that different
+// builds of nvngx_dlssnr.dll behave differently, and where the same version number has been
+// seen on two different builds.
+//
+// Three things, all cheap, none previously recorded: the PATH it was actually loaded from
+// (more than one copy can be in reach under Wine -- the binaries directory, one left beside
+// a game, one in the prefix); whether something ELSE had already loaded it before we did;
+// and the version resource, which carries NGX-specific fields nothing in this tree read --
+// the minimum driver the build expects and the GPU architecture it was built for. Those two
+// are the mechanism behind most "it does not work on my card" reports in this niche, and
+// they come from the binary rather than from a table we would have to maintain.
+static void DescribeSnippet(HMODULE mod) {
+    wchar_t pathW[MAX_PATH] = {};
+    const DWORD got = g_realGetModuleFileNameW ? g_realGetModuleFileNameW(mod, pathW, MAX_PATH)
+                                               : GetModuleFileNameW(mod, pathW, MAX_PATH);
+    if (!got) { Log("[ngx] could not resolve the model's path"); return; }
+    char path[MAX_PATH * 2] = {};
+    WideCharToMultiByte(CP_UTF8, 0, pathW, -1, path, sizeof(path) - 1, nullptr, nullptr);
+    Log("[ngx] model path: %s", path);
+
+    DWORD ignored = 0;
+    const DWORD sz = GetFileVersionInfoSizeW(pathW, &ignored);
+    if (!sz) { Log("[ngx] model has no version resource"); return; }
+    std::vector<uint8_t> buf(sz);
+    if (!GetFileVersionInfoW(pathW, 0, sz, buf.data())) return;
+
+    // The string table is per language+codepage; ask which one this binary has rather than
+    // assuming the usual 040904B0.
+    struct LangCp { WORD lang, cp; };
+    LangCp* lc = nullptr;
+    UINT lcBytes = 0;
+    if (!VerQueryValueW(buf.data(), L"\\VarFileInfo\\Translation", (LPVOID*)&lc, &lcBytes) ||
+        lcBytes < sizeof(LangCp) || !lc)
+        return;
+
+    const wchar_t* keys[] = { L"FileVersion", L"NGXMinimumDriverVersion", L"NGXGpuArchitecture",
+                              L"NGXApiVersion" };
+    for (const wchar_t* key : keys) {
+        wchar_t q[128];
+        _snwprintf(q, 128, L"\\StringFileInfo\\%04x%04x\\%s", lc->lang, lc->cp, key);
+        wchar_t* value = nullptr;
+        UINT vlen = 0;
+        if (!VerQueryValueW(buf.data(), q, (LPVOID*)&value, &vlen) || !value) continue;
+        char k[64] = {}, v[256] = {};
+        WideCharToMultiByte(CP_UTF8, 0, key, -1, k, sizeof(k) - 1, nullptr, nullptr);
+        WideCharToMultiByte(CP_UTF8, 0, value, -1, v, sizeof(v) - 1, nullptr, nullptr);
+        Log("[ngx] model %s = %s", k, v);
+        if (!wcscmp(key, L"NGXMinimumDriverVersion")) g_modelMinDriver = atof(v);
+    }
+}
+
 bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkDevice device,
                     uint32_t width, uint32_t height, VkCommandBuffer recordingCmd,
                     const NgxTuning& tuning) {
@@ -203,11 +261,19 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     if (s.binDir.empty()) { Log("[ngx] nvngx_dlssnr.dll not found (set DLSSNR_BIN_DIR)"); s.disabled = true; return false; }
     Log("[ngx] bin dir: %ls", s.binDir.c_str());
 
+    // Did something already have it open? Under Wine a game, a previous tool or the runner
+    // can have loaded a different copy first, and LoadLibraryEx would then hand us theirs
+    // rather than the one we asked for -- which is a different situation from loading it
+    // ourselves and is worth telling apart in a report.
+    if (HMODULE already = GetModuleHandleW(L"nvngx_dlssnr.dll"))
+        Log("[ngx] nvngx_dlssnr.dll was already loaded in this process at %p", (void*)already);
+
     s.snippet = LoadLibraryExW((s.binDir + L"\\nvngx_dlssnr.dll").c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (!s.snippet) { Log("[ngx] LoadLibrary nvngx_dlssnr.dll failed (%lu)", GetLastError()); s.disabled = true; return false; }
     Log("[ngx] nvngx_dlssnr.dll loaded at %p", (void*)s.snippet);
     RegisterPeRange("nvngx_dlssnr.dll", s.snippet);
+    DescribeSnippet(s.snippet);
 
     s.initExt = reinterpret_cast<FnVkInitExt>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init_Ext"));
     s.initExt2 = reinterpret_cast<FnVkInitExt>(GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_Init_Ext2"));

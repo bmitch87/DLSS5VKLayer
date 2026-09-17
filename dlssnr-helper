@@ -1115,6 +1115,20 @@ cmd_doctor() {
   printf 'prefix: %s\n' "$det_prefix"
   if [ -d "$det_prefix/drive_c" ]; then
     echo "  ok"
+    # A prefix whose wineboot succeeded but whose DLL installation did not reports "ok" on
+    # drive_c alone and then fails at run time with an NGX error code. install_wine_runtime_dll
+    # warns and carries on, so the only record of a failed install is a line nobody scrolls
+    # back to. We know exactly which files we tried to put there, so check for them.
+    if [ "$det_runner_type" = "wine" ]; then
+      for f in vulkan-1.dll nvapi64.dll dxgi.dll; do
+        if [ -f "$det_prefix/drive_c/windows/system32/$f" ]; then
+          echo "  system32/$f: ok"
+        else
+          echo "  system32/$f: error -- missing; run 'dlssnr-helper setup'"
+          ok=1
+        fi
+      done
+    fi
   elif [ "$det_runner_type" = "proton" ]; then
     echo "  will be created by Proton on first run"
   else
@@ -1131,10 +1145,53 @@ cmd_doctor() {
   printf 'binaries: %s\n' "$det_binaries"
   if [ -f "$det_binaries/nvngx_dlssnr.dll" ]; then
     echo "  nvngx_dlssnr.dll: ok"
+    # Identify it. Several projects have shown that different builds of this file behave
+    # differently and that a version number does not tell them apart, so a report that does
+    # not say WHICH model produced it cannot be acted on. The helper logs the same facts at
+    # load time; this is the half a user can run without starting anything.
+    if command -v sha256sum >/dev/null 2>&1; then
+      printf '    sha256: %s\n' "$(sha256sum "$det_binaries/nvngx_dlssnr.dll" | cut -d" " -f1)"
+    fi
+    printf '    bytes: %s\n' "$(stat -c %s "$det_binaries/nvngx_dlssnr.dll" 2>/dev/null || echo "?")"
+    if command -v strings >/dev/null 2>&1; then
+      for field in NGXMinimumDriverVersion NGXGpuArchitecture; do
+        v="$(strings -a -el "$det_binaries/nvngx_dlssnr.dll" 2>/dev/null |
+             grep -A1 -x "$field" | tail -1)"
+        [ -n "$v" ] && printf '    %s: %s\n' "$field" "$v"
+      done
+    fi
   else
     echo "  nvngx_dlssnr.dll: error -- missing (required)"
     ok=1
   fi
+  # Every copy, not only the one that would win. Two copies with different hashes is a
+  # diagnosis, and it is invisible today.
+  extra="$(find "$det_binaries" -maxdepth 1 -name 'nvngx_dlssnr*.dll' 2>/dev/null | wc -l)"
+  if [ "$extra" -gt 1 ]; then
+    echo "  note: more than one nvngx_dlssnr*.dll is present:"
+    find "$det_binaries" -maxdepth 1 -name 'nvngx_dlssnr*.dll' 2>/dev/null |
+      while read -r m; do printf '    %s\n' "$m"; done
+  fi
+
+  # The driver's own Wine-side NGX bridge. We never look for it at run time and it is not
+  # ours to ship, but on Linux it is how the NGX core reaches the driver, so whether it
+  # exists is exactly the kind of question this command should be able to answer.
+  echo "nvidia wine bridge:"
+  bridge=""
+  for d in /usr/lib/nvidia/wine /usr/lib64/nvidia/wine /usr/lib/x86_64-linux-gnu/nvidia/wine; do
+    if [ -f "$d/_nvngx.dll" ]; then bridge="$d/_nvngx.dll"; break; fi
+  done
+  if [ -n "$bridge" ]; then
+    echo "  _nvngx.dll: $bridge"
+  else
+    echo "  _nvngx.dll: not found (only matters if the core library fails to initialise)"
+  fi
+  if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q libnvidia-ngx; then
+    echo "  libnvidia-ngx: present"
+  else
+    echo "  libnvidia-ngx: not found via ldconfig"
+  fi
+
   if [ -f "$det_binaries/nvngx.dll" ]; then
     echo "  nvngx.dll: ok"
   else

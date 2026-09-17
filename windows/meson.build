@@ -7,6 +7,9 @@ windows_cpp_link_args = [
   '-lwinpthread',
   '-Wl,--end-group',
   '-pthread',
+  # version.dll: the helper reads the NGX model's own version resource, which is where
+  # NVIDIA records the driver and architecture that build expects.
+  '-lversion',
 ]
 
 executable('dlssnr_helper',

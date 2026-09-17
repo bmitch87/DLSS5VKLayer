@@ -128,6 +128,10 @@ void NgxSetReset(NgxSnippet& s, bool reset, bool logValue = false);
 // definition. It was believed to be "the one strength the model reads at evaluate"; it is
 // the one strength the model does not have.
 void NgxSetSharpness(NgxSnippet& s, float sharpness);
+// The minimum driver version the loaded model declares in its own version resource, or 0
+// when it did not say. Read from the binary rather than from a table, so it stays correct
+// when the model is swapped.
+extern double g_modelMinDriver;
 // The six the model reads at EVERY evaluate, written per pass from that pass's own resolved
 // tuning. Only the preset is latched at create; see NgxTuning.
 void NgxSetEvaluateTuning(NgxSnippet& s, const NgxTuning& t);
