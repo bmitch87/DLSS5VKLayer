@@ -1393,6 +1393,8 @@ struct OpticalFlowState {
     VkImageView backBitsView = nullptr;  // R16G16_UINT view of the backward flow
     GpuImage back{};        // backward flow field, when the both-directions rung was taken
     bool backEnabled = false;
+    uint32_t inputWidth = 0;    // the size the engine actually works at
+    uint32_t inputHeight = 0;
     GpuImage cost{};        // per-block matching cost, at the flow grid, when enabled
     GpuImage globalFlow{};  // one vector for the whole frame, 1x1, when enabled
     VkFormat costFormat = VK_FORMAT_UNDEFINED;
@@ -1636,6 +1638,27 @@ static float MVecRoundTripAbs() {
 
 static float MVecRoundTripRel() {
     static const float v = MVecEnvFloat("DLSSNR_MVEC_ROUNDTRIP_REL", 0.05f);
+    return v;
+}
+
+// Estimate the flow at a fixed target width rather than at the frame's own size.
+//
+// An absolute width and not a divisor, which is the better parameterisation of the same
+// idea: a divisor of 2 gives a different flow cost at 1080p and at 4K, a width gives the
+// same one. The projects this comes from default to 640 and report the trade as the same
+// grid for half the cost with double the search range in output pixels.
+//
+// 0 means the frame's own size, and that is the default here: the range claim is measured on
+// a different estimator (a D3D12 VME, not NVOF) and has not been reproduced on this one, so
+// it is an experiment with a switch rather than a setting with a number. The header is the
+// right home for it once somebody has measured what it does to the picture; an env var is
+// the right home for it now.
+static uint32_t MVecFlowWidth() {
+    static const uint32_t v = [] {
+        const char* p = getenv("DLSSNR_MVEC_FLOW_WIDTH");
+        const long n = p && *p ? strtol(p, nullptr, 10) : 0;
+        return n > 0 ? uint32_t(n) : 0u;
+    }();
     return v;
 }
 
@@ -1924,6 +1947,27 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
     DestroyOpticalFlow(c, f);
     f.attemptedQuality = quality;
     f.attemptedPixelSize = pixelSize;
+    // The size the ENGINE works at, which is the frame's own unless asked otherwise. Aspect
+    // preserved and both axes rounded to even, because the grid has to divide the raster
+    // evenly and an odd intermediate fails that for every grid but 1.
+    const uint32_t fullW = w, fullH = h;
+    const uint32_t targetW = MVecFlowWidth();
+    if (targetW && targetW < fullW) {
+        const double scale = double(targetW) / double(fullW);
+        uint32_t fw = uint32_t(std::lround(double(fullW) * scale / 2.0) * 2);
+        uint32_t fh = uint32_t(std::lround(double(fullH) * scale / 2.0) * 2);
+        if (fw >= 64 && fh >= 64) {
+            w = fw;
+            h = fh;
+            Log("[mvec] estimating flow at %ux%u for a %ux%u frame (target width %u)", w, h,
+                fullW, fullH, targetW);
+        } else {
+            Log("[mvec] flow target width %u would give %ux%u, too small; using the frame size",
+                targetW, fw, fh);
+        }
+    }
+    f.inputWidth = w;
+    f.inputHeight = h;
     if (!c.opticalFlow || !c.opticalQueue || !c.cmdFlow || !vkCreateOpticalFlowSessionNV ||
         !vkBindOpticalFlowSessionImageNV || !vkCmdOpticalFlowExecuteNV ||
         !vkGetPhysicalDeviceOpticalFlowImageFormatsNV) {
@@ -2492,6 +2536,28 @@ static void RecordProxyToColorIn(NeuralState& ns, VkCommandBuffer cb) {
     ns.vk.proxyIn.layout = VK_IMAGE_LAYOUT_UNDEFINED;
 }
 
+// colorIn into one of the engine's input surfaces. A straight copy at the usual size, and a
+// linear blit when the flow is being estimated smaller -- a copy cannot resize. Same shape
+// as the chain's own 16-to-8-bit step, which blits for the same reason.
+static void CopyOrScaleIntoFlowInput(NeuralState& ns, VkCommandBuffer cb, GpuImage& dst) {
+    if (dst.width == ns.colorIn.width && dst.height == ns.colorIn.height) {
+        VkImageCopy copy{};
+        copy.srcSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
+        copy.dstSubresource = { dst.aspect(), 0, 0, 1 };
+        copy.extent = { ns.colorIn.width, ns.colorIn.height, 1 };
+        vkCmdCopyImage(cb, ns.colorIn.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        return;
+    }
+    VkImageBlit blit{};
+    blit.srcSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
+    blit.dstSubresource = { dst.aspect(), 0, 0, 1 };
+    blit.srcOffsets[1] = { int32_t(ns.colorIn.width), int32_t(ns.colorIn.height), 1 };
+    blit.dstOffsets[1] = { int32_t(dst.width), int32_t(dst.height), 1 };
+    vkCmdBlitImage(cb, ns.colorIn.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+}
+
 static bool RunOpticalFlow(NeuralState& ns) {
     OpticalFlowState& f = ns.flow;
     if (!f.enabled) return true;
@@ -2545,12 +2611,7 @@ static bool RunOpticalFlow(NeuralState& ns) {
         TransitionImage(ns.vk, cb, f.prev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                         VK_PIPELINE_STAGE_TRANSFER_BIT);
-        VkImageCopy seed{};
-        seed.srcSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
-        seed.dstSubresource = { f.prev.aspect(), 0, 0, 1 };
-        seed.extent = { ns.colorIn.width, ns.colorIn.height, 1 };
-        vkCmdCopyImage(cb, ns.colorIn.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       f.prev.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &seed);
+        CopyOrScaleIntoFlowInput(ns, cb, f.prev);
         if (!SubmitAndWait(ns.vk, cb)) return false;
         f.hasPrev = true;
         return true;
@@ -2562,12 +2623,7 @@ static bool RunOpticalFlow(NeuralState& ns) {
         TransitionImage(ns.vk, cb, f.curr, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         currSrcA, VK_ACCESS_TRANSFER_WRITE_BIT, currSrcS,
                         VK_PIPELINE_STAGE_TRANSFER_BIT);
-        VkImageCopy copy{};
-        copy.srcSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
-        copy.dstSubresource = { f.curr.aspect(), 0, 0, 1 };
-        copy.extent = { ns.colorIn.width, ns.colorIn.height, 1 };
-        vkCmdCopyImage(cb, ns.colorIn.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                       f.curr.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        CopyOrScaleIntoFlowInput(ns, cb, f.curr);
     }
 
     ResetFlowTimestampQueries(ns.vk, cb);

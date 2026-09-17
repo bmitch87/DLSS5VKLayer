@@ -99,27 +99,48 @@ vec2 DecodeFlow(uvec2 raw) {
 // low-confidence vector shrinks toward zero and is then cut on what it has become. Cutting
 // on the raw magnitude first would let a confidently-wrong large vector through and discard
 // a faint but trustworthy one.
+// Full-resolution pixels per flow-input pixel.
+//
+// One when the engine ran at the frame's own size, which is the ordinary case and makes
+// every line below identical to what it was. More than one when the flow was estimated at a
+// reduced input: the vectors then come back in the smaller image's pixels and have to be
+// brought up to the frame's. Derived rather than passed in, because cDstW is the full-width
+// MVec and cSrcW * cGrid is the flow input width, so the ratio is already known here.
+float VecScale() {
+    return float(cDstW) / max(float(cSrcW * cGrid), 1.0);
+}
+
+// An MVec pixel's position in flow-grid cells. Equal to dst / cGrid at full input size.
+vec2 DstToCell(vec2 dst) {
+    return dst * vec2(float(cSrcW) / float(cDstW), float(cSrcH) / float(cDstH));
+}
+
 vec2 SampleFlow(ivec2 p) {
     p = clamp(p, ivec2(0), ivec2(int(cSrcW), int(cSrcH)) - 1);
-    vec2 v = DecodeFlow(imageLoad(srcFlow, p).xy);
+    // In flow-INPUT pixels for as long as the grid arithmetic needs it, and converted to
+    // full-resolution pixels once at the end. Mixing the two is the whole hazard here: the
+    // landing cell is a grid question and the deadzone is a frame question.
+    vec2 vf = DecodeFlow(imageLoad(srcFlow, p).xy);
 
     if (cHasCost != 0u && cCostHi > cCostLo) {
         float cost = float(imageLoad(srcCost, p).x);
-        v *= clamp((cCostHi - cost) / (cCostHi - cCostLo), 0.0, 1.0);
+        vf *= clamp((cCostHi - cost) / (cCostHi - cCostLo), 0.0, 1.0);
     }
 
     if (cRoundTrip != 0u) {
         // Read the backward field where the forward vector LANDS, not where it starts.
-        ivec2 land = clamp(p + ivec2(round(v / float(cGrid))),
+        ivec2 land = clamp(p + ivec2(round(vf / float(cGrid))),
                            ivec2(0), ivec2(int(cSrcW), int(cSrcH)) - 1);
         vec2 b = DecodeFlow(imageLoad(srcBack, land).xy);
-        vec2 residual = v + b;
-        float slack = cRoundTripAbs + cRoundTripRel * length(v);
+        // Judged in full-resolution pixels, because that is what the tolerances are in.
+        vec2 residual = (vf + b) * VecScale();
+        float slack = cRoundTripAbs + cRoundTripRel * length(vf * VecScale());
         if (dot(residual, residual) > slack * slack) {
             return vec2(0.0);
         }
     }
 
+    vec2 v = vf * VecScale();
     if (dot(v, v) < cDeadzone * cDeadzone) {
         return vec2(0.0);
     }
@@ -133,7 +154,7 @@ void main() {
     }
     vec2 v;
     if (cBilinear != 0u && cGrid > 1u) {
-        vec2 f = (vec2(dst) + vec2(0.5)) / float(cGrid) - vec2(0.5);
+        vec2 f = DstToCell(vec2(dst) + vec2(0.5)) - vec2(0.5);
         ivec2 p0 = ivec2(floor(f));
         vec2 w = f - vec2(p0);
         vec2 v00 = SampleFlow(p0);
@@ -142,7 +163,7 @@ void main() {
         vec2 v11 = SampleFlow(p0 + ivec2(1, 1));
         v = mix(mix(v00, v10, w.x), mix(v01, v11, w.x), w.y);
     } else {
-        v = SampleFlow(dst / int(cGrid));
+        v = SampleFlow(ivec2(DstToCell(vec2(dst))));
     }
     imageStore(dstMVec, dst, vec4(v, 0.0, 1.0));
 }
