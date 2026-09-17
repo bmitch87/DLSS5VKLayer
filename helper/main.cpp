@@ -1258,6 +1258,8 @@ struct NeuralState {
     std::vector<uint8_t> prevLuma;
     uint32_t lumaW = 0, lumaH = 0;
     uint32_t sceneCutStreak = 0;
+    bool sceneCutPending = false;   // exactly one frame over the threshold so far
+    bool sceneCutFired = false;     // this run of over-threshold frames has already fired
     uint32_t lastResetLogged = 0xFFFFFFFFu;
     bool mvecResetPending = false;
     bool pendingMvClear = false;  // scene cut: zero MVec inside the prep cmd
@@ -2135,6 +2137,8 @@ static int ReactivateMotionVectors(NeuralState& ns, uint32_t w, uint32_t h, uint
     ns.prevLuma.clear();
     ns.lumaW = ns.lumaH = 0;
     ns.sceneCutStreak = 0;
+    ns.sceneCutPending = false;
+    ns.sceneCutFired = false;
     ns.lastResetLogged = 0xFFFFFFFFu;
     if (!SetupOpticalFlow(ns.vk, ns, w, h, quality, ns.mvecPixelSize)) {
         ns.flow.attemptedQuality = quality;
@@ -2166,6 +2170,8 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
         ns.prevLuma.assign(n, 0);
         ns.lumaW = gw; ns.lumaH = gh;
         ns.sceneCutStreak = 0;
+        ns.sceneCutPending = false;
+        ns.sceneCutFired = false;
     }
 
     uint64_t sum = 0;
@@ -2186,10 +2192,41 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
     }
     if (sizeChanged) return false;
     int mean = int(sum / n);
-    if (mean >= threshold) ++ns.sceneCutStreak;
-    else ns.sceneCutStreak = 0;
-    bool cut = ns.sceneCutStreak >= 2;
-    if (cut) Log("[mvec] scene cut detected mean=%d threshold=%d streak=%u", mean, threshold, ns.sceneCutStreak);
+    // What the shape of the signal means, which the old "two consecutive frames over the
+    // threshold" rule had backwards:
+    //
+    //   a clean cut  -> ONE frame over (the first frame of the new scene differs from the
+    //                   last frame of the old one), then back under, because the new scene
+    //                   is compared against itself from then on. The old rule required two
+    //                   in a row, so the one event this function is named for was the one
+    //                   event it filtered out.
+    //   a flash      -> two or more over: into the flash and back out of it.
+    //   a fade, a fast pan -> a sustained run over. The old rule fired on EVERY frame of
+    //                   such a run, which is the over-firing NVIDIA's programming guide
+    //                   §3.13 warns costs temporal flickering and heavy aliasing.
+    //
+    // So: confirm an isolated cut one frame later (high, then low), and fire a sustained
+    // run exactly once at its second frame. Every case now fires once and no case fires
+    // never. The isolated cut's reset therefore lands on the frame after the cut rather
+    // than on the cut itself -- one frame late, against never, and §3.13's argument is
+    // that a late true positive is the cheaper error.
+    const bool over = mean >= threshold;
+    if (over) ++ns.sceneCutStreak; else ns.sceneCutStreak = 0;
+
+    bool cut = false;
+    const char* why = "";
+    if (!over && ns.sceneCutPending) { cut = true; why = "isolated"; }
+    if (over && ns.sceneCutStreak == 2 && !ns.sceneCutFired) {
+        cut = true;
+        why = "sustained";
+        ns.sceneCutFired = true;
+    }
+    ns.sceneCutPending = (ns.sceneCutStreak == 1);
+    if (!over) ns.sceneCutFired = false;
+
+    if (cut)
+        Log("[mvec] scene cut detected (%s) mean=%d threshold=%d streak=%u", why, mean, threshold,
+            ns.sceneCutStreak);
     return cut;
 }
 
@@ -2693,10 +2730,17 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     // while the fd path is live -- one frame of stale flow across a cut is the price of the copy.
     const bool sceneCut = !ns.proxyActive && !hdrEncode &&
                           DetectSceneCut(ns, shm.inPixels, w, h, 1);
-    if (sceneCut && !ns.firstFrame && ns.flow.enabled) {
-        ns.flow.hasPrev = false;
-        ns.flow.hintsStale = true;  // and the engine's own hints, which we cannot see
-        ns.pendingMvClear = true;  // zeroed inside the flow prep submit, GPU-side
+    if (sceneCut && !ns.firstFrame) {
+        // The model's own temporal history is the point. Clearing the flow field and
+        // leaving DLSSNR.Reset alone told the model to keep reprojecting across the cut
+        // with a field we had just zeroed -- the exact case a reset exists for, and the
+        // only one of the three pieces of history that was not being dropped.
+        ns.mvecResetPending = true;
+        if (ns.flow.enabled) {
+            ns.flow.hasPrev = false;
+            ns.flow.hintsStale = true;  // and the engine's own hints, which we cannot see
+            ns.pendingMvClear = true;   // zeroed inside the flow prep submit, GPU-side
+        }
     }
 
     const double tUpload = time ? NowMs() : 0.0;

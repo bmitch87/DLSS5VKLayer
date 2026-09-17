@@ -44,6 +44,7 @@ that prompted a change.
 | [pcdofafa/dlss5-for-all](https://github.com/pcdofafa/dlss5-for-all) | MIT | Reporting Laplacian variance and Sobel gradient energy **together**, with the stated reason that they fail differently, and discarding a border before measuring (`tests/nitidez_png.cpp`). The metrics themselves are standard; `tools/capture_metrics.cpp` is a project implementation. |
 | [LCPD15/DXL](https://github.com/LCPD15/DXL) | **AGPL-3.0** — findings only, no code | That a parameter container should record which keys the DLL actually *read*, because "set" looks like "in effect" and is not (`src/core/NgxParameterBag.h:126-146`). The probe in `core/ngx_param.h` is a project implementation written from the description; no AGPL code is present, and none may be taken. |
 | [SAOG0721/Magpie](https://github.com/SAOG0721/Magpie) | GPL-3.0 | That NVIDIA's optical-flow engine keeps temporal hints of its own and they must be disabled on any frame carrying a reset reason (`src/Magpie.Core/NvidiaOpticalFlowProvider.cpp:804-808`, and their reading of NVIDIA's programming guide). |
+| [2600th/dlss5-video-player](https://github.com/2600th/dlss5-video-player) | MIT | That a scene-cut detector needs a strong arm that fires immediately and a debounced weak arm, and that a detected cut must raise the model's own history reset and not only clear the motion field (`src/TemporalGuides.cpp:72-116`). The §3.13 reasoning is NVIDIA's documentation. |
 
 ## What Is Derived From RenoDX
 
