@@ -161,6 +161,8 @@ static const SettingEntry kSettingsTable[] = {
     {"set_auto_mask", &ShmHeader::autoMask, false},
     {"set_ui_correction", &ShmHeader::uiCorrection, false},
     {"set_scene_cut_threshold", &ShmHeader::sceneCutThreshold, false},
+    {"set_shadow_gain", &ShmHeader::shadowGainBits, true},
+    {"set_glow_gain", &ShmHeader::glowGainBits, true},
     {"set_sharpness", &ShmHeader::sharpnessBits, true},
     {"set_motion_enabled", &ShmHeader::mvecEnabled, false},
     {"set_motion_quality", &ShmHeader::mvecQuality, false},
@@ -1625,6 +1627,27 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                        "multiplied.\n\n0 is the old per-pixel behaviour. Raise it toward 100 if you "
                        "want a high guard: the relighting keeps its full range and stops "
                        "speckling.",
+                       ShmBinder::Live);
+
+        // In the composition group, not the model group. These ask the model for nothing; they
+        // decide how much of its answer lands, which is what every other control in this group
+        // does. Where a control lives is this project's statement about what it costs.
+        compositionRows << binder->AddFloat(f, "Darkening reaches", &ShmHeader::shadowGainBits,
+                       0.0, 4.0, 0.05,
+                       "How much of what the model DARKENED reaches the frame.\n"
+                       "1 is all of it, which is what every build before this did. Below 1 keeps "
+                       "the model's brightening and holds back its shadows -- the answer to \"it "
+                       "looks crushed\".",
+                       ShmBinder::Live);
+        compositionRows << binder->AddFloat(f, "Brightening reaches", &ShmHeader::glowGainBits,
+                       0.0, 4.0, 0.05,
+                       "How much of what the model BRIGHTENED reaches the frame.\n"
+                       "1 is all of it. Below 1 is the answer to \"it looks blown out\": the "
+                       "model's shadow work stays and only the highlights are held back.\n"
+                       "Everything else in this group is symmetric -- the guard, the ratio clamp "
+                       "and the colour bound all treat too far the same way in both directions -- "
+                       "so before these two the only control for either complaint was Detail "
+                       "strength, which turns down the half that was right as well.",
                        ShmBinder::Live);
 
         // The minimum is 1.1 and not 1.0. At exactly 1.0 the luminance path is identity by

@@ -111,6 +111,16 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
         if (!std::isfinite(s.ratioSmooth) || s.ratioSmooth < 0.0f) s.ratioSmooth = 0.0f;
         if (s.ratioSmooth > 1.0f) s.ratioSmooth = 1.0f;
 
+        // Clamped to [0, 4] like the other strengths: below 0 would invert the model's verdict in
+        // one direction only, which is not a setting anybody means, and the upper bound is the one
+        // the rest of the composition uses.
+        s.shadowGain = BitsToFloat(h->shadowGainBits.load());
+        s.glowGain = BitsToFloat(h->glowGainBits.load());
+        if (!std::isfinite(s.shadowGain) || s.shadowGain < 0.0f) s.shadowGain = 1.0f;
+        if (!std::isfinite(s.glowGain) || s.glowGain < 0.0f) s.glowGain = 1.0f;
+        if (s.shadowGain > 4.0f) s.shadowGain = 4.0f;
+        if (s.glowGain > 4.0f) s.glowGain = 4.0f;
+
         s.colourTrust = float(h->colourTrustPercent.load()) / 100.0f;
         static const int forcedCt = [] {
             const char* v = getenv("DLSSNR_COLOUR_TRUST");
@@ -1198,6 +1208,8 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     c.HdrTransfer = _hdrProxy ? _hdrTransfer : 0u;
     c.ColourTrust = s.colourTrust;
     c.RatioSmooth = s.ratioSmooth;
+    c.ShadowGain = s.shadowGain;
+    c.GlowGain = s.glowGain;
     return c;
 }
 

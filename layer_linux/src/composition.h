@@ -74,6 +74,11 @@ struct FrameSettings {
     // How much of the relighting ratio comes from the neighbourhood. See ratioSmoothPercent.
     float ratioSmooth = 0.0f;
 
+    // How much of the model's darkening and of its brightening reaches the frame. Both 1 is every
+    // path this composition had before them, and the shader skips its branch entirely at 1/1.
+    float shadowGain = 1.0f;
+    float glowGain = 1.0f;
+
 
     static FrameSettings Read(const ShmHeader* h);
 };

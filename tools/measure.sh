@@ -135,6 +135,11 @@ round() {
     sleep 1
   fi
 
+  # Cleared before the request, not after. Trap 1 again, in the one place it was still open: the
+  # wait below is for a manifest to EXIST, so a manifest left by an earlier round satisfies it
+  # instantly and the round reports the previous round's numbers under this round's heading. That
+  # is a wrong answer that looks like a right one, which is the failure this whole script is about.
+  rm -rf "$capture_dir"
   "$shmctl" "$shm" capture "$frames" >/dev/null
   echo "  waiting for $frames captured pairs..."
   local deadline=$((SECONDS + 30))

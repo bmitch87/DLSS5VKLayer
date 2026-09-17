@@ -53,6 +53,8 @@ DLSSNR_PIN(HdrProxy, 92);
 DLSSNR_PIN(HdrTransfer, 96);
 DLSSNR_PIN(ColourTrust, 100);
 DLSSNR_PIN(RatioSmooth, 104);
+DLSSNR_PIN(ShadowGain, 108);
+DLSSNR_PIN(GlowGain, 112);
 
 
 #undef DLSSNR_PIN

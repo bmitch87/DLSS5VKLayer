@@ -35,6 +35,8 @@ cbuffer Params : register(b0)
                            //    PQ-decoded on the way in and PQ-encoded on the way out.
     float gColourTrust;    // maximum chroma displacement from the frame, in normalized units
     float gRatioSmooth;    // how much of the relighting ratio to take from the neighbourhood
+    float gShadowGain;     // how much of the model's DARKENING reaches the frame. 1 = all of it
+    float gGlowGain;       // how much of its BRIGHTENING reaches the frame. 1 = all of it
 
 
 };
@@ -902,6 +904,33 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     // Coring was tried here and removed: the per-frame churn's amplitude overlaps the real detail's,
     // so an amplitude threshold cannot separate them -- it only relocated the noise to the threshold.
+
+    // The directional pair: how much of what the model DARKENED reaches the frame, and how much of
+    // what it BRIGHTENED does, as two separate numbers.
+    //
+    // Everything downstream of here is symmetric -- the guard, the ratio clamp and the colour bound
+    // all treat "too far" the same way in both directions -- and that is not what a user reports. A
+    // pass that looks blown out and a pass that looks crushed are different complaints with the same
+    // single control between them, so the only answer available was to turn the whole edit down and
+    // lose the half that was right.
+    //
+    // Classified on the UNMODIFIED residual, before either gain touches it, so the branch cannot
+    // select its own reference: whether a pixel counts as darkened is a fact about what the model
+    // said, not about what this code is about to do to it.
+    //
+    // Skipped entirely at 1.0/1.0, which is the default, so a default build is bit-identical rather
+    // than nearly so. Rebuilding `model` as `proxy + edit` is exact in real arithmetic and not in
+    // floating point, and "the shipped configuration cannot be changed by this at all" is worth more
+    // than one saved branch.
+    if (gShadowGain != 1.0 || gGlowGain != 1.0)
+    {
+        float editLuma = dot(edit, kLuma);
+        edit *= (editLuma < 0.0 ? gShadowGain : gGlowGain);
+        // Back into a picture, because everything below composes `model` rather than the residual.
+        // The two paths that use `edit` directly -- matched residual and transfer 2 -- read it after
+        // this point, so they carry the gains as well and the three agree.
+        model = proxy + edit;
+    }
 
     if (gDebugView == 3)
     {

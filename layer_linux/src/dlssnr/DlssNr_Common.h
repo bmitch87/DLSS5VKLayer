@@ -199,6 +199,11 @@ struct alignas(256) DlssNrConstants
     // How much of the relighting ratio comes from the neighbourhood. See ratioSmoothPercent.
     float RatioSmooth;
 
+    // The directional residual pair: how much of the model's darkening and of its brightening
+    // reaches the frame. Both 1.0 by default, which is every path this shader had before them.
+    float ShadowGain;
+    float GlowGain;
+
 
 };
 

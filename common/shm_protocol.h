@@ -37,7 +37,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 24;
+static constexpr uint32_t kShmVersion = 25;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -632,6 +632,22 @@ struct ShmHeader {
     std::atomic<uint32_t> sceneCutScore;
     // How many cuts this session has fired, so a run can be judged without watching the log.
     std::atomic<uint32_t> sceneCutCount;
+
+    // The directional residual pair: how much of what the model DARKENED reaches the frame, and how
+    // much of what it BRIGHTENED does. Both 1.0 by default, which is exactly the behaviour that
+    // shipped -- the shader skips the branch entirely at 1/1, so a default build is bit-identical.
+    //
+    // Everything else in the composition is symmetric: the highlight guard, the ratio clamp and the
+    // colour bound all treat "too far" the same in both directions. That is not what a user
+    // reports. "It looks blown out" and "it looks crushed" are different complaints, and the only
+    // control that used to answer either of them was detail strength, which turns down the half
+    // that was right along with the half that was not.
+    //
+    // In the COMPOSITION group rather than the model group, in the interface and here: this does
+    // not ask the model for anything, it decides how much of the model's answer lands. Where a
+    // control lives is a statement about what it costs.
+    std::atomic<uint32_t> shadowGainBits;
+    std::atomic<uint32_t> glowGainBits;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -647,7 +663,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 2116, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2124, "the header layout changed -- bump kShmVersion");
 
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
@@ -784,6 +800,8 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->sceneCutThreshold.store(kSceneCutThresholdDefault);
     h->sceneCutScore.store(0);
     h->sceneCutCount.store(0);
+    h->shadowGainBits.store(FloatToBits(1.0f));
+    h->glowGainBits.store(FloatToBits(1.0f));
     h->intensityBits.store(FloatToBits(1.0f));
     h->localToneBits.store(FloatToBits(1.0f));
     h->localStructureBits.store(FloatToBits(1.0f));
