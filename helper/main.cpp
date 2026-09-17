@@ -1038,6 +1038,14 @@ static bool CreateImage2DOpticalFlow(VkCtx& c, VkFormat fmt, uint32_t w, uint32_
     ci.extent = { w, h, 1 };
     ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    // The flow OUTPUT is viewed through a second format -- R16G16_UINT over
+    // R16G16_SFIXED5_NV or R16G16_SFLOAT -- and a view whose format differs from its
+    // image's is only legal when the image was created MUTABLE_FORMAT. It was not, so the
+    // one view the entire deadzone pass reads through was an invalid view that NVIDIA's
+    // driver happened to honour. Only the output needs it; the two input images are never
+    // aliased and mutable format can cost compression, so they do not get it.
+    if (ofUsage & VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV)
+        ci.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     // STORAGE: the MVec deadzone compute pass reads the raw flow texels through
     // a size-compatible R16G16_UINT view (no image->image copy out of the
     // optical-flow output, which the driver cannot sample/copy as bits).
@@ -1088,13 +1096,12 @@ static void DestroyImage2D(VkCtx& c, GpuImage& img) {
 }
 
 static size_t ImageSizeBytes(VkCtx& c, GpuImage& img) {
-    if (vkGetImageSubresourceLayout) {
-        VkSubresourceLayout sl{};
-        VkImageSubresource sub{};
-        sub.aspectMask = img.aspect();
-        vkGetImageSubresourceLayout(c.device, img.image, &sub, &sl);
-        if (sl.size) return sl.size;
-    }
+    // vkGetImageSubresourceLayout is only defined for LINEAR (and DRM-modifier) tiling, and
+    // every image this is called on is OPTIMAL. Asking anyway was a spec violation whose
+    // answer had no defined meaning -- the driver's number was being preferred over our own
+    // arithmetic precisely where it is least entitled to one. The per-format sizes below
+    // were always the real answer.
+    (void)c;
     switch (img.format) {
         case VK_FORMAT_R16G16_SFLOAT: return size_t(img.width) * img.height * 4;
         case VK_FORMAT_R16G16_SFIXED5_NV: return size_t(img.width) * img.height * 4;
@@ -1472,7 +1479,12 @@ static bool QueryOpticalFlowFormat(VkCtx& c, VkOpticalFlowUsageFlagsNV usage,
     uint32_t count = 0;
     if (vkGetPhysicalDeviceOpticalFlowImageFormatsNV(c.physical, &info, &count, nullptr) != VK_SUCCESS || !count)
         return false;
+    // Every element's sType has to be set before the call, not just the info struct's: this
+    // is an array the driver fills in, and it is entitled to read the type of each slot to
+    // know what it may write there. Leaving them zeroed is what validation reports, and the
+    // fact that NVIDIA's driver fills them anyway is luck, not contract.
     std::vector<VkOpticalFlowImageFormatPropertiesNV> props(count);
+    for (auto& p : props) p.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_IMAGE_FORMAT_PROPERTIES_NV;
     if (vkGetPhysicalDeviceOpticalFlowImageFormatsNV(c.physical, &info, &count, props.data()) != VK_SUCCESS)
         return false;
     for (uint32_t i = 0; i < preferredCount; ++i) {
@@ -1616,7 +1628,11 @@ static bool BuildMVecComputePass(NeuralState& ns, uint32_t ow, uint32_t oh) {
         DestroyMVecComputePass(c, f);
         return false;
     }
-    VkDescriptorImageInfo srcInfo{ nullptr, f.outBitsView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    // GENERAL, not SHADER_READ_ONLY_OPTIMAL: this is bound as a STORAGE_IMAGE and read with
+    // imageLoad, and a storage image may only be GENERAL (or SHARED_PRESENT). The declared
+    // layout here and the image's actual layout at dispatch have to agree, so the barrier
+    // before the dispatch moves to GENERAL too.
+    VkDescriptorImageInfo srcInfo{ nullptr, f.outBitsView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo dstInfo{ nullptr, ns.mv.view, VK_IMAGE_LAYOUT_GENERAL };
     VkWriteDescriptorSet writes[2] = {};
     for (uint32_t i = 0; i < 2; ++i) {
@@ -2179,7 +2195,7 @@ static bool RunOpticalFlow(NeuralState& ns) {
     // The compute pass reads the raw NVOF texels in-place through the
     // R16G16_UINT view, decodes, deadzone-clamps and upscales straight into
     // the MVec resource. No host readback, no image->image bit copy.
-    TransitionImage2(ns.vk, cb, f.out, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    TransitionImage2(ns.vk, cb, f.out, VK_IMAGE_LAYOUT_GENERAL,
                      VK_ACCESS_2_OPTICAL_FLOW_WRITE_BIT_NV, VK_ACCESS_2_SHADER_READ_BIT,
                      VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     TransitionImage2(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_GENERAL,
