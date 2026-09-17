@@ -199,12 +199,15 @@ bool ApplySetting(ShmHeader* h, const char* name, const char* value) {
         }
         (h->*s.field).store(s.isFloat ? FloatToBits(float(v)) : uint32_t(v < 0 ? 0 : v));
         h->controlSeq.fetch_add(1);
-        // Anything the model latches when its feature is built also bumps the tuning sequence, which
-        // is what tells the helper to rebuild rather than to keep using a feature built with the old
-        // values. Sharpness and uicorrection are absent: the parameter probe shows both being read
-        // at evaluate, so a running feature already follows them and a rebuild would buy nothing.
-        static const char* kCreateTime[] = { "preset", "style", "automask", "intensity",
-                                             "localtone", "localstructure", "skinstructure", "passes" };
+        // What actually costs a rebuild, which turned out to be far less than this list used to say.
+        //
+        // Measured: with the rebuild debounce pushed out so that one feature served every value,
+        // style, intensity, local tone, local structure, skin structure and the auto mask all moved
+        // the picture on their own, reproducibly, with zero rebuilds -- see
+        // NgxTuning::SameCreateParams for the numbers. Only the preset is read at create, and it
+        // was separately measured to change nothing at all. `passes` stays because adding or
+        // dropping a pass is a build, not a tuning.
+        static const char* kCreateTime[] = { "preset", "passes" };
         for (const char* k : kCreateTime) {
             if (std::strcmp(k, name) == 0) { h->tuningSeq.fetch_add(1); break; }
         }

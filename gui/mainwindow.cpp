@@ -1420,21 +1420,28 @@ QWidget* MainWindow::buildSettings() {
                           "The model's own processing profiles.\n"
                           "Three, and only three: styles above Cinematic were swept through this "
                           "model and produced output identical to Cinematic, so the list is not "
-                          "hiding anything.",
-                          ShmBinder::AtCreate);
+                          "hiding anything.\n"
+                          "Takes effect on the next frame: measured live on this model.",
+                          ShmBinder::Live);
         binder->AddInt(f, "Preset", &ShmHeader::preset, 0, 15,
                        "The model's own render preset.\n"
                        "The model reads this every time a pass is built -- and on this model build "
                        "no value from 0 to 15 changed the picture at all. Left at its full range "
                        "rather than narrowed, because \"read and does nothing here\" is not the "
-                       "same as \"out of range\", and another model may differ.",
+                       "same as \"out of range\", and another model may differ.\n"
+                       "The one setting here that really is latched: changing it rebuilds the "
+                       "pass, which takes a moment.",
                        ShmBinder::AtCreate);
+        // Live, all six, measured: see NgxTuning::SameCreateParams. They used to cost a feature
+        // rebuild -- a device-wide stall and a fresh temporal history -- for a value the running
+        // feature was going to read at the next evaluate anyway.
         binder->AddFloat(f, "Intensity", &ShmHeader::intensityBits, 0.0, 4.0, 0.05,
-                         "How hard the model works.", ShmBinder::AtCreate);
-        binder->AddFloat(f, "Local structure", &ShmHeader::localStructureBits, 0.0, 4.0, 0.05, "",
-                         ShmBinder::AtCreate);
-        binder->AddFloat(f, "Local tone", &ShmHeader::localToneBits, 0.0, 4.0, 0.05, "",
-                         ShmBinder::AtCreate);
+                         "How hard the model works.\n"
+                         "Takes effect on the next frame.", ShmBinder::Live);
+        binder->AddFloat(f, "Local structure", &ShmHeader::localStructureBits, 0.0, 4.0, 0.05,
+                         "Takes effect on the next frame.", ShmBinder::Live);
+        binder->AddFloat(f, "Local tone", &ShmHeader::localToneBits, 0.0, 4.0, 0.05,
+                         "Takes effect on the next frame.", ShmBinder::Live);
         skinStructureBox =
             binder->AddFloat(f, "Skin structure", &ShmHeader::skinStructureBits, -1.0, 4.0, 0.05,
                              "-1 follows local structure, which is the model's own default. It is not "
@@ -1442,14 +1449,16 @@ QWidget* MainWindow::buildSettings() {
                              "Needs the auto skin mask: with the mask off, strengths of 0, 2 and 4 "
                              "were measured to give byte-identical output. The mask is what tells the "
                              "model where skin is, and without it there is nothing for a strength to "
-                             "apply to.",
-                             ShmBinder::AtCreate);
+                             "apply to.\n"
+                             "Takes effect on the next frame.",
+                             ShmBinder::Live);
         autoMaskBox =
             binder->AddBool(f, "Auto skin mask", &ShmHeader::autoMask,
                             "The model's automatic skin mask.\n"
                             "Also the switch that makes Skin structure mean anything -- see its "
-                            "tooltip.",
-                            ShmBinder::AtCreate);
+                            "tooltip.\n"
+                            "Takes effect on the next frame.",
+                            ShmBinder::Live);
         connect(autoMaskBox, &QCheckBox::toggled, this, &MainWindow::updateSkinStructureEnabled);
         updateSkinStructureEnabled();
         binder->AddBool(f, "UI correction", &ShmHeader::uiCorrection,

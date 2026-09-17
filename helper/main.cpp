@@ -1591,6 +1591,12 @@ struct NeuralState {
     // swap inside one frame rather than a gap in the chain.
     bool passDirty[kMaxPasses] = {};
     NgxTuning lastSeenTuning[kMaxPasses] = {};
+    // What each pass was last EVALUATED with, which since the six became live is a different
+    // question from what it was BUILT with. A change here owes the model a history reset: its
+    // accumulated state was produced under the old strengths, and carrying it across is what makes
+    // a slider drag smear instead of simply landing.
+    NgxTuning lastEvalTuning[kMaxPasses] = {};
+    bool haveEvalTuning[kMaxPasses] = {};
 
     // Rebuilds are spaced rather than done at once: back-to-back NGX creation exhausts the driver's
     // latches and the model stops answering until the process restarts. The spacing is wall-clock
@@ -3420,12 +3426,26 @@ static void MaintainPasses(NeuralState& ns, ShmMap& shm, uint32_t wanted) {
     // change that follows then looks like no change at all. Seven atomic loads per live pass per
     // frame is nothing next to a control that silently stops working. Every new value re-arms the
     // wait, so dragging a slider debounces rather than rebuilding at each tick.
+    //
+    // "What the model latches at creation" is now the PRESET and nothing else -- measured; see
+    // NgxTuning::SameCreateParams for the numbers. The other six act at evaluate on the feature
+    // that is already running, so rebuilding for them bought a device-wide stall and a fresh
+    // temporal history in exchange for a value the running feature was going to read anyway.
+    //
+    // DLSSNR_REBUILD_ON_TUNING=1 restores the old behaviour for every field. It exists so that
+    // "the picture smears for a moment when I drag a slider now" can be tested rather than argued
+    // about, and it should be deleted once nobody has reported that for a release.
+    static const bool rebuildOnEverything = [] {
+        const char* p = getenv("DLSSNR_REBUILD_ON_TUNING");
+        return p && p[0] == '1';
+    }();
     auto scanDirty = [&]() -> int {
         int first = -1;
         for (uint32_t i = 0; i < ns.livePasses; ++i) {
             const NgxTuning t = TuningFor(shm.hdr, i);
             if (!(t == ns.lastSeenTuning[i])) { ns.lastSeenTuning[i] = t; ns.tuningChangedMs = now; }
-            ns.passDirty[i] = !(t == ns.tuning[i]);
+            ns.passDirty[i] = rebuildOnEverything ? !(t == ns.tuning[i])
+                                                  : !t.SameCreateParams(ns.tuning[i]);
             if (ns.passDirty[i] && first < 0) first = (int)i;
         }
         return first;
@@ -3824,7 +3844,24 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         //
         // Sharpness is set alongside it out of habit and does nothing: this model has no
         // sharpness parameter. See NgxSetSharpness.
-        NgxSetEvaluateTuning(ns.ngx, TuningFor(shm.hdr, pass));
+        const NgxTuning et = TuningFor(shm.hdr, pass);
+        NgxSetEvaluateTuning(ns.ngx, et);
+        // A strength that just moved invalidates the history built under the old one. Raised once,
+        // on the first frame that carries the new value, not for as long as it differs from the
+        // build -- which after the rebuild went away would have been forever.
+        if (!ns.haveEvalTuning[pass] || !(et == ns.lastEvalTuning[pass])) {
+            if (ns.haveEvalTuning[pass]) {
+                ns.passNeedsReset[pass] = true;
+                static uint32_t said = 0;
+                if (said < 4) {
+                    ++said;
+                    Log("[params] pass %u retuned live; raising the model's history reset for one "
+                        "frame (no rebuild)", pass);
+                }
+            }
+            ns.lastEvalTuning[pass] = et;
+            ns.haveEvalTuning[pass] = true;
+        }
         const PassTuning ps = ShmResolvePass(shm.hdr, pass);
         NgxSetSharpness(ns.ngx, ClampF(ps.sharpness, 0.0f, 1.0f));
 

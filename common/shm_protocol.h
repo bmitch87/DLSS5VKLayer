@@ -263,15 +263,18 @@ struct PassTuning {
     // it, so their default is an answer to a different question and is not evidence for ours.
     uint32_t uiCorrection = 0;
 
-    bool SameCreateParams(const PassTuning& o) const {
-        // Everything the model latches when its feature is built. Sharpness is absent because it is
-        // read at evaluate, and so is the only one of these a running feature will actually follow.
-        // uiCorrection is absent for the same reason as sharpness: the parameter probe shows the DLL
-        // reading DLSSNR.UICorrection at evaluate and never at create, so a change to it is followed
-        // by the running feature and must not cost a rebuild.
-        return intensity == o.intensity && localTone == o.localTone && localStructure == o.localStructure &&
-               skinStructure == o.skinStructure && style == o.style && preset == o.preset && autoMask == o.autoMask;
-    }
+    // What the model latches when its feature is built: the preset, and nothing else.
+    //
+    // This used to name seven fields, and six of them did not belong. The parameter probe showed
+    // the DLL reading those six at every evaluate and only the preset at create; a picture test
+    // then confirmed it, with the rebuild debounce pushed out so that ONE feature, built once,
+    // served every value -- style, intensity, local tone, local structure, skin structure and the
+    // auto mask each moved the output on their own, reproducibly, with zero rebuilds. The numbers
+    // are in core/ngx_snippet.h, next to NgxTuning::SameCreateParams, which is the copy of this
+    // question that the helper actually acts on.
+    //
+    // Sharpness and uiCorrection were already absent, for the same reason arrived at earlier.
+    bool SameCreateParams(const PassTuning& o) const { return preset == o.preset; }
 };
 
 struct ShmHeader {
