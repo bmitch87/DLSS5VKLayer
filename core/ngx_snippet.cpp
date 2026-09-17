@@ -644,7 +644,8 @@ bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height
 // ---------------------------------------------------------------------------
 void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
                      const NVSDK_NGX_Resource_VK& out, const NVSDK_NGX_Resource_VK& mv,
-                     const NVSDK_NGX_Resource_VK& depth, uint32_t width, uint32_t height) {
+                     const NVSDK_NGX_Resource_VK& depth, uint32_t width, uint32_t height,
+                     uint32_t mvecWidth, uint32_t mvecHeight) {
     if (!s.params) return;
     s.resColor = color; s.resOut = out; s.resMV = mv; s.resDepth = depth;
     DWORD seh = 0;
@@ -676,11 +677,21 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
         { "DLSSNR.MVecSubrectBaseX", "DLSSNR.MVecSubrectBaseY", "DLSSNR.MVecSubrectWidth", "DLSSNR.MVecSubrectHeight" },
         { "DLSSNR.DepthSubrectBaseX", "DLSSNR.DepthSubrectBaseY", "DLSSNR.DepthSubrectWidth", "DLSSNR.DepthSubrectHeight" },
     };
-    for (auto& n : subrectNames) {
+    // The MVec subrect is the one that is not simply the frame. It was set to the full
+    // raster unconditionally, which was true while the motion field was always full-size and
+    // always entirely written -- and stops being true the moment any of it is produced at a
+    // reduced size or zeroed by a confidence gate. Telling the model that every pixel of the
+    // field is a measurement when part of it is not is exactly what the subrect parameters
+    // exist to prevent.
+    for (size_t i = 0; i < sizeof(subrectNames) / sizeof(subrectNames[0]); ++i) {
+        const bool isMVec = i == 2;
+        const uint32_t sw = isMVec ? mvecWidth : width;
+        const uint32_t sh = isMVec ? mvecHeight : height;
+        const char* const* n = subrectNames[i];
         ParamSetUI(s.params, n[0], 0, &seh);
         ParamSetUI(s.params, n[1], 0, &seh);
-        ParamSetUI(s.params, n[2], width, &seh);
-        ParamSetUI(s.params, n[3], height, &seh);
+        ParamSetUI(s.params, n[2], sw, &seh);
+        ParamSetUI(s.params, n[3], sh, &seh);
     }
     // Gone from this block, all confirmed never read: the dotted and undotted jitter keys
     // (this pass has no jitter anyway), the undotted Reset/Width/Height aliases whose

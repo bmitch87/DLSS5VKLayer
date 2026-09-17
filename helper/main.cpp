@@ -3553,7 +3553,14 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         FillResource(ro, *out, true);
         FillResource(rm, ns.mv, false);
         FillResource(rd, ns.depth, false);
-        NgxSetResources(ns.ngx, rc, ro, rm, rd, w, h);
+        // What the motion field actually holds this frame. Zero when it carries nothing --
+        // vectors disabled, the session gone, a cut just cleared it, or the model has no
+        // field to reproject with yet -- rather than a full rectangle of zeros presented as
+        // measurements.
+        const bool mvecUsable = ns.flow.enabled && ns.mvecEnabled && !ns.pendingMvClear;
+        NgxSetResources(ns.ngx, rc, ro, rm, rd, w, h,
+                        mvecUsable ? ns.mv.width : 0u,
+                        mvecUsable ? ns.mv.height : 0u);
 
         // This pass's own tuning, written immediately before this pass's evaluate.
         //

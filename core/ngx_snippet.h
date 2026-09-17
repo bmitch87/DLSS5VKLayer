@@ -113,9 +113,16 @@ bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height
                    VkCommandBuffer recordingCmd);
 void NgxReleasePass(NgxSnippet& s, uint32_t pass, VkDevice device);
 void NgxReleaseAllPasses(NgxSnippet& s, VkDevice device);
+// mvecWidth/mvecHeight are the region of the motion field that actually holds measurements.
+// They are normally the full frame; they are not when the field was produced at a reduced
+// size, when a grid did not divide the raster evenly, or when a confidence gate has zeroed
+// part of it. Zero means "the field carries nothing", which is a clearer statement to the
+// model than a full rectangle of zeros -- and the DLL infers no subrect from a resource, so
+// whatever is not said here stays at its own default.
 void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
                      const NVSDK_NGX_Resource_VK& out, const NVSDK_NGX_Resource_VK& mv,
-                     const NVSDK_NGX_Resource_VK& depth, uint32_t width, uint32_t height);
+                     const NVSDK_NGX_Resource_VK& depth, uint32_t width, uint32_t height,
+                     uint32_t mvecWidth, uint32_t mvecHeight);
 void NgxSetReset(NgxSnippet& s, bool reset, bool logValue = false);
 // A no-op that logs once. This model has no sharpness parameter under any name -- see the
 // definition. It was believed to be "the one strength the model reads at evaluate"; it is
