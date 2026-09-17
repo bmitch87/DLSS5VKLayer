@@ -204,6 +204,10 @@ struct alignas(256) DlssNrConstants
     float ShadowGain;
     float GlowGain;
 
+    // How the model's answer is enlarged when it ran below the frame's size: 0 bilinear (what every
+    // build before it did), 1 nearest, 2 Catmull-Rom. See SampleRecon in dlssnr.hlsl.
+    uint32_t Reconstruct;
+
 
 };
 

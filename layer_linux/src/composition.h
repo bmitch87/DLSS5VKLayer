@@ -79,6 +79,9 @@ struct FrameSettings {
     float shadowGain = 1.0f;
     float glowGain = 1.0f;
 
+    // How the model's answer is enlarged when it ran small. See ReconstructFilter.
+    uint32_t reconstruct = kReconstructBilinear;
+
 
     static FrameSettings Read(const ShmHeader* h);
 };

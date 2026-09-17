@@ -121,6 +121,11 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
         if (s.shadowGain > 4.0f) s.shadowGain = 4.0f;
         if (s.glowGain > 4.0f) s.glowGain = 4.0f;
 
+        // Clamped to a mode the shader has, so a header written by a newer build falls back to the
+        // behaviour that shipped rather than to whatever the last branch happens to be.
+        s.reconstruct = h->reconstructFilter.load();
+        if (s.reconstruct > kReconstructCatmullRom) s.reconstruct = kReconstructBilinear;
+
         s.colourTrust = float(h->colourTrustPercent.load()) / 100.0f;
         static const int forcedCt = [] {
             const char* v = getenv("DLSSNR_COLOUR_TRUST");
@@ -1210,6 +1215,7 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     c.RatioSmooth = s.ratioSmooth;
     c.ShadowGain = s.shadowGain;
     c.GlowGain = s.glowGain;
+    c.Reconstruct = s.reconstruct;
     return c;
 }
 

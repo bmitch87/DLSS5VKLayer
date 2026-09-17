@@ -55,6 +55,7 @@ DLSSNR_PIN(ColourTrust, 100);
 DLSSNR_PIN(RatioSmooth, 104);
 DLSSNR_PIN(ShadowGain, 108);
 DLSSNR_PIN(GlowGain, 112);
+DLSSNR_PIN(Reconstruct, 116);
 
 
 #undef DLSSNR_PIN

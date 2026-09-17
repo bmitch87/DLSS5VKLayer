@@ -24,6 +24,7 @@
 // misalignment to search for. Do not add it.
 //
 // usage: capture_metrics [directory]
+//        capture_metrics <reference-dir> <candidate-dir>   compare two runs' answers
 //   directory defaults to the same place CaptureWriter::Directory() resolves:
 //   $XDG_STATE_HOME/dlssnr/captures, else ~/.local/state/dlssnr/captures, else /tmp.
 
@@ -249,7 +250,82 @@ bool FileExists(const std::string& p) {
 
 }  // namespace
 
+// Two directories: compare each round's ANSWER against the other's, rather than each round's answer
+// against its own input.
+//
+// The one-directory mode answers "how far did the pass move this picture". It cannot answer "which
+// of these two settings is closer to the reference", because each round's PSNR is measured against
+// its own before_ image and the two rounds never meet. That is the question the reconstruction
+// filter needs: capture at 100%, capture again at 50% with each filter, and compare each 50% answer
+// against the 100% one.
+//
+// Both directories must hold the same frames of the same picture, which is what holdFrame is for.
+// The raster and encoding are required to match and the run is refused otherwise -- comparing two
+// different pictures and reporting a number is the failure this whole tool exists to avoid.
+static int CompareDirs(const std::string& a, const std::string& b) {
+    Manifest ma, mb;
+    if (!ReadManifest(a, ma) || !ReadManifest(b, mb)) return 1;
+    if (ma.width != mb.width || ma.height != mb.height || ma.encoding != mb.encoding ||
+        ma.bytesPerPixel != mb.bytesPerPixel) {
+        std::fprintf(stderr,
+                     "capture_metrics: %s is %ux%u %s and %s is %ux%u %s -- these are not two "
+                     "versions of the same picture, so there is nothing to compare.\n",
+                     a.c_str(), ma.width, ma.height, ma.encoding.c_str(), b.c_str(), mb.width,
+                     mb.height, mb.encoding.c_str());
+        return 1;
+    }
+
+    std::printf("reference       %s\n", a.c_str());
+    std::printf("candidate       %s\n", b.c_str());
+    std::printf("raster          %ux%u\n", ma.width, ma.height);
+    std::printf("border discard  %d px\n\n", kBorder);
+    std::printf("Each row is the candidate's ANSWER against the reference's answer for the same\n");
+    std::printf("frame. Higher PSNR is closer to the reference; the sharpness columns say which\n");
+    std::printf("way it differs, since two settings can be equally far apart and one of them\n");
+    std::printf("softer.\n\n");
+    std::printf("%-6s  %14s %14s  %14s %14s  %10s\n", "frame", "lap(ref)", "lap(cand)",
+                "sobel(ref)", "sobel(cand)", "PSNR dB");
+
+    const char* ext = ma.encoding == "png" ? "png" : "raw";
+    const uint32_t frames = ma.frames < mb.frames ? ma.frames : mb.frames;
+    std::vector<float> ra, ca;
+    double lapR = 0, lapC = 0, sobR = 0, sobC = 0, psnr = 0;
+    uint32_t counted = 0;
+    for (uint32_t i = 0; i < frames; ++i) {
+        char na[512], nb[512];
+        std::snprintf(na, sizeof(na), "%s/after_%02u.%s", a.c_str(), i, ext);
+        std::snprintf(nb, sizeof(nb), "%s/after_%02u.%s", b.c_str(), i, ext);
+        if (!FileExists(na) || !FileExists(nb)) continue;
+        if (!LoadLuma(na, ma, ra) || !LoadLuma(nb, mb, ca)) return 1;
+
+        const Sharpness sr = Measure(ra, ma.width, ma.height);
+        const Sharpness sc = Measure(ca, ma.width, ma.height);
+        const double p = Psnr(ra, ca, ma.width, ma.height);
+        std::printf("%-6u  %14.6g %14.6g  %14.6g %14.6g  %10.2f\n", i, sr.laplacianVariance,
+                    sc.laplacianVariance, sr.sobelEnergy, sc.sobelEnergy, p);
+        lapR += sr.laplacianVariance;
+        lapC += sc.laplacianVariance;
+        sobR += sr.sobelEnergy;
+        sobC += sc.sobelEnergy;
+        psnr += std::isinf(p) ? 0.0 : p;
+        ++counted;
+    }
+    if (!counted) {
+        std::fprintf(stderr, "capture_metrics: no matching after_NN frames in %s and %s\n",
+                     a.c_str(), b.c_str());
+        return 1;
+    }
+    std::printf("\n%-6s  %14.6g %14.6g  %14.6g %14.6g  %10.2f\n", "mean", lapR / counted,
+                lapC / counted, sobR / counted, sobC / counted, psnr / counted);
+    std::printf("\nlaplacian candidate/reference  %.4f\n", lapR > 0 ? lapC / lapR : 0.0);
+    std::printf("sobel     candidate/reference  %.4f\n", sobR > 0 ? sobC / sobR : 0.0);
+    std::printf("\nA candidate at the same PSNR but a HIGHER laplacian ratio is not closer to the\n");
+    std::printf("reference, it is differently wrong and sharper. Read the two together.\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
+    if (argc > 2) return CompareDirs(argv[1], argv[2]);
     const std::string dir = argc > 1 ? argv[1] : DefaultDirectory();
 
     Manifest m;

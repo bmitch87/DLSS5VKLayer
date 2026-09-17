@@ -37,7 +37,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 25;
+static constexpr uint32_t kShmVersion = 26;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -172,6 +172,23 @@ enum ProxyFormat : uint32_t {
 // What holdFrame means. A third value rather than a second field: the size and the existing two
 // meanings are unchanged, so every reader that only understands off and on is still right about
 // both of them.
+// How the model's answer is enlarged when it ran below the frame's resolution.
+//
+// Only reachable below 100% model resolution: at the frame's own size every one of these lands on
+// texel centres and none of them is doing anything.
+enum ReconstructFilter : uint32_t {
+    // The sampler's own bilinear. What every build before this did, and the default.
+    kReconstructBilinear = 0,
+    // The nearest source texel, no blending. The argument for it is that a smooth filter invents
+    // detail across a disocclusion, where neighbouring cells describe different surfaces.
+    kReconstructNearest = 1,
+    // A sharpening cubic, nine bilinear fetches folded from sixteen taps. The argument for it is
+    // that three of the four objections to a smooth filter are objections to interpolating a
+    // PICTURE, and what this enlarges becomes a residual against the frame's own full-resolution
+    // proxy rather than a picture in its own right.
+    kReconstructCatmullRom = 2,
+};
+
 enum HoldFrameMode : uint32_t {
     kHoldOff = 0,
     kHoldOn = 1,
@@ -666,6 +683,15 @@ struct ShmHeader {
     // control lives is a statement about what it costs.
     std::atomic<uint32_t> shadowGainBits;
     std::atomic<uint32_t> glowGainBits;
+
+    // How the model's answer is enlarged when it ran below the frame's resolution. See
+    // ReconstructFilter, and SampleRecon in dlssnr.hlsl.
+    //
+    // A mode rather than a decision, because five projects hold five positions on it and not one of
+    // them shipped a picture. 0 is exactly what every build before this did, so the question can be
+    // asked on real content without anyone rebuilding, and answered by capture rather than by
+    // argument.
+    std::atomic<uint32_t> reconstructFilter;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -681,7 +707,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 2124, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2128, "the header layout changed -- bump kShmVersion");
 
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
@@ -820,6 +846,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->sceneCutCount.store(0);
     h->shadowGainBits.store(FloatToBits(1.0f));
     h->glowGainBits.store(FloatToBits(1.0f));
+    h->reconstructFilter.store(kReconstructBilinear);
     h->intensityBits.store(FloatToBits(1.0f));
     h->localToneBits.store(FloatToBits(1.0f));
     h->localStructureBits.store(FloatToBits(1.0f));

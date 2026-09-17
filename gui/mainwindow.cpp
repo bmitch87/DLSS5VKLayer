@@ -162,6 +162,7 @@ static const SettingEntry kSettingsTable[] = {
     {"set_ui_correction", &ShmHeader::uiCorrection, false},
     {"set_scene_cut_threshold", &ShmHeader::sceneCutThreshold, false},
     {"set_shadow_gain", &ShmHeader::shadowGainBits, true},
+    {"set_reconstruction_filter", &ShmHeader::reconstructFilter, false},
     {"set_glow_gain", &ShmHeader::glowGainBits, true},
     {"set_sharpness", &ShmHeader::sharpnessBits, true},
     {"set_motion_enabled", &ShmHeader::mvecEnabled, false},
@@ -1218,6 +1219,34 @@ void MainWindow::updateStatus() {
     // Reload blocks signals while it writes, so the mask's toggled() does not fire and the skin row
     // would stay as the user last left it rather than as the header now reads.
     updateSkinStructureEnabled();
+    // Whether the chosen model fraction divides the frame the layer is actually presenting.
+    //
+    // KKY-03's point: a non-integer ratio undersamples in the image that FEEDS the model, before
+    // the model has done anything, so it is a cost paid on the way down as well as on the way up.
+    // Which fractions are exact depends on the raster, so this is computed from the live one rather
+    // than from a fixed list -- 50% is exact at 1920 and not at 1921.
+    //
+    // Marked rather than snapped. Snapping would move a value the user chose, and an inexact
+    // fraction is a legitimate thing to ask for once you know that is what you are asking for.
+    if (modelScaleNote && hdr) {
+        const uint32_t w = hdr->layerWidth.load(), h = hdr->layerHeight.load();
+        const double p = double(BitsToFloat(hdr->workingScaleBits.load()));
+        if (!w || !h || p <= 0.0) {
+            modelScaleNote->setText("<span style=\"color:#9e9e9e;\">no frame yet</span>");
+        } else {
+            const uint32_t mw = std::max<uint32_t>(64, uint32_t(std::lround(double(w) * p)));
+            const uint32_t mh = std::max<uint32_t>(64, uint32_t(std::lround(double(h) * p)));
+            const bool exact = mw > 0 && mh > 0 && w % mw == 0 && h % mh == 0;
+            modelScaleNote->setText(
+                QString("<span style=\"color:%1;\">%2x%3 from %4x%5 &mdash; %6</span>")
+                    .arg(exact ? "#43a047" : "#fb8c00")
+                    .arg(mw).arg(mh).arg(w).arg(h)
+                    .arg(exact ? QString("exact (1 model pixel = %1x%2 frame pixels)")
+                                     .arg(w / mw).arg(h / mh)
+                               : QString("not exact &mdash; the model's own input is resampled too")));
+        }
+    }
+
     if (sceneCutLabel && hdr) {
         const uint32_t score = hdr->sceneCutScore.load();
         const uint32_t cuts = hdr->sceneCutCount.load();
@@ -1493,7 +1522,33 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                            "information.\n"
                            "It is also expensive: at 200% on a 4K frame the transport carries 132 MB "
                            "each way, every frame. Treat it as an experiment, not a quality "
-                           "setting.");
+                           "setting.\n"
+                           "The line below says whether this fraction divides the current frame "
+                           "exactly. One that does not makes the model's own input an undersampled "
+                           "picture before the model has done anything, which is a cost paid twice "
+                           "-- once going down and again coming back up.");
+        modelScaleNote = new QLabel("-", col->parentWidget());
+        modelScaleNote->setWordWrap(true);
+        modelScaleNote->setToolTip(FormatTip(
+            "An exact fraction lands every model pixel on a whole number of frame pixels. An "
+            "inexact one resamples on the way down as well as on the way up, so the reconstruction "
+            "filter is not the only thing deciding how the answer looks."));
+        f->addRow("", modelScaleNote);
+        binder->AddChoice(f, "Reconstruction filter", &ShmHeader::reconstructFilter,
+                          { "Bilinear", "Nearest", "Catmull-Rom" },
+                          "How the model's answer is enlarged when it ran below 100%.\n"
+                          "Does nothing at 100%: at the frame's own size every mode lands on texel "
+                          "centres.\n"
+                          "Bilinear is what every build before this one did. Nearest refuses to "
+                          "blend across a disocclusion, where neighbouring cells describe different "
+                          "surfaces. Catmull-Rom sharpens, on the argument that what is enlarged "
+                          "here becomes a residual against the frame rather than a picture in its "
+                          "own right.\n"
+                          "Five projects hold five positions on this and none shipped a "
+                          "measurement. Take one: hold a frame, capture at 100%, then at 50% with "
+                          "each mode, and compare each against the 100% answer with "
+                          "tools/capture_metrics <dir-a> <dir-b>.",
+                          ShmBinder::Live);
         binder->AddChoice(f, "Down-leg filter", &ShmHeader::scalingDownscaler,
                           { "(fsr1, unsupported)", "Bicubic", "Catmull-Rom", "Lanczos2", "Lanczos3",
                             "Kaiser2", "Kaiser3", "Magic" },

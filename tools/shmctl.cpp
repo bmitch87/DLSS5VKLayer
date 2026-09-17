@@ -83,6 +83,8 @@ const Setting kSettings[] = {
     { "whitepointtrim", &ShmHeader::whitePointTrimBits, true, "multiplier on a measured white point" },
     { "workingscale", &ShmHeader::workingScaleBits, true,
       "the fraction of the frame the model works at; above 1 there are no extra samples to find" },
+    { "reconstruct", &ShmHeader::reconstructFilter, false,
+      "how the answer is enlarged below 100%: 0 bilinear, 1 nearest, 2 catmull-rom" },
     { "downscaler", &ShmHeader::scalingDownscaler, false, "1 bicubic, 2 catmull, 3 lanczos2, 4 lanczos3, 5 kaiser2, 6 kaiser3, 7 magic" },
     { "compare", &ShmHeader::compareMode, false, "0 off, 1 side by side, 2 wipe" },
     { "comparesplit", &ShmHeader::compareSplitBits, true, "where the split sits, 0-1" },

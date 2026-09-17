@@ -37,6 +37,7 @@ cbuffer Params : register(b0)
     float gRatioSmooth;    // how much of the relighting ratio to take from the neighbourhood
     float gShadowGain;     // how much of the model's DARKENING reaches the frame. 1 = all of it
     float gGlowGain;       // how much of its BRIGHTENING reaches the frame. 1 = all of it
+    uint  gReconstruct;    // how the model's answer is enlarged when it ran small. See SampleRecon.
 
 
 };
@@ -287,6 +288,77 @@ float3 SrgbToLinear(float3 v)
 {
     v = saturate(v);
     return lerp(v / 12.92, pow((v + 0.055) / 1.055, 2.4), step(0.04045, v));
+}
+
+// How the model's answer is enlarged when it ran below the frame's resolution.
+//
+// Five projects hold five positions on this and none of them shipped a picture, so it is a mode
+// rather than a decision: 0 is exactly what this shader has always done, and the other two are
+// reachable for measurement without anyone having to rebuild.
+//
+//   0 BILINEAR      the sampler's own filtering. What every build before this did.
+//   1 NEAREST       the nearest source texel, no blending at all.
+//   2 CATMULL-ROM   a sharpening cubic, nine bilinear fetches folded from sixteen taps.
+//
+// The argument for NEAREST is that a smooth filter invents detail across a disocclusion, where the
+// neighbouring cells describe different surfaces, and that an interpolated PICTURE is a picture of
+// something that was never there. The argument against it here is the one worth holding on to:
+// three of the four objections to a smooth filter are objections to interpolating a picture, and
+// what leaves this function is not composed as a picture -- the resolve turns it into a residual
+// against the frame's own full-resolution proxy, and a residual is not a picture.
+//
+// Which of those is right is a measurement, and it is the user's to take: hold a frame, capture at
+// 100%, then at 50% and 75% with each mode, and compare each against the 100% answer.
+//
+// CATMULL-ROM has negative lobes, so it can undershoot below zero on a gradient edge. Clamped at
+// zero here rather than left to the caller: the SDR path saturates on the way into SrgbToLinear
+// and would not notice, but the float path multiplies the value by a white point and a negative
+// there is light with a sign, which nothing downstream is written to expect.
+float4 SampleCatmullRom(Texture2D<float4> tex, float2 uv, float2 texSize)
+{
+    // The standard nine-fetch fold: sixteen cubic taps become nine bilinear ones by sampling
+    // between texel pairs at the position their two weights put the centre of mass.
+    float2 samplePos = uv * texSize;
+    float2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    float2 f = samplePos - texPos1;
+
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+
+    float2 w12 = w1 + w2;
+    // w12 is zero only if w1 and w2 cancel, which the Catmull-Rom basis does not do on [0,1);
+    // guarded anyway, because a NaN here would reach the composition.
+    float2 offset12 = w2 / max(w12, 1e-6);
+
+    float2 p0 = (texPos1 - 1.0) / texSize;
+    float2 p3 = (texPos1 + 2.0) / texSize;
+    float2 p12 = (texPos1 + offset12) / texSize;
+
+    float4 r = 0.0;
+    r += tex.SampleLevel(gLinear, float2(p0.x,  p0.y),  0) * (w0.x  * w0.y);
+    r += tex.SampleLevel(gLinear, float2(p12.x, p0.y),  0) * (w12.x * w0.y);
+    r += tex.SampleLevel(gLinear, float2(p3.x,  p0.y),  0) * (w3.x  * w0.y);
+
+    r += tex.SampleLevel(gLinear, float2(p0.x,  p12.y), 0) * (w0.x  * w12.y);
+    r += tex.SampleLevel(gLinear, float2(p12.x, p12.y), 0) * (w12.x * w12.y);
+    r += tex.SampleLevel(gLinear, float2(p3.x,  p12.y), 0) * (w3.x  * w12.y);
+
+    r += tex.SampleLevel(gLinear, float2(p0.x,  p3.y),  0) * (w0.x  * w3.y);
+    r += tex.SampleLevel(gLinear, float2(p12.x, p3.y),  0) * (w12.x * w3.y);
+    r += tex.SampleLevel(gLinear, float2(p3.x,  p3.y),  0) * (w3.x  * w3.y);
+
+    return float4(max(r.rgb, 0.0), r.a);
+}
+
+float4 SampleRecon(Texture2D<float4> tex, float2 uv, float2 texSize)
+{
+    // Mode 0 is the call this shader has always made, written out rather than routed through the
+    // cases below, so the default path is the same instruction sequence it was.
+    if (gReconstruct == 0) return tex.SampleLevel(gLinear, uv, 0);
+    if (gReconstruct == 1) return tex.SampleLevel(gLinear, (floor(uv * texSize) + 0.5) / texSize, 0);
+    return SampleCatmullRom(tex, uv, texSize);
 }
 
 // ST 2084 (PQ), in the normalised form both ends of this pipeline use: 1.0 means 10000 nits at the
@@ -799,8 +871,17 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     // Sampled rather than loaded: when the model ran at a reduced resolution these are smaller than the
     // frame, and its edit is enlarged here while the frame underneath stays untouched.
-    float4 proxySample = gSource.SampleLevel(gLinear, cmpUv, 0);
-    float4 modelSample = gModel.SampleLevel(gLinear, cmpUv, 0);
+    //
+    // WHICH filter does the enlarging is gReconstruct. At full model raster every mode lands on
+    // texel centres and none of them is doing anything, so the choice only exists below 100%.
+    float2 reconSize;
+    {
+        uint rw, rh;
+        gSource.GetDimensions(rw, rh);
+        reconSize = float2(rw, rh);
+    }
+    float4 proxySample = SampleRecon(gSource, cmpUv, reconSize);
+    float4 modelSample = SampleRecon(gModel, cmpUv, reconSize);
 
     // Nothing was encoded on the way in, so nothing is decoded here either. The float16 proxy is
     // linear light already -- the sRGB decode would fold the highlights flat.
@@ -843,8 +924,12 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             const float2 off = float2(nb == 0 ? -1.0 : nb == 1 ? 1.0 : 0.0,
                                       nb == 2 ? -1.0 : nb == 3 ? 1.0 : 0.0) * texel;
             const float2 uvn = saturate(cmpUv + off);
-            float3 pn = gSource.SampleLevel(gLinear, uvn, 0).rgb;
-            float3 mn = gModel.SampleLevel(gLinear, uvn, 0).rgb;
+            // The same filter as the centre tap above, deliberately. gainSharp is built from the
+            // reconstructed centre and gainSmooth from these; reconstructing them differently
+            // would make the two disagree about the same pixel for a reason that is not the
+            // neighbourhood.
+            float3 pn = SampleRecon(gSource, uvn, reconSize).rgb;
+            float3 mn = SampleRecon(gModel, uvn, reconSize).rgb;
             if (gHdrProxy == 0 && gPassthrough == 0)
             {
                 pn = SrgbToLinear(pn);
