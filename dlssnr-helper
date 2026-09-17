@@ -290,7 +290,14 @@ install_wine_runtime_dll() {
     download_runtime_dll "$name" || return 1
     source="$DATA_DIR/binaries/$name"
   fi
-  cp "$source" "$target"
+  # --remove-destination, not a plain cp: cp follows an existing symlink and writes
+  # to whatever it points at. Wine, Winetricks, Proton and several distro packagings
+  # all leave symlinks in system32, so a plain cp here does not replace the link --
+  # it overwrites a file outside the prefix that the Wine installation or the
+  # distribution owns. This runs on every start with a system-Wine runner.
+  # (cp --remove-destination reported by ComfyUI-NVIDIA-DLSS-Frame-Interpolation,
+  # docs/linux.md:186-190, MIT.)
+  cp --remove-destination "$source" "$target"
   return 0
 }
 
@@ -558,7 +565,9 @@ setup_prefix() {
   if [ -n "$dll" ]; then
     mkdir -p "$WINE_PREFIX_DIR/drive_c/windows/system32"
     if [ ! -f "$WINE_PREFIX_DIR/drive_c/windows/system32/vulkan-1.dll" ]; then
-      cp "$dll" "$WINE_PREFIX_DIR/drive_c/windows/system32/vulkan-1.dll"
+      # --remove-destination: see install_wine_runtime_dll. Never write through a
+      # symlink that a prefix we did not create may have left here.
+      cp --remove-destination "$dll" "$WINE_PREFIX_DIR/drive_c/windows/system32/vulkan-1.dll"
     fi
   else
     echo "warning: vendored DXVK vulkan-1.dll not found" >&2

@@ -31,6 +31,17 @@ The GPL-3.0 text for the OptiScaler-derived material is in `third_party/optiscal
 RenoDX's MIT notice is in `third_party/optiscaler/RenoDX_ATTRIBUTION.txt`. Other dependencies retain
 their notices at the paths given above; not every notice is a separate file in `third_party/`.
 
+## Findings From Reviewed Projects
+
+Some changes here act on a **finding** reported by another project — a fact about NVIDIA's runtime, a
+driver or the Wine stack — rather than on its code. No code from these projects is present. They are
+credited because the finding is theirs and because the next reader should be able to reach the source
+that prompted a change.
+
+| Project | License | Finding acted on |
+|---|---|---|
+| [Konohamaru04/ComfyUI-NVIDIA-DLSS-Frame-Interpolation](https://github.com/Konohamaru04/ComfyUI-NVIDIA-DLSS-Frame-Interpolation) | MIT | `cp --remove-destination` when installing DLLs into a Wine prefix: a plain `cp` writes *through* a prefix symlink into the file it points at (`docs/linux.md:186-190`). |
+
 ## What Is Derived From RenoDX
 
 The heart of the pass, including the two-branch luminance ratio, OkLab hue correction, blend between
