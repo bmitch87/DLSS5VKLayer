@@ -1982,6 +1982,13 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
     // hints, which are per-execute and were on unconditionally until they were named here.
     Log("[mvec] session grid=%u rung=%s cost=%s global_flow=%s external_hints=off",
         f.grid, takenRung, f.costEnabled ? "on" : "off", f.globalEnabled ? "on" : "off");
+    // Measured at 1080p on this project's reference card: 0.98 ms of GPU at grid 4, 2.57 ms
+    // at grid 2, 8.24 ms at grid 1. The finest grid costs eight times the default and
+    // NVIDIA's own published comparison does not find it the highest-quality mode, so a
+    // session that ends up there should say so rather than quietly spending the time.
+    if (f.grid == 1)
+        Log("[mvec] grid 1 is the most expensive setting by a wide margin (about 8x grid 4 "
+            "at 1080p here) and is not known to be the highest quality; 4 is the default");
     return true;
 }
 

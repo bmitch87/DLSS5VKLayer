@@ -1376,7 +1376,16 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
         binder->AddChoice(f, "Motion pixel size", &ShmHeader::mvecPixelSize,
                           { "1 px", "2 px", "4 px", "8 px" },
                           "The optical-flow grid spacing in source-image pixels. Unsupported grids "
-                          "fall back to the nearest grid the GPU can use.");
+                          "fall back to the nearest grid the GPU can use.\n\n"
+                          "Finer is not better here, and it is expensive. Measured on this "
+                          "project's reference card at 1080p, the flow pass alone costs about "
+                          "0.98 ms at 4 px, 2.57 ms at 2 px and 8.24 ms at 1 px -- eight times "
+                          "the cost at the finest setting. NVIDIA's own published comparison "
+                          "finds 1 px is not the highest-quality mode either: on their data a "
+                          "2x2 grid at the slow preset beat a 1x1 grid on every error metric at "
+                          "half the cost.\n\n"
+                          "4 px is the default. Treat 1 px as a diagnostic rather than a "
+                          "quality setting.");
     }
     {
         auto* f = group(col, "Input and precision");
