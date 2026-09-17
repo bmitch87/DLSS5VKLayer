@@ -43,3 +43,9 @@ executable('soak_passes',
   dependencies: [thread_dep],
   install: false,
 )
+
+executable('capture_metrics',
+  'capture_metrics.cpp',
+  link_args: ['-static', '-static-libstdc++', '-static-libgcc'],
+  install: false,
+)

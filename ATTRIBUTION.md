@@ -41,6 +41,7 @@ that prompted a change.
 | Project | License | Finding acted on |
 |---|---|---|
 | [Konohamaru04/ComfyUI-NVIDIA-DLSS-Frame-Interpolation](https://github.com/Konohamaru04/ComfyUI-NVIDIA-DLSS-Frame-Interpolation) | MIT | `cp --remove-destination` when installing DLLs into a Wine prefix: a plain `cp` writes *through* a prefix symlink into the file it points at (`docs/linux.md:186-190`). |
+| [pcdofafa/dlss5-for-all](https://github.com/pcdofafa/dlss5-for-all) | MIT | Reporting Laplacian variance and Sobel gradient energy **together**, with the stated reason that they fail differently, and discarding a border before measuring (`tests/nitidez_png.cpp`). The metrics themselves are standard; `tools/capture_metrics.cpp` is a project implementation. |
 
 ## What Is Derived From RenoDX
 
