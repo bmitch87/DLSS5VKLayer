@@ -42,6 +42,7 @@ that prompted a change.
 |---|---|---|
 | [Konohamaru04/ComfyUI-NVIDIA-DLSS-Frame-Interpolation](https://github.com/Konohamaru04/ComfyUI-NVIDIA-DLSS-Frame-Interpolation) | MIT | `cp --remove-destination` when installing DLLs into a Wine prefix: a plain `cp` writes *through* a prefix symlink into the file it points at (`docs/linux.md:186-190`). |
 | [pcdofafa/dlss5-for-all](https://github.com/pcdofafa/dlss5-for-all) | MIT | Reporting Laplacian variance and Sobel gradient energy **together**, with the stated reason that they fail differently, and discarding a border before measuring (`tests/nitidez_png.cpp`). The metrics themselves are standard; `tools/capture_metrics.cpp` is a project implementation. |
+| [LCPD15/DXL](https://github.com/LCPD15/DXL) | **AGPL-3.0** — findings only, no code | That a parameter container should record which keys the DLL actually *read*, because "set" looks like "in effect" and is not (`src/core/NgxParameterBag.h:126-146`). The probe in `core/ngx_param.h` is a project implementation written from the description; no AGPL code is present, and none may be taken. |
 
 ## What Is Derived From RenoDX
 

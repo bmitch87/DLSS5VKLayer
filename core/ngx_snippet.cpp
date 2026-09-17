@@ -119,10 +119,16 @@ static bool ParamSetF(NVSDK_NGX_Parameter* p, const char* n, float v, DWORD* seh
     Guarded([&] { p->Set(n, v); return true; }, false, seh);
     return *seh == 0;
 }
+// Every readback in this file is a question we are asking ourselves, not one the DLL
+// asked. Marking the phase here keeps our own reads out of the evidence about which keys
+// the DLL uses, and stops miss() reporting a key we invented (DLSSNR.Available) as one
+// the DLL wanted and we lacked.
 static bool ParamGetUI(NVSDK_NGX_Parameter* p, const char* n, unsigned int* v, DWORD* seh) {
+    NgxPhaseScope phase(kNgxPhaseOurs);
     return Guarded([&] { return NVSDK_NGX_SUCCEED(p->Get(n, v)); }, false, seh);
 }
 static bool ParamGetF(NVSDK_NGX_Parameter* p, const char* n, float* v, DWORD* seh) {
+    NgxPhaseScope phase(kNgxPhaseOurs);
     return Guarded([&] { return NVSDK_NGX_SUCCEED(p->Get(n, v)); }, false, seh);
 }
 
@@ -134,11 +140,13 @@ static NVSDK_NGX_Result CallInitExtSafely(FnVkInitExt fn, unsigned long long app
 }
 static NVSDK_NGX_Result CallCreateSafely(FnVkCreateFeature fn, VkCommandBuffer cmd, int feature,
     NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** handle, DWORD* seh) noexcept {
+    NgxPhaseScope phase(kNgxPhaseCreate);
     return Guarded([&] { return fn(cmd, feature, params, handle); },
                    NVSDK_NGX_Result_FAIL_SEH, seh);
 }
 static NVSDK_NGX_Result CallEvaluateSafely(FnVkEvaluateFeature fn, VkCommandBuffer cmd,
     const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, DWORD* seh) noexcept {
+    NgxPhaseScope phase(kNgxPhaseEvaluate);
     return Guarded([&] { return fn(cmd, handle, params, nullptr); },
                    NVSDK_NGX_Result_FAIL_SEH, seh);
 }
@@ -297,7 +305,16 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     {
         DWORD seh2 = 0;
         NVSDK_NGX_Result r = NVSDK_NGX_Result_FAIL_Failure;
-        if (s.core) {
+        // The unread-key probe only sees what passes through our own container, so a run
+        // whose question is "which keys does the DLL actually read" has to take the
+        // fallback deliberately rather than by accident. It is a diagnostic, not a mode:
+        // the DLL allocator stays preferred everywhere else.
+        const bool forceOwn = [] {
+            const char* e = getenv("DLSSNR_FORCE_OWNPARAM");
+            return e && e[0] == '1';
+        }();
+        if (forceOwn) Log("[params] DLSSNR_FORCE_OWNPARAM=1: skipping the DLL allocators");
+        if (s.core && !forceOwn) {
             auto coreAlloc = reinterpret_cast<FnVkAllocateParameters>(
                 GetProcAddress(s.core, "NVSDK_NGX_VULKAN_AllocateParameters"));
             auto coreDestroy = reinterpret_cast<FnVkDestroyParameters>(
@@ -309,7 +326,7 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
                 else s.params = nullptr;
             }
         }
-        if (!s.params && s.snippet) {
+        if (!s.params && s.snippet && !forceOwn) {
             auto snipAlloc = reinterpret_cast<FnVkAllocateParameters>(
                 GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_AllocateParameters"));
             auto snipDestroy = reinterpret_cast<FnVkDestroyParameters>(
@@ -327,6 +344,11 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
             s.params = new OwnParam();
             s.ownParams = true;
             Log("[params] using own NVSDK_NGX_Parameter implementation");
+        } else {
+            // Worth saying out loud: with a DLL-allocated block we cannot see which keys
+            // the DLL reads, so the [param-unread] report below will be absent.
+            Log("[params] container is the DLL's; the unread-key probe is unavailable "
+                "(set DLSSNR_FORCE_OWNPARAM=1 to run it)");
         }
     }
     {
@@ -715,7 +737,12 @@ void NgxTeardown(NgxSnippet& s, VkDevice device) {
         Log("[ngx] snippet Shutdown1 -> %#x seh=%#x", (uint32_t)r, seh);
     }
     if (s.params) {
-        if (s.ownParams) delete static_cast<OwnParam*>(s.params);
+        if (s.ownParams) {
+            // What the DLL never asked for. "Set" looks like "in effect" and is not, and
+            // this is the only place in the tree that can tell the difference.
+            static_cast<OwnParam*>(s.params)->DumpUnread();
+            delete static_cast<OwnParam*>(s.params);
+        }
         else if (s.paramsDestroy) {
             NVSDK_NGX_Result r = Guarded([&] { return s.paramsDestroy(s.params); },
                                          NVSDK_NGX_Result_FAIL_SEH, &seh);
