@@ -452,6 +452,27 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
         return false;
     }
 
+    // The snippet exports GetScratchBufferSize and we have never called it -- it was the one
+    // declared export nothing resolved. Another project listed "CreateFeature may need
+    // GetScratchBufferSize satisfied first" among the theories it could not test; we can, so
+    // this asks and logs the answer rather than leaving it open. Our creates already succeed,
+    // so a non-zero requirement here would be a surprise worth seeing, and a zero retires the
+    // question. The number also belongs in any per-pass VRAM accounting.
+    {
+        auto scratch = reinterpret_cast<FnVkGetScratchBufferSize>(
+            GetProcAddress(s.snippet, "NVSDK_NGX_VULKAN_GetScratchBufferSize"));
+        if (scratch) {
+            DWORD seh2 = 0;
+            size_t bytes = 0;
+            NVSDK_NGX_Result r = Guarded([&] { return scratch(FEATURE_DLSSNR, s.params, &bytes); },
+                                         NVSDK_NGX_Result_FAIL_SEH, &seh2);
+            Log("[ngx] GetScratchBufferSize(18) -> %#x seh=%#x bytes=%llu", (uint32_t)r, seh2,
+                (unsigned long long)bytes);
+        } else {
+            Log("[ngx] snippet does not export GetScratchBufferSize");
+        }
+    }
+
 // Public Vulkan NGX contract: query Feature-18 requirements before create.
     {
         auto reqs2 = reinterpret_cast<FnVkGetFeatureReqs2>(
