@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "../../common/breadcrumbs.h"
+#include "../../common/frame_trace.h"
 #include "../../common/shm_protocol.h"
 #include "composition.h"
 #include "hotkey.h"
@@ -132,6 +133,11 @@ static bool NoRoundTrip() {
 // stopped, and a thread presents on one device at a time; a second device's crumbs interleaving is
 // itself worth seeing, which a per-device ring would hide.
 static dlssnr::Breadcrumbs g_crumbs;
+
+// The frame trace, off unless DLSSNR_TRACE=1. See common/frame_trace.h -- the breadcrumbs answer
+// "where did it stop", this answers "what did the last few minutes look like", and neither
+// substitutes for the other.
+static dlssnr::FrameTrace g_trace;
 
 static void DumpCrumbs(const char* why) {
     Log("[crumbs] %s -- last steps on the present path, newest first:", why);
@@ -1302,6 +1308,10 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
     }
     if (dc->vkDestroyDevice) dc->vkDestroyDevice(device, pAllocator);
     delete dc;
+    // The trace, written once and here: this is the last moment a layer reliably reaches in a
+    // process it does not own. Nothing is written per frame -- the point of the ring is that the
+    // recording costs nothing on disk until the session is over.
+    if (const char* path = g_trace.Write()) Log("[trace] wrote %s", path);
 }
 
 static DeviceChain* FindDevice(VkDevice device) {
@@ -1567,6 +1577,7 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     // helper's round trip. The capture pair that compose recorded lands with it.
     if (sc.leg2Pending) {
         g_crumbs.Drop("Leg2Wait");
+        dlssnr::TraceScope t(g_trace, "Leg2Wait");
         // Bounded: on a timeout leg2Pending stays set, so the next present waits again
         // rather than touching surfaces that compose may still be reading. Giving up for
         // one frame is the fail-open path -- the game's own image is presented -- and the
@@ -1763,7 +1774,10 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     g_crumbs.Drop("Leg1Submit");
     if (!endAndSubmit(sc.fenceLeg1)) return false;
     g_crumbs.Drop("Leg1Wait");
-    if (!waitAndReset(sc.fenceLeg1)) return false;
+    {
+        dlssnr::TraceScope t(g_trace, "Leg1Wait", sc.comp->ModelWidth(), sc.comp->ModelHeight());
+        if (!waitAndReset(sc.fenceLeg1)) return false;
+    }
     dropWaits();
     sc.comp->ConsumeMeter();
     const double tCapture = time ? NowMs() : 0.0;
@@ -1787,13 +1801,17 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         const void* proxy = sc.comp->ProxyPixels();
         if (!answer || !proxy) return false;
         if (answer != proxy) std::memcpy(answer, proxy, sc.comp->ModelBytes());
-    } else if (!ShmProcessFrame(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ModelBytes(),
-                         sc.comp->ProxyPixels(), sc.comp->ModelPixels(), sc.comp->ProxyActive(),
-                         answerViaFd, sc.comp->HdrProxyActive(),
-                         /*frameRepeat=*/repaint || fs.holdFrame != 0)) {
-        // Fail-open. Leg 1 already put the image back in PRESENT_SRC_KHR, so the original frame is
-        // what gets presented and nothing else is owed.
-        return false;
+    } else {
+        dlssnr::TraceScope t(g_trace, "RoundTrip",
+                             dc->shm.hdr ? dc->shm.hdr->seq_req.load() + 1u : 0u);
+        if (!ShmProcessFrame(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ModelBytes(),
+                             sc.comp->ProxyPixels(), sc.comp->ModelPixels(), sc.comp->ProxyActive(),
+                             answerViaFd, sc.comp->HdrProxyActive(),
+                             /*frameRepeat=*/repaint || fs.holdFrame != 0)) {
+            // Fail-open. Leg 1 already put the image back in PRESENT_SRC_KHR, so the original frame
+            // is what gets presented and nothing else is owed.
+            return false;
+        }
     }
     sc.comp->MarkModelFrame();
     const double tHelper = time ? NowMs() : 0.0;
@@ -1862,6 +1880,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         ShmStore64(dc->shm.hdr->layerPresentsLo, dc->shm.hdr->layerPresentsHi, dc->presentsSeen);
     dc->lastQueue.store(queue, std::memory_order_relaxed);
     g_crumbs.Drop("PresentEnter", uint32_t(dc->presentsSeen));
+    // The outermost event: everything below nests inside it, which is why the analyser must never
+    // sum durations across levels.
+    dlssnr::TraceScope tracePresent(g_trace, "Present", uint32_t(dc->presentsSeen));
 
     // Whether this call's wait semaphores have already been consumed by a submit of ours. They are
     // handed to the first swapchain we actually process; every path after that presents with none,
@@ -2095,6 +2116,10 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v) {
         if (DryRun() || NoRoundTrip())
             Log("=== kill switches active:%s%s -- this session is NOT enhancing anything ===",
                 DryRun() ? " DLSSNR_DRY_RUN" : "", NoRoundTrip() ? " DLSSNR_NO_ROUNDTRIP" : "");
+        g_trace.Init("layer");
+        if (g_trace.Enabled())
+            Log("=== DLSSNR_TRACE=1: recording a frame trace; it is written when the device is "
+                "destroyed ===");
     });
     return VK_SUCCESS;
 }

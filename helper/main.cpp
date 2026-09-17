@@ -6,6 +6,7 @@
 #include "guard.h"
 #include "logging.h"
 #include "../common/breadcrumbs.h"
+#include "../common/frame_trace.h"
 #include "../common/shm_protocol.h"
 #include "mvec_deadzone_spv.h"
 
@@ -63,6 +64,11 @@ static bool SkipEvaluate() {
 // seq_resp and nothing else to read -- so each side records its own path and each says which step
 // it stopped on. The stages here are the helper's frame, not the layer's.
 static dlssnr::Breadcrumbs g_crumbs;
+
+// The frame trace. See common/frame_trace.h. One ring per process, so the helper's lives here and
+// the layer's lives in the game -- which is the arrangement that makes a per-process trace easy
+// rather than a thing to coordinate.
+static dlssnr::FrameTrace g_trace;
 
 // GPU-side checkpoints, off unless asked for. Same switch, same reasoning and the same name as the
 // layer's: the CPU ring says which step this process was standing on, checkpoints say where the GPU
@@ -3500,6 +3506,8 @@ static uint32_t ReadLinuxPid() {
 
 static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     g_crumbs.Drop("FrameEnter", shm.hdr->seq_req.load());
+    // The outermost event; Evaluate and Readback nest inside it.
+    dlssnr::TraceScope traceFrame(g_trace, "Frame", shm.hdr->seq_req.load());
     uint32_t w = shm.hdr->width.load(), h = shm.hdr->height.load();
     if (!w || !h || w > kMaxW || h > kMaxH) return false;
     // Echo the raster this call answers before seq_resp announces it, so a swapchain waiting on a
@@ -3797,7 +3805,10 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         WriteEvalTimestamp(ns.vk, ns.vk.cmdEval, 1);
         CopyEvalTimestampResults(ns.vk, ns.vk.cmdEval);
         g_crumbs.Drop("EvalSubmit", pass);
-        if (!SubmitAndWait(ns.vk, ns.vk.cmdEval)) return false;
+        {
+            dlssnr::TraceScope t(g_trace, "Evaluate", pass, w);
+            if (!SubmitAndWait(ns.vk, ns.vk.cmdEval)) return false;
+        }
         const double passGpuMs = ReadEvalTimestampMs(ns.vk);
         if (passGpuMs >= 0.0) { evalGpuMs += passGpuMs; ++timedPasses; }
         last = out;
@@ -3911,6 +3922,7 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         if (!SubmitAndWait(ns.vk, cb)) return false;
     } else {
         g_crumbs.Drop("Readback", uint32_t(bytes >> 10));
+        dlssnr::TraceScope t(g_trace, "Readback", uint32_t(bytes >> 10));
         if (!ReadbackPixels(ns.vk, *last, bytes)) return false;
         if (!ns.vk.transportOut) std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
     }
@@ -4035,6 +4047,9 @@ static DWORD WINAPI NgxWatchdogThread(LPVOID) {
         // Printed before anything else, because _exit follows and this is the only record of what
         // the frame had already done when the call stopped coming back.
         DumpCrumbs("the model stopped answering");
+        // Written before _exit, not after: a hung NGX call is exactly the session a trace is worth
+        // having, and this path never unwinds.
+        if (const char* path = g_trace.Write()) Log("[trace] wrote %s", path);
         if (shm && shm->hdr) {
             ShmStoreString(shm->hdr->helperReasonSeq, shm->hdr->helperReason, kReasonBytes,
                            "the model stopped responding; restart the helper");
@@ -4056,6 +4071,29 @@ int main() {
     // runner-installed handler while the helper is starting.
     InstallGuard();
     Log("=== dlssnr_helper starting ===");
+    // The trace directory arrives as a Linux path and this process is a PE under Wine, so it is
+    // translated the same way the mapping's is: the host filesystem is Wine's Z: drive.
+    //
+    // A char buffer rather than std::string: appending a char to one instantiates
+    // basic_string::_M_replace_cold here, and this target links libstdc++ statically with
+    // -nostdlib++, where that arrives as a duplicate definition of a different size. Same reason
+    // the watchdog is a Win32 thread.
+    {
+        const char* dir = getenv("DLSSNR_TRACE_DIR");
+        if (!dir || !*dir) dir = getenv("XDG_STATE_HOME");
+        char win[512] = {0};
+        if (dir && dir[0] == '/') {
+            win[0] = 'Z'; win[1] = ':';
+            size_t n = 2;
+            for (const char* c = dir; *c && n + 1 < sizeof(win); ++c, ++n)
+                win[n] = (*c == '/') ? '\\' : *c;
+            win[n] = '\0';
+        }
+        g_trace.Init("helper", win[0] ? win : nullptr);
+    }
+    if (g_trace.Enabled())
+        Log("=== DLSSNR_TRACE=1: recording a frame trace; it is written on quit and by the "
+            "watchdog ===");
     if (SkipEvaluate())
         Log("=== kill switch active: DLSSNR_SKIP_EVALUATE -- the model will not run ===");
     char exePath[MAX_PATH];
@@ -4237,6 +4275,9 @@ int main() {
     else if (ns.ngx.disabled) Log("[helper] neural disabled");
     shm.hdr->helperState.store(kHelperStopped);
     Log("[helper] shutting down");
+    // Before the teardown, not after: NgxTeardown has been observed to wedge, and a trace written
+    // on the far side of a call that may never return is a trace that is sometimes not written.
+    if (const char* path = g_trace.Write()) Log("[trace] wrote %s", path);
     if (ns.ngx.snippet) NgxTeardown(ns.ngx, ns.vk.device);
     vkDeviceWaitIdle(ns.vk.device);
     DestroyImage2D(ns.vk, ns.vk.proxyIn);
