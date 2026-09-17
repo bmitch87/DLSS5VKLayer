@@ -5,6 +5,7 @@
 #include "ngx_snippet.h"
 #include "guard.h"
 #include "logging.h"
+#include "../common/breadcrumbs.h"
 #include "../common/shm_protocol.h"
 #include "mvec_deadzone_spv.h"
 
@@ -54,6 +55,35 @@ static bool SkipEvaluate() {
         return p && p[0] == '1';
     }();
     return v;
+}
+
+// Breadcrumbs, this process's own. See common/breadcrumbs.h.
+//
+// From the shared-memory side a hung helper and a hung layer look identical -- seq_req ahead of
+// seq_resp and nothing else to read -- so each side records its own path and each says which step
+// it stopped on. The stages here are the helper's frame, not the layer's.
+static dlssnr::Breadcrumbs g_crumbs;
+
+// GPU-side checkpoints, off unless asked for. Same switch, same reasoning and the same name as the
+// layer's: the CPU ring says which step this process was standing on, checkpoints say where the GPU
+// was when a device was lost. Each marker is a real command in the buffer, so it is not free the way
+// the ring is.
+static bool CheckpointsEnabled() {
+    static const bool v = [] {
+        const char* p = getenv("DLSSNR_CHECKPOINTS");
+        return p && p[0] == '1';
+    }();
+    return v;
+}
+
+static void DumpCrumbs(const char* why) {
+    Log("[crumbs] %s -- last steps in the helper's frame, newest first:", why);
+    bool any = false;
+    g_crumbs.Dump([&](const char* stage, uint32_t detail, double ageMs) {
+        any = true;
+        Log("[crumbs]   %-15s %8u  %9.2f ms ago", stage, detail, ageMs);
+    });
+    if (!any) Log("[crumbs]   (nothing recorded)");
 }
 
 static double NowMs() {
@@ -195,6 +225,9 @@ VK_FN(vkCreatePipelineLayout) VK_FN(vkDestroyPipelineLayout)
 VK_FN(vkCreateComputePipelines) VK_FN(vkDestroyPipeline)
 VK_FN(vkCmdBindPipeline) VK_FN(vkCmdDispatch) VK_FN(vkCmdBindDescriptorSets)
 VK_FN(vkCmdPushDescriptorSetKHR)
+// VK_NV_device_diagnostic_checkpoints: null unless the device enabled it, which
+// happens only under DLSSNR_CHECKPOINTS=1.
+VK_FN(vkCmdSetCheckpointNV) VK_FN(vkGetQueueCheckpointDataNV)
 VK_FN(vkCreateDescriptorSetLayout) VK_FN(vkDestroyDescriptorSetLayout)
 VK_FN(vkCreateDescriptorPool) VK_FN(vkDestroyDescriptorPool)
 VK_FN(vkAllocateDescriptorSets) VK_FN(vkUpdateDescriptorSets)
@@ -416,6 +449,7 @@ static bool CreateContext(VkCtx& c) {
     LOAD(vkCreateDescriptorPool) LOAD(vkDestroyDescriptorPool)
     LOAD(vkAllocateDescriptorSets) LOAD(vkUpdateDescriptorSets)
     LOAD(vkCmdPushDescriptorSetKHR)
+    LOAD(vkCmdSetCheckpointNV) LOAD(vkGetQueueCheckpointDataNV)
 #undef LOAD
 
     uint32_t devCount = 0;
@@ -543,6 +577,11 @@ static bool CreateContext(VkCtx& c) {
                            VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
                            VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME })
         if (HasDeviceExt(c.physical, e)) enabled.push_back(e);
+    // Asked for only when someone asked for it: every other extension above buys a capability,
+    // this one buys evidence and costs a command per marker to do so.
+    if (CheckpointsEnabled() &&
+        HasDeviceExt(c.physical, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME))
+        enabled.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
     c.sync2 = HasDeviceExt(c.physical, "VK_KHR_synchronization2");
     c.memoryBudget = HasDeviceExt(c.physical, "VK_EXT_memory_budget");
     c.pushDescriptors = HasDeviceExt(c.physical, "VK_KHR_push_descriptor");
@@ -1306,10 +1345,44 @@ static void DeviceLocalMemoryMB(VkCtx& c, uint32_t* usedMB, uint32_t* budgetMB) 
     if (budgetMB) *budgetMB = uint32_t(budget / (1024ull * 1024ull));
 }
 
+// After a lost device or a fence that never signalled, ask the queue what it had reached.
+//
+// The only call in Vulkan that answers "where was the GPU", and valid precisely in the state where
+// nothing else is. Null unless the device enabled the extension, which happens only under
+// DLSSNR_CHECKPOINTS=1.
+static void DumpCheckpoints(VkCtx& c, VkQueue queue) {
+    if (!vkGetQueueCheckpointDataNV || queue == VK_NULL_HANDLE) {
+        if (CheckpointsEnabled())
+            Log("[checkpoints] unavailable (the device did not enable "
+                "VK_NV_device_diagnostic_checkpoints)");
+        return;
+    }
+    uint32_t n = 0;
+    vkGetQueueCheckpointDataNV(queue, &n, nullptr);
+    if (!n) { Log("[checkpoints] the queue reported none"); return; }
+    std::vector<VkCheckpointDataNV> data(n);
+    for (auto& d : data) d.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+    vkGetQueueCheckpointDataNV(queue, &n, data.data());
+    Log("[checkpoints] %u marker(s) the GPU had reached:", n);
+    for (uint32_t i = 0; i < n; ++i) {
+        const char* marker = (const char*) data[i].pCheckpointMarker;
+        Log("[checkpoints]   stage=0x%08x %s", (unsigned) data[i].stage, marker ? marker : "(null)");
+    }
+}
+
 static bool WaitFence(VkCtx& c, int idx) {
     if (idx < 0) return false;
     const VkResult r = vkWaitForFences(c.device, 1, &c.fences[idx], VK_TRUE, kFenceBudgetNs);
     if (r != VK_SUCCESS) c.lastQueueResult = r;
+    if (r == VK_ERROR_DEVICE_LOST) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            DumpCrumbs("device lost");
+            DumpCheckpoints(c, c.queue);
+        }
+        return false;
+    }
     if (r == VK_TIMEOUT) {
         // Not recoverable from here, and pretending otherwise is worse than stopping: the
         // command buffer this fence covers is one the next frame re-begins, and beginning
@@ -1321,6 +1394,8 @@ static bool WaitFence(VkCtx& c, int idx) {
             Log("[helper] a fence did not signal within %llu ms; the GPU is not retiring "
                 "our work. Stopping rather than reusing the command buffer it covers.",
                 (unsigned long long)(kFenceBudgetNs / 1000000ull));
+            DumpCrumbs("a fence did not signal");
+            DumpCheckpoints(c, c.queue);
         }
         return false;
     }
@@ -3424,6 +3499,7 @@ static uint32_t ReadLinuxPid() {
 }
 
 static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
+    g_crumbs.Drop("FrameEnter", shm.hdr->seq_req.load());
     uint32_t w = shm.hdr->width.load(), h = shm.hdr->height.load();
     if (!w || !h || w > kMaxW || h > kMaxH) return false;
     // Echo the raster this call answers before seq_resp announces it, so a swapchain waiting on a
@@ -3626,6 +3702,7 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     // says nothing about it. Unlike a repaint, a duplicate does NOT reset the model -- the
     // history is about a scene that has not changed, which is exactly when it is worth most.
     const bool sameFrameAgain = frameRepeat || duplicateFrame;
+    g_crumbs.Drop("Upload", uint32_t(bytes >> 10));
     if (ns.flow.enabled && !sameFrameAgain) {
         // The colorIn upload is merged into the flow prep command buffer.
         if (!RunOpticalFlow(ns)) {
@@ -3705,12 +3782,21 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         ns.passNeedsReset[pass] = false;
 
         WriteEvalTimestamp(ns.vk, ns.vk.cmdEval, 0);
+        // The one call that has actually been seen to never come back. The watchdog prints this
+        // ring when it fires, so the crumb before this one names the pass that wedged.
+        g_crumbs.Drop("Evaluate", pass);
+        // Either side of the snippet's own recording, so a device lost inside the model's dispatches
+        // is distinguishable from one lost in our transitions around them. The marker is the same
+        // literal the crumb used, so the two dumps read as one path.
+        if (vkCmdSetCheckpointNV) vkCmdSetCheckpointNV(ns.vk.cmdEval, (const void*) "EvaluateEnter");
         if (!NgxEvaluatePass(ns.ngx, pass, ns.vk.cmdEval)) {
             vkEndCommandBuffer(ns.vk.cmdEval);
             return false;
         }
+        if (vkCmdSetCheckpointNV) vkCmdSetCheckpointNV(ns.vk.cmdEval, (const void*) "EvaluateLeave");
         WriteEvalTimestamp(ns.vk, ns.vk.cmdEval, 1);
         CopyEvalTimestampResults(ns.vk, ns.vk.cmdEval);
+        g_crumbs.Drop("EvalSubmit", pass);
         if (!SubmitAndWait(ns.vk, ns.vk.cmdEval)) return false;
         const double passGpuMs = ReadEvalTimestampMs(ns.vk);
         if (passGpuMs >= 0.0) { evalGpuMs += passGpuMs; ++timedPasses; }
@@ -3824,9 +3910,11 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         ns.vk.answerOut.layout = VK_IMAGE_LAYOUT_UNDEFINED;
         if (!SubmitAndWait(ns.vk, cb)) return false;
     } else {
+        g_crumbs.Drop("Readback", uint32_t(bytes >> 10));
         if (!ReadbackPixels(ns.vk, *last, bytes)) return false;
         if (!ns.vk.transportOut) std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
     }
+    g_crumbs.Drop("FrameDone");
     const double tDone = time ? NowMs() : 0.0;
     // Always sampled, not only under DLSSNR_TIME. These two fields have existed, been saved
     // and restored by ShmResetSettings, and been written by nothing at all -- and the way
@@ -3944,6 +4032,9 @@ static DWORD WINAPI NgxWatchdogThread(LPVOID) {
         Log("[watchdog] NGX %s has not returned after %llu ms; the model has stopped "
             "answering. Ending the helper -- restart it to try again.",
             NgxCallName(), ms);
+        // Printed before anything else, because _exit follows and this is the only record of what
+        // the frame had already done when the call stopped coming back.
+        DumpCrumbs("the model stopped answering");
         if (shm && shm->hdr) {
             ShmStoreString(shm->hdr->helperReasonSeq, shm->hdr->helperReason, kReasonBytes,
                            "the model stopped responding; restart the helper");
