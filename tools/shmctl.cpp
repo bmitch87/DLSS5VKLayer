@@ -212,6 +212,9 @@ void PrintStatus(const ShmHeader* h) {
     std::printf("helper_state=%u\nmodel_up=%u\nhelper_frames=%llu\n", h->helperState.load(),
                 h->modelUp.load(),
                 (unsigned long long) ShmLoad64(h->helperFramesLo, h->helperFramesHi));
+    std::printf("helper_features=%u\nhelper_pass_ceiling=%u\nhelper_vram_mb=%u\n",
+                h->helperFeatures.load(), h->helperPassCeiling.load(), h->helperVramMB.load());
+    std::printf("helper_eval_ms=%.2f\n", double(BitsToFloat(h->helperEvalMsBits.load())));
     std::printf("layer_pid=%u\nlayer_composition_up=%u\nlayer_frames=%llu\nlayer_ms=%.2f\n",
                 h->layerPid.load(),
                 h->layerCompositionUp.load(),

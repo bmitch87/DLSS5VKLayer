@@ -546,6 +546,19 @@ void NgxSetCreateTuning(NgxSnippet& s, const NgxTuning& t) {
             t.preset, t.style, t.intensity, t.localTone, t.localStructure, t.skinStructure, t.autoMask);
 }
 
+// No FreeMemOnReleaseFeature here, and that is a measured answer rather than an omission.
+//
+// NGX is documented to pool a feature's memory across an ordinary ReleaseFeature so the next
+// create is cheap, and the published escape is to ask for it back with the
+// NVSDK_NGX_Parameter_FreeMemOnReleaseFeature parameter -- which would matter to us, because
+// MaintainPasses releases the tail of the chain when the pass count drops and expects the
+// memory back. But the key does not exist in this model: no such string appears in
+// nvngx_dlssnr.dll, and it is not among the 61 DLSSNR.* names either. Setting it would be a
+// control with nothing listening.
+//
+// Whether the memory actually comes back is now observable instead: MaintainPasses samples
+// the device-local heap around every build, so a shrink that frees nothing would show as a
+// price that never drops.
 void NgxReleasePass(NgxSnippet& s, uint32_t pass, VkDevice device) {
     if (pass >= kMaxPasses || !s.features[pass] || !s.releaseFeature) return;
     // Never free under the GPU. The helper submits and fences every evaluate, so waiting on the

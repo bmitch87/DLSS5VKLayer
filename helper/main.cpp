@@ -162,7 +162,8 @@ VK_FN(vkBindBufferMemory) VK_FN(vkCmdCopyBufferToImage) VK_FN(vkCmdCopyImageToBu
 VK_FN(vkGetMemoryHostPointerPropertiesEXT)
 VK_FN(vkGetMemoryFdKHR) VK_FN(vkGetMemoryFdPropertiesKHR)
 VK_FN(vkCmdCopyImage) VK_FN(vkCmdPipelineBarrier) VK_FN(vkDeviceWaitIdle)
-VK_FN(vkGetPhysicalDeviceProperties2) VK_FN(vkGetPhysicalDeviceOpticalFlowImageFormatsNV)
+VK_FN(vkGetPhysicalDeviceProperties2) VK_FN(vkGetPhysicalDeviceMemoryProperties2)
+VK_FN(vkGetPhysicalDeviceOpticalFlowImageFormatsNV)
 VK_FN(vkCreateOpticalFlowSessionNV) VK_FN(vkDestroyOpticalFlowSessionNV)
 VK_FN(vkBindOpticalFlowSessionImageNV) VK_FN(vkCmdOpticalFlowExecuteNV) VK_FN(vkCmdBlitImage)
 VK_FN(vkCmdPipelineBarrier2) VK_FN(vkQueueSubmit2) VK_FN(vkCmdWriteTimestamp2)
@@ -242,6 +243,8 @@ struct VkCtx {
     void* queryMap = nullptr;
     bool flowQueryAvailable = false;
     bool fenceTimedOut = false;  // the GPU stopped retiring our work; stand down
+    bool memoryBudget = false;   // VK_EXT_memory_budget is available
+    VkResult lastQueueResult = VK_SUCCESS;  // why the last submit or fence wait failed
     VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
     bool pinMissed = false;      // DLSSNR_GPU_UUID/INDEX named a device that is not here
     // The model's own cost, on the graphics queue. Deliberately a separate pool from the
@@ -365,7 +368,8 @@ static bool CreateContext(VkCtx& c) {
     LOAD(vkGetBufferMemoryRequirements) LOAD(vkBindBufferMemory) LOAD(vkCmdCopyBufferToImage)
     LOAD(vkCmdCopyImageToBuffer) LOAD(vkCmdCopyImage) LOAD(vkCmdPipelineBarrier) LOAD(vkDeviceWaitIdle)
     LOAD(vkGetMemoryHostPointerPropertiesEXT) LOAD(vkGetMemoryFdKHR) LOAD(vkGetMemoryFdPropertiesKHR)
-    LOAD(vkGetPhysicalDeviceProperties2) LOAD(vkGetPhysicalDeviceOpticalFlowImageFormatsNV)
+    LOAD(vkGetPhysicalDeviceProperties2) LOAD(vkGetPhysicalDeviceMemoryProperties2)
+    LOAD(vkGetPhysicalDeviceOpticalFlowImageFormatsNV)
     LOAD(vkCreateOpticalFlowSessionNV) LOAD(vkDestroyOpticalFlowSessionNV)
     LOAD(vkBindOpticalFlowSessionImageNV) LOAD(vkCmdOpticalFlowExecuteNV) LOAD(vkCmdBlitImage)
     LOAD(vkCmdPipelineBarrier2) LOAD(vkQueueSubmit2) LOAD(vkCmdWriteTimestamp2)
@@ -494,12 +498,14 @@ static bool CreateContext(VkCtx& c) {
     for (const char* e : { "VK_NVX_binary_import", "VK_NVX_image_view_handle",
                            "VK_KHR_maintenance1", "VK_KHR_maintenance2", "VK_KHR_maintenance3",
                            "VK_KHR_maintenance4", "VK_KHR_buffer_device_address", "VK_KHR_push_descriptor",
-                           "VK_KHR_synchronization2", VK_NV_OPTICAL_FLOW_EXTENSION_NAME,
+                           "VK_KHR_synchronization2", "VK_EXT_memory_budget",
+                           VK_NV_OPTICAL_FLOW_EXTENSION_NAME,
                            VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
                            VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
                            VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME })
         if (HasDeviceExt(c.physical, e)) enabled.push_back(e);
     c.sync2 = HasDeviceExt(c.physical, "VK_KHR_synchronization2");
+    c.memoryBudget = HasDeviceExt(c.physical, "VK_EXT_memory_budget");
     VkPhysicalDeviceOpticalFlowFeaturesNV flowFeatures{};
     flowFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV;
     flowFeatures.opticalFlow = VK_TRUE;
@@ -1202,7 +1208,11 @@ static int SubmitAsync(VkCtx& c, VkCommandBuffer cb, VkQueue queue,
         si2.pSignalSemaphoreInfos = signal ? &ssi : nullptr;
         const uint32_t idx = c.fenceCursor;
         const VkResult sr = vkQueueSubmit2(queue, 1, &si2, c.fences[idx]);
-        if (sr != VK_SUCCESS) { Log("[vk] queue submit2 failed: %d", (int)sr); return -1; }
+        if (sr != VK_SUCCESS) {
+            c.lastQueueResult = sr;
+            Log("[vk] queue submit2 failed: %d", (int)sr);
+            return -1;
+        }
         c.fenceCursor = (c.fenceCursor + 1) % VkCtx::kFenceRing;
         return (int)idx;
     }
@@ -1211,7 +1221,11 @@ static int SubmitAsync(VkCtx& c, VkCommandBuffer cb, VkQueue queue,
     si.commandBufferCount = 1; si.pCommandBuffers = &cb;
     const uint32_t idx = c.fenceCursor;
     const VkResult sr = vkQueueSubmit(queue, 1, &si, c.fences[idx]);
-    if (sr != VK_SUCCESS) { Log("[vk] queue submit failed: %d", (int)sr); return -1; }
+    if (sr != VK_SUCCESS) {
+        c.lastQueueResult = sr;
+        Log("[vk] queue submit failed: %d", (int)sr);
+        return -1;
+    }
     c.fenceCursor = (c.fenceCursor + 1) % VkCtx::kFenceRing;
     return (int)idx;
 }
@@ -1223,9 +1237,39 @@ static int SubmitAsync(VkCtx& c, VkCommandBuffer cb, VkQueue queue,
 // this process for the rest of the session with nothing in the log.
 static constexpr uint64_t kFenceBudgetNs = 10ull * 1000ull * 1000ull * 1000ull;
 
+// Device-local memory in use, in MiB, or 0 when the device cannot say.
+//
+// helperVramMB has been declared, saved and restored by ShmResetSettings since it was added
+// and written by absolutely nothing -- so the VRAM budget the pass ceiling is supposed to
+// respect has never had a measured input. VK_EXT_memory_budget is how a Vulkan process asks;
+// heapUsage is this process's own use of each heap and heapBudget is what it may reasonably
+// take, both from the driver rather than from arithmetic over our own allocations, which
+// would miss everything the snippet allocates behind our back -- and the snippet's feature
+// histories are the whole point of measuring.
+static void DeviceLocalMemoryMB(VkCtx& c, uint32_t* usedMB, uint32_t* budgetMB) {
+    if (usedMB) *usedMB = 0;
+    if (budgetMB) *budgetMB = 0;
+    if (!c.memoryBudget || !vkGetPhysicalDeviceMemoryProperties2) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{};
+    mb.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 mp{};
+    mp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    mp.pNext = &mb;
+    vkGetPhysicalDeviceMemoryProperties2(c.physical, &mp);
+    VkDeviceSize used = 0, budget = 0;
+    for (uint32_t i = 0; i < mp.memoryProperties.memoryHeapCount; ++i) {
+        if (!(mp.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+        used += mb.heapUsage[i];
+        budget += mb.heapBudget[i];
+    }
+    if (usedMB) *usedMB = uint32_t(used / (1024ull * 1024ull));
+    if (budgetMB) *budgetMB = uint32_t(budget / (1024ull * 1024ull));
+}
+
 static bool WaitFence(VkCtx& c, int idx) {
     if (idx < 0) return false;
     const VkResult r = vkWaitForFences(c.device, 1, &c.fences[idx], VK_TRUE, kFenceBudgetNs);
+    if (r != VK_SUCCESS) c.lastQueueResult = r;
     if (r == VK_TIMEOUT) {
         // Not recoverable from here, and pretending otherwise is worse than stopping: the
         // command buffer this fence covers is one the next frame re-begins, and beginning
@@ -1404,6 +1448,7 @@ struct NeuralState {
     std::vector<uint8_t> prevLuma;
     uint32_t lumaW = 0, lumaH = 0;
     uint32_t sceneCutStreak = 0;
+    uint32_t passPriceMB = 0;       // measured cost of the last pass built, device-local MiB
     bool sceneCutPending = false;   // exactly one frame over the threshold so far
     bool sceneCutFired = false;     // this run of over-threshold frames has already fired
     uint32_t lastResetLogged = 0xFFFFFFFFu;
@@ -2735,12 +2780,53 @@ static void MaintainPasses(NeuralState& ns, ShmMap& shm, uint32_t wanted) {
         // the right answer while the model has no feature to answer with.
         if (wanted > ns.livePasses) {
             const uint32_t pass = ns.livePasses;
+
+            // Price the next pass before building it. A feature's history is driver-sized at
+            // the model's working resolution and several at 4K are not free, and our ceiling
+            // is thirty -- six times what the fork this idea came from allows. Refusing on a
+            // measured price beats discovering the limit by hitting it, because hitting it
+            // does not necessarily look like a failed allocation (see below).
+            uint32_t usedBefore = 0, budgetBefore = 0;
+            DeviceLocalMemoryMB(ns.vk, &usedBefore, &budgetBefore);
+            if (ns.passPriceMB && budgetBefore && usedBefore + ns.passPriceMB > budgetBefore) {
+                Log("[helper] not building pass %u: %u MiB used of %u MiB budget and the last "
+                    "pass cost %u MiB. Holding the chain at %u.",
+                    pass, usedBefore, budgetBefore, ns.passPriceMB, ns.livePasses);
+                shm.hdr->helperPassCeiling.store(ns.livePasses);
+                ns.buildAfterMs = now + spacing;
+                break;
+            }
+
             const NgxTuning t = TuningFor(shm.hdr, pass);
             NgxSetCreateTuning(ns.ngx, t);
             if (!BeginCmd(ns.vk.cmdCreate)) return;
             const bool built = NgxCreatePass(ns.ngx, pass, ns.w, ns.h, ns.vk.cmdCreate);
-            SubmitAndWait(ns.vk, ns.vk.cmdCreate);
+            ns.vk.lastQueueResult = VK_SUCCESS;
+            const bool submitted = SubmitAndWait(ns.vk, ns.vk.cmdCreate);
+
+            // A VRAM failure inside the snippet does not have to arrive as a null handle.
+            // It has been reported arriving as VK_ERROR_DEVICE_LOST from the submit -- which
+            // is also what every other catastrophe looks like, so without saying it here a
+            // ramp that simply ran out of memory reads as a driver bug. The submit's result
+            // was previously discarded entirely on this path.
+            if (!submitted && ns.vk.lastQueueResult == VK_ERROR_DEVICE_LOST) {
+                Log("[helper] device lost while building pass %u. On this path that is most "
+                    "likely the model running out of video memory rather than a dead device: "
+                    "%u MiB were in use of a %u MiB budget. Holding the chain at %u.",
+                    pass, usedBefore, budgetBefore, ns.livePasses);
+                shm.hdr->helperPassCeiling.store(ns.livePasses);
+                ns.buildAfterMs = now + spacing;
+                break;
+            }
+
             if (built) {
+                uint32_t usedAfter = 0;
+                DeviceLocalMemoryMB(ns.vk, &usedAfter, nullptr);
+                if (usedAfter > usedBefore) {
+                    ns.passPriceMB = usedAfter - usedBefore;
+                    Log("[helper] pass %u cost %u MiB (%u -> %u of %u MiB budget)", pass,
+                        ns.passPriceMB, usedBefore, usedAfter, budgetBefore);
+                }
                 ns.tuning[pass] = t;
                 ns.lastSeenTuning[pass] = t;
                 ns.passNeedsReset[pass] = true;
@@ -3150,6 +3236,15 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     ++ns.evaluates;
     if (shm.hdr) {
         ShmStore64(shm.hdr->helperFramesLo, shm.hdr->helperFramesHi, ns.evaluates);
+        // Sampled rather than per frame: this is a driver query, and VRAM does not move
+        // between feature builds. Published here rather than from PublishStatus, which only
+        // runs when the raster is set up -- so the figure there was whatever was in use
+        // before the chain grew, which is the one moment it is guaranteed to be wrong.
+        if (ns.evaluates % 30 == 1) {
+            uint32_t used = 0;
+            DeviceLocalMemoryMB(ns.vk, &used, nullptr);
+            shm.hdr->helperVramMB.store(used);
+        }
         // GPU time for the model where the device can measure it, CPU wall clock around
         // the submit-and-fence otherwise. The two are not the same number -- the CPU one
         // includes our own barriers and the queue wait -- so anything comparing this
