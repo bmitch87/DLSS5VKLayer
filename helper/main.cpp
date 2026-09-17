@@ -241,6 +241,7 @@ struct VkCtx {
     VkDeviceMemory queryMem = nullptr;
     void* queryMap = nullptr;
     bool flowQueryAvailable = false;
+    bool fenceTimedOut = false;  // the GPU stopped retiring our work; stand down
     // The model's own cost, on the graphics queue. Deliberately a separate pool from the
     // flow one: they are written from different queue families, and the whole GPU-timing
     // apparatus used to live inside the optical-flow capability check -- so a device
@@ -1117,9 +1118,31 @@ static int SubmitAsync(VkCtx& c, VkCommandBuffer cb, VkQueue queue,
     return (int)idx;
 }
 
+// Generous rather than tight: a long pass chain at 4K on a slow part is genuinely slow,
+// and cutting a working frame off is worse than the stall this bounds. A lost device
+// already returns VK_ERROR_DEVICE_LOST from the wait rather than hanging; this covers the
+// other case, a driver that stops without losing the device, where an infinite wait parks
+// this process for the rest of the session with nothing in the log.
+static constexpr uint64_t kFenceBudgetNs = 10ull * 1000ull * 1000ull * 1000ull;
+
 static bool WaitFence(VkCtx& c, int idx) {
     if (idx < 0) return false;
-    if (vkWaitForFences(c.device, 1, &c.fences[idx], VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+    const VkResult r = vkWaitForFences(c.device, 1, &c.fences[idx], VK_TRUE, kFenceBudgetNs);
+    if (r == VK_TIMEOUT) {
+        // Not recoverable from here, and pretending otherwise is worse than stopping: the
+        // command buffer this fence covers is one the next frame re-begins, and beginning
+        // a buffer that is still executing is undefined. So the process stands down and
+        // the layer sees a helper that is simply absent -- which is the case its whole
+        // fail-open design is built for.
+        if (!c.fenceTimedOut) {
+            c.fenceTimedOut = true;
+            Log("[helper] a fence did not signal within %llu ms; the GPU is not retiring "
+                "our work. Stopping rather than reusing the command buffer it covers.",
+                (unsigned long long)(kFenceBudgetNs / 1000000ull));
+        }
+        return false;
+    }
+    if (r != VK_SUCCESS) return false;
     vkResetFences(c.device, 1, &c.fences[idx]);
     return true;
 }
@@ -3129,6 +3152,15 @@ int main() {
         // imported region, or by memcpy) is visible here before we read it.
         std::atomic_thread_fence(std::memory_order_acquire);
         bool ok = ProcessFrame(ns, shm);
+        if (ns.vk.fenceTimedOut) {
+            ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
+                           "the GPU stopped retiring the helper's work; restart the helper");
+            shm.hdr->helperState.store(kHelperModelFailed);
+            shm.hdr->seq_ok.store(0);
+            std::atomic_thread_fence(std::memory_order_release);
+            shm.hdr->seq_resp.store(req);
+            break;
+        }
         if (!ok) Log("[helper] frame %u failed (w=%u h=%u)", req, shm.hdr->width.load(), shm.hdr->height.load());
         shm.hdr->seq_ok.store(ok ? req : 0);
         // The release pairs with the layer's acquire on seq_resp: the answer -- written by the GPU

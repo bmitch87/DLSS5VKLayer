@@ -1379,9 +1379,20 @@ static bool NoteVk(DeviceChain* dc, VkResult r, const char* what) {
         return false;
     }
     static std::atomic<uint32_t> reported{0};
-    if (reported.fetch_add(1) < 8) Log("[layer] %s -> %d", what, (int) r);
+    if (reported.fetch_add(1) < 8) {
+        if (r == VK_TIMEOUT) Log("[layer] %s -> TIMEOUT", what);
+        else Log("[layer] %s -> %d", what, (int) r);
+    }
     return false;
 }
+
+// Long enough that a slow part running a long pass chain at 4K is never cut off, short
+// enough that a driver which has stopped without losing the device does not park the
+// game's present thread for the rest of the session. A lost device already returns
+// VK_ERROR_DEVICE_LOST from the wait rather than hanging, so this covers the other case:
+// a stall with no result to report, which NoteVk could never see because the call never
+// returned.
+static constexpr uint64_t kFenceBudgetNs = 5ull * 1000ull * 1000ull * 1000ull;
 
 // Returns true if the swapchain image now holds the composed frame.
 //
@@ -1413,7 +1424,11 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     // than at the end of that frame keeps the game thread out of the GPU's way for the whole of the
     // helper's round trip. The capture pair that compose recorded lands with it.
     if (sc.leg2Pending) {
-        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fenceLeg2, VK_TRUE, UINT64_MAX),
+        // Bounded: on a timeout leg2Pending stays set, so the next present waits again
+        // rather than touching surfaces that compose may still be reading. Giving up for
+        // one frame is the fail-open path -- the game's own image is presented -- and the
+        // wait is retried until it succeeds or the device is lost.
+        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fenceLeg2, VK_TRUE, kFenceBudgetNs),
                     "vkWaitForFences(leg2)"))
             return false;
         dc->vkResetFences(d, 1, &sc.fenceLeg2);
@@ -1566,8 +1581,21 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         return true;
     };
     const auto waitAndReset = [&](VkFence fence) {
-        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences"))
+        const VkResult r = dc->vkWaitForFences(d, 1, &fence, VK_TRUE, kFenceBudgetNs);
+        if (r == VK_TIMEOUT) {
+            // Unlike leg 2's wait, this one cannot just be retried next frame: the command
+            // buffer it covers is the one this function re-begins, and beginning a buffer
+            // that is still executing is undefined. So the swapchain stands down for good
+            // and stops touching that buffer, which lets the in-flight work drain on its
+            // own. Pass-through is the fail-open state the rest of this file already uses.
+            if (!sc.passThrough) {
+                sc.passThrough = true;  // the caller releases the primary claim on seeing this
+                Log("[layer] leg 1 fence did not signal within %llu ms; this swapchain is "
+                    "now pass-through", (unsigned long long)(kFenceBudgetNs / 1000000ull));
+            }
             return false;
+        }
+        if (!NoteVk(dc, r, "vkWaitForFences")) return false;
         dc->vkResetFences(d, 1, &fence);
         return true;
     };
@@ -1704,6 +1732,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
                                                  waitCount, pPresentInfo->pWaitSemaphores,
                                                  /*repaint=*/false, &submittedWaits);
             waitsConsumed = waitsConsumed || submittedWaits;
+            // ProcessPresent stands a swapchain down for good if its leg 1 fence never
+            // signalled. Same reasoning as the CreateResources failure above: a claim
+            // left on a swapchain that no longer drives the channel stops any peer from
+            // taking it over.
+            if (sc.passThrough) ReleasePrimary(dc->self, pPresentInfo->pSwapchains[i]);
             if (!composed) ++dc->framesPassedThrough;
             if (VerboseEnabled()) {
                 Log("[present] swapchain=%p image=%u seq=%u composed=%d",
