@@ -530,13 +530,23 @@ ensure_dxvk_config() {
       dxvk_device="$dev"
     fi
   fi
+  # hideNvidiaGpu belongs in BOTH branches, including the one that used to write an empty
+  # file: DXVK hides the NVIDIA GPU behind an AMD compatibility identity by default, and
+  # DXVK-NVAPI needs DXVK's dxgi.dll to discover the Vulkan device. If the identity is AMD,
+  # that discovery is the step that fails -- and it fails while the log is naming the
+  # NVIDIA card, which is what makes it hard to place. Our own helper renders through
+  # Vulkan rather than D3D12, so this has never been on our critical path; it is on the
+  # path of the component that answers NVAPI for the snippet.
   if [ -n "$ven" ] && [ -n "$dev" ]; then
     cat > "$DXVK_CONFIG_FILE" <<EOF
+dxgi.hideNvidiaGpu = False
 dxgi.customVendorId = $ven
 dxgi.customDeviceId = $dev
 EOF
   else
-    : > "$DXVK_CONFIG_FILE"
+    cat > "$DXVK_CONFIG_FILE" <<EOF
+dxgi.hideNvidiaGpu = False
+EOF
     echo "warning: no NVIDIA GPU detected; DXVK custom IDs are not set" >&2
   fi
 }
@@ -697,17 +707,55 @@ cmd_start() {
   chmod 600 "$shm" 2>/dev/null || true
   shm_control resume
 
+  # An inherited LD_LIBRARY_PATH breaks the Wine-side NVIDIA shims: a CUDA install on it
+  # was reproduced elsewhere as the reason cuInit failed inside the prefix, and stripping
+  # the variable fixed it. The helper is a Windows PE run by Wine; nothing it loads should
+  # come from a host library path.
+  #
+  # This is the kind of failure that appears and disappears depending on how the helper was
+  # launched -- inherited from a shell that has CUDA on it, absent from the desktop entry --
+  # which is the hardest kind to report. Unset it for the child only, never in the parent,
+  # and keep an escape for anyone running a self-built Wine that genuinely needs one.
+  if [ -n "${LD_LIBRARY_PATH:-}" ] && [ "${DLSSNR_KEEP_LD_LIBRARY_PATH:-0}" != "1" ]; then
+    echo "note: dropping inherited LD_LIBRARY_PATH for the helper: $LD_LIBRARY_PATH" >&2
+    unset LD_LIBRARY_PATH
+  fi
+
   export WINEPREFIX="$WINE_PREFIX_DIR"
   export DLSSNR_SHM="$shm"
   export DLSSNR_UID="$UID"
   export DLSSNR_LOG="$log"
   export DXVK_CONFIG_FILE="$DXVK_CONFIG_FILE"
   export WINEDEBUG="${WINEDEBUG:--all}"
+  # Same decision as WINEDEBUG, applied to the other noise source. The child's stdout and
+  # stderr are redirected into the helper log -- the file we ask users to attach to a bug
+  # report -- so DXVK's own logging lands in the middle of our [ngx] and [time] lines. The
+  # :- form leaves it overridable for anyone actually debugging DXVK.
+  export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-none}"
+  # Two independent projects report NGX rendering a frame and then crashing or wedging
+  # during cleanup, and both name these as the mitigation. They are Wine's own heap flags,
+  # the ones Proton exposes as PROTON_HEAP_DELAY_FREE / PROTON_HEAP_ZERO_MEMORY.
+  #
+  # Not free, and the cost is not measured here: DELAY_FREE defers frees so the prefix heap
+  # grows, and ZERO_MEMORY is a memset per allocation. Our allocation pattern is bursty at
+  # start-up and at feature rebuilds rather than per frame, which is why this is judged the
+  # right default -- but it is a judgement, so both stay overridable.
+  export WINE_HEAP_DELAY_FREE="${WINE_HEAP_DELAY_FREE:-1}"
+  export WINE_HEAP_ZERO_MEMORY="${WINE_HEAP_ZERO_MEMORY:-1}"
   if [ -n "$binaries" ]; then
     export DLSSNR_BIN_DIR="Z:$binaries"
   fi
   if [ "$runner_type" = "proton" ]; then
     export PROTON_ENABLE_NVAPI=1
+    # PROTON_ENABLE_NVAPI on its own is not enough: Proton still presents an AMD
+    # compatibility identity unless this is cleared, and DXVK-NVAPI cannot discover the
+    # NVIDIA device behind one. The symptom is maximally confusing -- "no NVIDIA adapter"
+    # while the log names the NVIDIA adapter two lines earlier.
+    export PROTON_HIDE_NVIDIA_GPU=0
+    # The WINE_HEAP_* pair above does nothing under a Proton launcher, which reads the
+    # PROTON_ names and sets the WINE_ ones itself. Setting both covers both runners.
+    export PROTON_HEAP_DELAY_FREE="${PROTON_HEAP_DELAY_FREE:-1}"
+    export PROTON_HEAP_ZERO_MEMORY="${PROTON_HEAP_ZERO_MEMORY:-1}"
     # DXVK-NVAPI (bundled by Proton-CachyOS/GE and friends, switched on by PROTON_ENABLE_NVAPI above)
     # already answers NVAPI inside the prefix. Loading the vendored nvapi64.dll on top of it faults in
     # its DllMain, so tell the helper to leave NVAPI to the runner. See core/ngx_snippet.cpp.
@@ -857,6 +905,29 @@ install_dir=$(detect_install_dir)
 helper_exe=$(detect_helper_exe || true)
 dxvk_dll=$(detect_dxvk_dll || true)
 EOF
+  # What cmd_start would actually put in the child's environment. These are the settings a
+  # bug report otherwise cannot show: every one of them is invisible once the helper is
+  # running, and three of them decide whether NVAPI can find the GPU at all.
+  cat <<EOF
+env_wine_heap_delay_free=${WINE_HEAP_DELAY_FREE:-1}
+env_wine_heap_zero_memory=${WINE_HEAP_ZERO_MEMORY:-1}
+env_dxvk_log_level=${DXVK_LOG_LEVEL:-none}
+env_ld_library_path_inherited=$([ -n "${LD_LIBRARY_PATH:-}" ] && echo "${LD_LIBRARY_PATH}" || echo "(none)")
+env_ld_library_path_kept=${DLSSNR_KEEP_LD_LIBRARY_PATH:-0}
+EOF
+  if [ "$runner_type" = "proton" ]; then
+    cat <<EOF
+env_proton_enable_nvapi=1
+env_proton_hide_nvidia_gpu=0
+env_proton_heap_delay_free=${PROTON_HEAP_DELAY_FREE:-1}
+env_proton_heap_zero_memory=${PROTON_HEAP_ZERO_MEMORY:-1}
+EOF
+  fi
+  if [ -f "$DXVK_CONFIG_FILE" ]; then
+    echo "dxvk_config_contents<<END"
+    cat "$DXVK_CONFIG_FILE"
+    echo "END"
+  fi
 }
 
 cmd_detect_gpu() {
