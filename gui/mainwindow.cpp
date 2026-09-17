@@ -338,6 +338,27 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     buttons->addWidget(profileCombo);
     buttons->addWidget(profileSaveBtn);
     root->addLayout(buttons);
+
+    // Said once, here, where the decision to switch it on is made.
+    //
+    // This is an IMPLICIT Vulkan layer: the loader inserts it into every Vulkan process on the
+    // machine that has the enabling variable set, not only into the game the user was thinking of.
+    // It hooks vkQueuePresentKHR inside that process and reads the swapchain. That is
+    // indistinguishable, from the outside, from the thing anti-cheat systems exist to detect, and
+    // nothing in this tree said so anywhere -- not in the interface, not in the packaging.
+    //
+    // The sentence is neutral and factual because the honest answer is "we do not know what any
+    // particular anti-cheat will do". What we do know is the shape of the thing, and the user is
+    // entitled to that before they turn it on for an online game.
+    auto* warn = new QLabel(
+        "This is an implicit Vulkan layer: it loads into every Vulkan program started while it is "
+        "enabled, and hooks presentation inside it. Anti-cheat systems may treat that as injection. "
+        "Prefer enabling it per game rather than globally, and think twice about online games.",
+        this);
+    warn->setWordWrap(true);
+    warn->setStyleSheet("color:#fb8c00;");
+    root->addWidget(warn);
+
     connect(profileReloadBtn, &QToolButton::clicked, this, [this] {
         const int idx = profileCombo->currentIndex();
         if (idx > 0) loadSettingsFromFile(profileCombo->itemData(idx).toString());
@@ -1477,9 +1498,16 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                           "How much of the frame's budget the flow estimate may take.");
         binder->AddChoice(f, "Motion units", &ShmHeader::mvecScaleMode,
                           { "Normalised", "Pixels", "UV 0..1" },
-                          "What the numbers in the field mean to the model.\n"
-                          "Pixels is what the estimate produces; the others are for matching a model "
-                          "that expects them.");
+                          "What the numbers in the motion field mean -- it describes the field, not "
+                          "a preference.\n"
+                          "This project's field is ALWAYS in full-resolution pixels: the estimate "
+                          "produces pixels and the deadzone shader writes pixels. Pixels is "
+                          "therefore the only setting that describes it, and the other two "
+                          "deliberately mis-scale it. They are an A/B tool, not a quality "
+                          "control.\n"
+                          "Kept because they say what a field COULD hold, and the scale they send "
+                          "is now the right way round: a normalised field is scaled by half the "
+                          "frame and a UV field by the whole of it.");
         binder->AddChoice(f, "Motion pixel size", &ShmHeader::mvecPixelSize,
                           { "1 px", "2 px", "4 px", "8 px" },
                           "The optical-flow grid spacing in source-image pixels. Unsupported grids "

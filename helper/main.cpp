@@ -3196,10 +3196,22 @@ static float HalfToFloat(uint16_t h) {
 }
 
 // What the model is told the motion field's numbers mean.
+// MVecScaleX/Y MULTIPLY the stored vector to give pixels. That is the direction the DLSS
+// integration contract defines -- a field in UV space is accompanied by a scale of the render
+// width, not its reciprocal -- and it is the direction our own default is consistent with: the
+// deadzone shader writes full-resolution pixels and this writes 1.0 beside them.
+//
+// Both other modes had it inverted. "UV 0..1" wrote 1/w, which converts pixels TO UV rather than UV
+// to pixels, and "Normalised" wrote 2/w where -1..1 needs w/2. Reciprocals of the conversion each
+// one names, so selecting either did not mis-scale the field a little -- at 1920 wide it scaled it
+// by about a millionth, which is a field of zeros with extra steps.
+//
+// They stay because they describe what the FIELD holds, and a field that is not ours may hold
+// either. Ours always holds pixels, which the tooltip now says.
 static void ApplyMotionScale(NgxSnippet& ngx, uint32_t mode, uint32_t w, uint32_t h) {
-    float sx = 2.0f / float(w), sy = 2.0f / float(h);
+    float sx = float(w) * 0.5f, sy = float(h) * 0.5f;   // -1..1 across the frame
     if (mode == kMVecPixels) { sx = 1.0f; sy = 1.0f; }
-    else if (mode == kMVecUv01) { sx = 1.0f / float(w); sy = 1.0f / float(h); }
+    else if (mode == kMVecUv01) { sx = float(w); sy = float(h); }
     NgxSetMotionScale(ngx, sx, sy);
 }
 
