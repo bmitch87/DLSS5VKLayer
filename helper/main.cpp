@@ -2991,6 +2991,7 @@ int main() {
     Log("[helper] context ready, waiting for frames");
 
     uint32_t lastReq = shm.hdr->seq_resp.load();
+    double lastFrameMs = 0.0;  // wall clock of the last frame processed, for the gap rule
     while (!shm.hdr->quit.load()) {
         // Restated every pass, not announced once.
         //
@@ -3011,6 +3012,30 @@ int main() {
             shm.hdr->seq_resp.store(req);
             continue;
         }
+        // A hole in the sequence is a discontinuity, and until now only the counter going
+        // BACKWARDS had a branch. The layer skips the round trip on a timeout, stands down
+        // for five seconds after four consecutive ones, latches inert on device loss, and
+        // is simply off whenever the user toggles the pass -- so on the far side of any of
+        // those the model would resume with history from before the interruption. A
+        // present-time pass has no reset signal from the game; its own continuity is the
+        // only one it can observe, so a gap has to be the reset condition.
+        if (req > lastReq + 1) {
+            Log("[helper] %u frames were skipped (%u -> %u); resetting the model's history",
+                req - lastReq - 1, lastReq, req);
+            ns.mvecResetPending = true;
+            ns.flow.hasPrev = false;
+            ns.flow.hintsStale = true;
+        } else if (req == lastReq + 1 && lastFrameMs > 0.0 && NowMs() - lastFrameMs > 250.0) {
+            // And a gap in TIME with no gap in the count: an alt-tab, a stall or a paused
+            // player holds seq_req still rather than skipping it, and the next frame is
+            // just as unrelated to the last one as a skipped run would have been.
+            Log("[helper] %.0f ms since the last frame; resetting the model's history",
+                NowMs() - lastFrameMs);
+            ns.mvecResetPending = true;
+            ns.flow.hasPrev = false;
+            ns.flow.hintsStale = true;
+        }
+
         if (req == lastReq) {
             for (int i = 0; i < 20000; ++i) {
                 if (shm.hdr->quit.load() || shm.hdr->seq_req.load() != lastReq) break;
@@ -3034,6 +3059,7 @@ int main() {
         std::atomic_thread_fence(std::memory_order_release);
         shm.hdr->seq_resp.store(req);
         lastReq = req;
+        lastFrameMs = NowMs();
         if (ns.ngx.disabled) {
             shm.hdr->quit.store(1);
             break;
