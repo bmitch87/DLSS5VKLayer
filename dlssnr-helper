@@ -769,6 +769,25 @@ cmd_start() {
   fi
   if [ "$runner_type" = "wine" ]; then
     export DXVK_ENABLE_NVAPI=1
+    # Deliberately NOT set here: DXVK_NVAPI_DRS_NGX_DLSS_NR_OVERRIDE=on.
+    #
+    # Another project sets it and documents it as one of the switches that makes DLSS-NR
+    # work under Wine, which made it look like the cheapest possible win. It is inert.
+    # DXVK-NVAPI builds the variable name as DXVK_NVAPI_DRS_<setting>, and the settings it
+    # knows are a fixed list -- sixteen NGX_* names in the build we ship, checked by
+    # scanning nvapi64.dll:
+    #
+    #   NGX_DLAA_OVERRIDE, NGX_DLSSG_{MODE,MULTI_FRAME_COUNT,DYNAMIC_*},
+    #   NGX_DLSS_FG_OVERRIDE[_RENDER_PRESET_SELECTION],
+    #   NGX_DLSS_RR_{MODE,OVERRIDE,OVERRIDE_RENDER_PRESET_SELECTION,OVERRIDE_SCALING_RATIO},
+    #   NGX_DLSS_SR_{MODE,OVERRIDE,OVERRIDE_RENDER_PRESET_SELECTION,OVERRIDE_SCALING_RATIO},
+    #   NGX_DLSS_OVERRIDE_OPTIMAL_SETTINGS
+    #
+    # Super Resolution, Ray Reconstruction, Frame Generation and DLAA. There is no Neural
+    # Rendering setting, and no string containing DLSSNR, "neural" or _NR_ anywhere in the
+    # binary. An unknown suffix is simply never looked up, so setting it does nothing at
+    # all -- which is exactly the kind of control this project has twice removed for
+    # looking real while nothing listened. Re-check the list before adding it back.
     unset DLSSNR_SKIP_NVAPI
     export WINEDLLOVERRIDES="vulkan-1=n,b;nvapi64=n,b;dxgi=n,b;d3d11=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
   fi
