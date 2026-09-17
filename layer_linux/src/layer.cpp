@@ -1864,6 +1864,17 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             Log("[time] encode=%.2f helper=%.2f resolve=%.2f total=%.2f ms (model %ux%u)",
                 tCapture - t0, tHelper - tCapture, tReturn - tHelper, tReturn - t0,
                 sc.comp->ModelWidth(), sc.comp->ModelHeight());
+            // How far the measured white point has travelled, which is the precondition for
+            // deciding whether one trim scalar can be right across every scene. See
+            // Composition::ConsumeMeter. Printed beside the timings because that is the line
+            // anybody already leaves on for a long session.
+            float lo = 0.0f, hi = 0.0f, mean = 0.0f;
+            uint64_t n = 0;
+            sc.comp->WhitePointTravel(lo, hi, mean, n);
+            if (n)
+                Log("[white] measured %.4f now, %.4f..%.4f over %llu frames (mean %.4f, span x%.2f)",
+                    sc.comp->MeasuredWhitePoint(), lo, hi, (unsigned long long)n, mean,
+                    lo > 0.0f ? hi / lo : 0.0f);
         }
     }
     return true;

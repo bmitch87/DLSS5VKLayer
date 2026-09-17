@@ -215,6 +215,8 @@ class Composition {
     // What the meter settled on, or 0 when it has not taken a usable reading. For the interface, so
     // the number in use is visible rather than inferred.
     float MeasuredWhitePoint() const { return _measuredWhitePoint; }
+    // The range the measured white point has covered this session. See ConsumeMeter.
+    void WhitePointTravel(float& lo, float& hi, float& mean, uint64_t& frames) const;
 
   private:
     struct Image {
@@ -311,6 +313,11 @@ class Composition {
     VkDescriptorSet _meterDescriptorSet = VK_NULL_HANDLE;
     VkSampler _meterSampler = VK_NULL_HANDLE;
     float _measuredWhitePoint = 0.0f;
+    // Whole-session travel of the measurement above, kept outside any ring so a long run still
+    // reports its own shape. See ConsumeMeter for what the question is.
+    float _whiteMin = 0.0f, _whiteMax = 0.0f;
+    double _whiteSum = 0.0;
+    uint64_t _whiteSeen = 0;
     float _meterSteadiness = 0.0f;
     HostBuffer _download{}, _upload{}, _captureBuf{};
 

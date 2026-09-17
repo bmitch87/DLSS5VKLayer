@@ -1607,6 +1607,35 @@ void Composition::ConsumeMeter() {
     const float* mirror = (const float*) _meterMirror.mapped;
     _measuredWhitePoint = mirror[1];
     _meterSteadiness = mirror[3];
+
+    // How far the measured white point actually travels over a session.
+    //
+    // AEX-05 proposes replacing the single trim scalar with a curve of (whitePoint, trim) anchors,
+    // on the grounds that one number cannot be right across every scene. That is plausible and it
+    // is unmeasured: nothing here has ever recorded the RANGE the measurement covers, only its
+    // current value, so "the trim has to follow the white point" and "the white point barely moves
+    // in practice" are indistinguishable from anything this project has logged.
+    //
+    // This is the precondition, not the feature. It costs two comparisons a frame and prints one
+    // line every TimeInterval() frames under DLSSNR_TIME, so a real session with day and night
+    // scenes answers the question without anyone building the curve first. If the span turns out
+    // to be narrow, AEX-05 closes; if it is wide, this is the evidence that it should be built.
+    if (_measuredWhitePoint > 0.0f) {
+        if (_whiteSeen == 0 || _measuredWhitePoint < _whiteMin) _whiteMin = _measuredWhitePoint;
+        if (_measuredWhitePoint > _whiteMax) _whiteMax = _measuredWhitePoint;
+        ++_whiteSeen;
+        _whiteSum += double(_measuredWhitePoint);
+    }
+}
+
+// min/max/mean of the measured white point across this session, and how many frames it covers.
+// Zero frames means the meter has never offered a reading -- a manual white point, or content the
+// meter refuses.
+void Composition::WhitePointTravel(float& lo, float& hi, float& mean, uint64_t& frames) const {
+    lo = _whiteSeen ? _whiteMin : 0.0f;
+    hi = _whiteSeen ? _whiteMax : 0.0f;
+    mean = _whiteSeen ? float(_whiteSum / double(_whiteSeen)) : 0.0f;
+    frames = _whiteSeen;
 }
 
 }  // namespace dlssnr
