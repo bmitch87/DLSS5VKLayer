@@ -67,6 +67,18 @@ static bool SkipEvaluate() {
 // remove; and dropping the variables outright would break every recipe already written down. So:
 // the environment chooses where the session starts, the header decides from then on, and the log
 // says when the environment did anything at all.
+// 0 off, 1 a 64px checkerboard, 2 all zero, 3 all 255.
+//
+// The checkerboard answers "does this key do anything"; the two solid fills answer "which way
+// round is it", which is the half DXL-05 asks for and no document states.
+static int ProbeControlMask() {
+    static const int v = [] {
+        const char* p = getenv("DLSSNR_PROBE_CONTROLMASK");
+        return p && *p ? atoi(p) : 0;
+    }();
+    return v;
+}
+
 static void SeedSceneCutFromEnv(ShmHeader* hdr) {
     if (!hdr) return;
     const char* off = getenv("DLSSNR_SCENE_CUT");
@@ -1563,6 +1575,10 @@ struct NeuralState {
     // a pass must read the previous pass's answer while writing its own: with a single surface the
     // model would be reading and writing the same image.
     GpuImage colorIn{}, workA{}, workB{}, mv{}, depth{};
+    // DLSSNR.ControlMask, only under DLSSNR_PROBE_CONTROLMASK=1. A checkerboard, which is the
+    // cheapest possible answer to "does binding this key move the picture at all" -- if half the
+    // frame is masked and nothing changes, there is nothing to plumb. See the probe below.
+    GpuImage probeMask{};
     // Where the chain lands before it leaves. The passes run at higher precision than the
     // transport, so the last one is brought down to the transport's format here, once.
     GpuImage colorOut{};
@@ -3279,8 +3295,56 @@ static bool EnsureNeural(NeuralState& ns, ShmMap& shm, uint32_t w, uint32_t h) {
     ns.flow.attemptedQuality = UINT32_MAX;
 
     std::vector<uint8_t> zeros(size_t(w) * h * 4, 0);
-    if (!UploadPixels(ns.vk, ns.mv, zeros.data(), zeros.size()) ||
-        !UploadPixels(ns.vk, ns.depth, zeros.data(), zeros.size())) return false;
+    if (!UploadPixels(ns.vk, ns.mv, zeros.data(), zeros.size())) return false;
+
+    // DLSSNR_DEPTH_FILL is the probe that settles whether the depth channel is worth building a
+    // proxy for. Default 0.0, which is what has always been uploaded; set it to 0.5 or 1.0 and see
+    // whether the output digest moves at all. A flat buffer is a flat buffer whatever its value, so
+    // if the model's answer is identical at 0.0, 0.5 and 1.0 then this channel is not reading
+    // anything a present-time layer could supply, and no depth proxy is worth building.
+    //
+    // Kept rather than deleted after the answer, because the answer belongs to THIS model build and
+    // whoever swaps the model can re-run it in one line.
+    // The ControlMask probe, built only when asked for.
+    //
+    // MVE-04 and DXL-05 both want this key plumbed through as a user-configurable region. Before
+    // any of that, the question is whether binding it does anything at all, and a checkerboard
+    // answers it in one run: at 64-pixel squares half the frame is masked, so any effect at all is
+    // unmissable in the digest. OMP-07 is why the use case is a region a USER draws rather than a
+    // HUD this code detects -- an image-based HUD detector was measured and rejected by the project
+    // our composition descends from, and our position after UI compositing is strictly worse.
+    if (ProbeControlMask()) {
+        DestroyImage2D(ns.vk, ns.probeMask);
+        if (CreateImage2D(ns.vk, VK_FORMAT_R8_UNORM, w, h, ns.probeMask)) {
+            const int mode = ProbeControlMask();
+            std::vector<uint8_t> board(size_t(w) * h);
+            for (uint32_t y = 0; y < h; ++y)
+                for (uint32_t x = 0; x < w; ++x)
+                    board[size_t(y) * w + x] =
+                        mode == 2 ? 0 : mode == 3 ? 255
+                                                  : (((x >> 6) ^ (y >> 6)) & 1 ? 255 : 0);
+            if (UploadPixels(ns.vk, ns.probeMask, board.data(), board.size()))
+                Log("[probe] DLSSNR_PROBE_CONTROLMASK=%d: binding %s to DLSSNR.ControlMask", mode,
+                    mode == 2 ? "an all-zero mask" : mode == 3 ? "an all-255 mask"
+                                                              : "a 64px checkerboard");
+            else
+                Log("[probe] control mask upload failed");
+        } else {
+            Log("[probe] control mask image could not be created");
+        }
+    }
+
+    {
+        float fill = 0.0f;
+        if (const char* e = getenv("DLSSNR_DEPTH_FILL"); e && *e) {
+            fill = strtof(e, nullptr);
+            Log("[helper] DLSSNR_DEPTH_FILL=%s: filling the depth channel with %.3f instead of 0",
+                e, double(fill));
+        }
+        std::vector<uint8_t> depthFill(size_t(w) * h * 4);
+        for (size_t i = 0; i < depthFill.size(); i += 4) std::memcpy(&depthFill[i], &fill, 4);
+        if (!UploadPixels(ns.vk, ns.depth, depthFill.data(), depthFill.size())) return false;
+    }
 
     if (!BeginCmd(ns.vk.cmdScratch)) return false;
     TransitionImage(ns.vk, ns.vk.cmdScratch, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -3828,9 +3892,13 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         // field to reproject with yet -- rather than a full rectangle of zeros presented as
         // measurements.
         const bool mvecUsable = ns.flow.enabled && ns.mvecEnabled && !ns.pendingMvClear;
+        NVSDK_NGX_Resource_VK rmask{};
+        const bool haveMask = ProbeControlMask() && ns.probeMask.image;
+        if (haveMask) FillResource(rmask, ns.probeMask, false);
         NgxSetResources(ns.ngx, rc, ro, rm, rd, w, h,
                         mvecUsable ? ns.mv.width : 0u,
-                        mvecUsable ? ns.mv.height : 0u);
+                        mvecUsable ? ns.mv.height : 0u,
+                        haveMask ? &rmask : nullptr);
 
         // This pass's own tuning, written immediately before this pass's evaluate.
         //

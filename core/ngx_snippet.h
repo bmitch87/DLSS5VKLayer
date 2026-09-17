@@ -57,7 +57,7 @@ struct NgxSnippet {
     decltype(&GetModuleFileNameW) originalGetModuleFileNameW = nullptr;
 
     // Resource structs passed to the DLL (must outlive eval calls)
-    NVSDK_NGX_Resource_VK resColor{}, resOut{}, resMV{}, resDepth{};
+    NVSDK_NGX_Resource_VK resColor{}, resOut{}, resMV{}, resDepth{}, resControlMask{};
 
     std::wstring binDir;
 };
@@ -153,7 +153,9 @@ void NgxReleaseAllPasses(NgxSnippet& s, VkDevice device);
 void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
                      const NVSDK_NGX_Resource_VK& out, const NVSDK_NGX_Resource_VK& mv,
                      const NVSDK_NGX_Resource_VK& depth, uint32_t width, uint32_t height,
-                     uint32_t mvecWidth, uint32_t mvecHeight);
+                     uint32_t mvecWidth, uint32_t mvecHeight,
+                     // DLSSNR.ControlMask, for the probe only; null in every ordinary frame.
+                     const NVSDK_NGX_Resource_VK* controlMask = nullptr);
 void NgxSetReset(NgxSnippet& s, bool reset, bool logValue = false);
 // A no-op that logs once. This model has no sharpness parameter under any name -- see the
 // definition. It was believed to be "the one strength the model reads at evaluate"; it is

@@ -711,9 +711,11 @@ bool NgxCreatePass(NgxSnippet& s, uint32_t pass, uint32_t width, uint32_t height
 void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
                      const NVSDK_NGX_Resource_VK& out, const NVSDK_NGX_Resource_VK& mv,
                      const NVSDK_NGX_Resource_VK& depth, uint32_t width, uint32_t height,
-                     uint32_t mvecWidth, uint32_t mvecHeight) {
+                     uint32_t mvecWidth, uint32_t mvecHeight,
+                     const NVSDK_NGX_Resource_VK* controlMask) {
     if (!s.params) return;
     s.resColor = color; s.resOut = out; s.resMV = mv; s.resDepth = depth;
+    if (controlMask) s.resControlMask = *controlMask;
     DWORD seh = 0;
     Guarded([&] {
         const bool hasDepth = s.resDepth.Resource.ImageViewInfo.ImageView != VK_NULL_HANDLE;
@@ -721,10 +723,21 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
         s.params->Set("DLSSNR.Output", &s.resOut);
         s.params->Set("DLSSNR.MVec", &s.resMV);
         s.params->Set("DLSSNR.Depth", hasDepth ? &s.resDepth : (const NVSDK_NGX_Resource_VK*)nullptr);
-        s.params->Set("DLSSNR.ControlMask", (const NVSDK_NGX_Resource_VK*)nullptr);
+        s.params->Set("DLSSNR.ControlMask",
+                      controlMask ? &s.resControlMask : (const NVSDK_NGX_Resource_VK*)nullptr);
         s.params->Set("DLSSNR.UI", (const NVSDK_NGX_Resource_VK*)nullptr);
         s.params->Set("DLSSNR.UIAlpha", (const NVSDK_NGX_Resource_VK*)nullptr);
-        s.params->Set("DLSSNR.Backbuffer", (const NVSDK_NGX_Resource_VK*)nullptr);
+        // DLSSNR.Backbuffer is one of the 61 real keys and the DLL asks for it at every evaluate.
+        // We have nothing to put there that is not already DLSSNR.Color -- our "backbuffer" IS the
+        // frame the model is being shown -- so the probe is to hand it the output surface and see
+        // whether anything changes. One line, so that "we pass null" is a measured choice rather
+        // than an assumption. The answer on this model is that it changes nothing; see the log.
+        static const bool bindBackbuffer = [] {
+            const char* p = getenv("DLSSNR_BIND_BACKBUFFER");
+            return p && p[0] == '1';
+        }();
+        s.params->Set("DLSSNR.Backbuffer",
+                      bindBackbuffer ? &s.resOut : (const NVSDK_NGX_Resource_VK*)nullptr);
         s.params->Set("DLSSNR.BidirectionalDistortionField", (const NVSDK_NGX_Resource_VK*)nullptr);
         // The undotted aliases (Color, Output, Depth, MotionVectors, MVec) are gone: the
         // probe reports them never read, and the DLSSNR.* names above are the ones the model
