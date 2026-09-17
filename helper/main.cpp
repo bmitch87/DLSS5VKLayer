@@ -1461,6 +1461,7 @@ struct NeuralState {
     uint32_t lumaW = 0, lumaH = 0;
     uint32_t sceneCutStreak = 0;
     uint32_t passPriceMB = 0;       // measured cost of the last pass built, device-local MiB
+    bool loggedDuplicate = false;   // say "identical frame" once per run, not per frame
     bool sceneCutPending = false;   // exactly one frame over the threshold so far
     bool sceneCutFired = false;     // this run of over-threshold frames has already fired
     uint32_t lastResetLogged = 0xFFFFFFFFu;
@@ -2530,7 +2531,22 @@ static int ReactivateMotionVectors(NeuralState& ns, uint32_t w, uint32_t h, uint
     return 1;
 }
 
-static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint32_t h, uint32_t fmt) {
+// Returns whether this frame is a scene cut, and reports separately whether it is a
+// DUPLICATE of the previous one.
+//
+// The two look identical to a run-length rule and are opposites. A cut says the history is
+// worthless; a duplicate is a confident statement that nothing moved, which is the strongest
+// possible evidence that the history is still good. Both produce a zero motion field and
+// only one of them should reset anything.
+//
+// The test is the mean absolute luma difference over the grid being exactly zero. That is
+// an integer mean, so zero means the average difference is under one part in 255 across the
+// whole frame -- which is a duplicate or close enough to one that estimating flow between
+// the pair is a full NVOF execute spent producing a field we already know is zero. No
+// invented float threshold: the quantisation is the threshold.
+static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint32_t h, uint32_t fmt,
+                           bool* duplicate) {
+    if (duplicate) *duplicate = false;
     static const bool enabled = [] {
         const char* p = getenv("DLSSNR_SCENE_CUT");
         return !p || p[0] != '0';
@@ -2572,6 +2588,7 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
     }
     if (sizeChanged) return false;
     int mean = int(sum / n);
+    if (mean == 0 && duplicate) *duplicate = true;
     // What the shape of the signal means, which the old "two consecutive frames over the
     // threshold" rule had backwards:
     //
@@ -2607,6 +2624,11 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
     if (cut)
         Log("[mvec] scene cut detected (%s) mean=%d threshold=%d streak=%u", why, mean, threshold,
             ns.sceneCutStreak);
+    if (duplicate && *duplicate && !ns.loggedDuplicate) {
+        ns.loggedDuplicate = true;
+        Log("[mvec] identical frame received; skipping the flow estimate while it repeats");
+    }
+    if (duplicate && !*duplicate) ns.loggedDuplicate = false;
     return cut;
 }
 
@@ -3153,8 +3175,9 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     // scene that is no longer on screen, which is worse than handing it nothing. The CPU detector
     // reads the shared-memory region, which the dma-buf path leaves unwritten, so it stands down
     // while the fd path is live -- one frame of stale flow across a cut is the price of the copy.
+    bool duplicateFrame = false;
     const bool sceneCut = !ns.proxyActive && !hdrEncode &&
-                          DetectSceneCut(ns, shm.inPixels, w, h, 1);
+                          DetectSceneCut(ns, shm.inPixels, w, h, 1, &duplicateFrame);
     if (sceneCut && !ns.firstFrame) {
         // The model's own temporal history is the point. Clearing the flow field and
         // leaving DLSSNR.Reset alone told the model to keep reprojecting across the cut
@@ -3181,7 +3204,14 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     // Estimating flow between a frame and itself costs a full NVOF execute to produce a
     // field we already know is zero, so a repeat skips it and takes one of the plain upload
     // paths below instead -- the upload normally rides along inside the flow prep submit.
-    if (ns.flow.enabled && !frameRepeat) {
+    //
+    // Two ways to be the same frame twice. frameRepeat is the layer saying so, which it can
+    // only do for its own idle repaint. duplicateFrame is this side noticing: a paused game,
+    // an occluded window or a menu presents the same picture through the ordinary path and
+    // says nothing about it. Unlike a repaint, a duplicate does NOT reset the model -- the
+    // history is about a scene that has not changed, which is exactly when it is worth most.
+    const bool sameFrameAgain = frameRepeat || duplicateFrame;
+    if (ns.flow.enabled && !sameFrameAgain) {
         // The colorIn upload is merged into the flow prep command buffer.
         if (!RunOpticalFlow(ns)) {
             Log("[mvec] disabling estimated motion vectors after a flow failure");
