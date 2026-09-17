@@ -1949,7 +1949,10 @@ static void WriteFlowTimestampBegin(VkCtx& c, VkCommandBuffer cb) {
     if (vkCmdWriteTimestamp) {
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, c.flowQuery, 0);
     } else if (c.sync2 && vkCmdWriteTimestamp2) {
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV, c.flowQuery, 0);
+        // ALL_COMMANDS, not the optical-flow stage: both flow timestamps are recorded into
+        // graphics-queue buffers (prep and post), which bracket the NVOF submit rather than
+        // containing it.
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, c.flowQuery, 0);
     }
 }
 
@@ -1958,7 +1961,7 @@ static void WriteFlowTimestampEnd(VkCtx& c, VkCommandBuffer cb) {
     if (vkCmdWriteTimestamp) {
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, c.flowQuery, 1);
     } else if (c.sync2 && vkCmdWriteTimestamp2) {
-        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV, c.flowQuery, 1);
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, c.flowQuery, 1);
     }
 }
 
@@ -2134,20 +2137,32 @@ static bool RunOpticalFlow(NeuralState& ns) {
 
     ResetFlowTimestampQueries(ns.vk, cb);
 
+    // These three barriers run on the GRAPHICS queue and used to name
+    // VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV as their destination, which is not a stage
+    // this queue family supports -- a stage mask has to be legal for the queue the command
+    // buffer is submitted to, not for the queue that eventually consumes the data.
+    //
+    // Naming the consumer here was never what ordered the two queues anyway: the NVOF
+    // execute is a separate submit on the optical-flow queue that waits on semPrep, and a
+    // binary semaphore's signal makes these writes available and its wait makes them
+    // visible. So the barrier's job on this side is the layout transition and making prior
+    // work available, which ALL_COMMANDS plus MEMORY_READ/WRITE states conservatively and
+    // legally. The images are CONCURRENT across the two families, so no ownership transfer
+    // is owed either.
     {
         VkAccessFlags prevSrcA; VkPipelineStageFlags prevSrcS;
         SrcAccessForLayout(f.prev.layout, &prevSrcA, &prevSrcS);
         TransitionImage2(ns.vk, cb, f.prev, VK_IMAGE_LAYOUT_GENERAL,
-                         prevSrcA, VK_ACCESS_2_OPTICAL_FLOW_READ_BIT_NV,
-                         prevSrcS, VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV);
+                         prevSrcA, VK_ACCESS_2_MEMORY_READ_BIT,
+                         prevSrcS, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     }
     TransitionImage2(ns.vk, cb, f.curr, VK_IMAGE_LAYOUT_GENERAL,
-                     VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_OPTICAL_FLOW_READ_BIT_NV,
-                     VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV);
+                     VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_ACCESS_2_MEMORY_READ_BIT,
+                     VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
     TransitionImage2(ns.vk, cb, f.out, VK_IMAGE_LAYOUT_GENERAL,
                      VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                     VK_ACCESS_2_OPTICAL_FLOW_WRITE_BIT_NV,
-                     VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV);
+                     VK_ACCESS_2_MEMORY_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
 
     WriteFlowTimestampBegin(ns.vk, cb);
     const int prepFence = SubmitAsync(ns.vk, cb, ns.vk.queue, 0, nullptr,
@@ -2195,9 +2210,13 @@ static bool RunOpticalFlow(NeuralState& ns) {
     // The compute pass reads the raw NVOF texels in-place through the
     // R16G16_UINT view, decodes, deadzone-clamps and upscales straight into
     // the MVec resource. No host readback, no image->image bit copy.
+    // Same again in the other direction: this buffer is on the graphics queue, so the SOURCE
+    // cannot name the optical-flow stage either. semFlow is what made the NVOF writes
+    // available and visible here; this barrier only has to transition the layout and order
+    // the compute read after it.
     TransitionImage2(ns.vk, cb, f.out, VK_IMAGE_LAYOUT_GENERAL,
-                     VK_ACCESS_2_OPTICAL_FLOW_WRITE_BIT_NV, VK_ACCESS_2_SHADER_READ_BIT,
-                     VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+                     VK_ACCESS_2_MEMORY_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     TransitionImage2(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_GENERAL,
                      VK_ACCESS_2_SHADER_READ_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
@@ -2210,11 +2229,11 @@ static bool RunOpticalFlow(NeuralState& ns) {
                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
 
     TransitionImage2(ns.vk, cb, f.curr, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                     VK_ACCESS_2_OPTICAL_FLOW_READ_BIT_NV, VK_ACCESS_2_TRANSFER_READ_BIT,
-                     VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+                     VK_ACCESS_2_MEMORY_READ_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
     TransitionImage2(ns.vk, cb, f.prev, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_ACCESS_2_OPTICAL_FLOW_READ_BIT_NV, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                     VK_PIPELINE_STAGE_2_OPTICAL_FLOW_BIT_NV, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+                     VK_ACCESS_2_MEMORY_READ_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT);
     {
         VkImageCopy copy{};
         copy.srcSubresource = { f.curr.aspect(), 0, 0, 1 };
