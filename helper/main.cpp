@@ -3110,7 +3110,23 @@ static NgxTuning TuningFor(const ShmHeader* h, uint32_t pass) {
     t.localTone = ClampF(p.localTone, 0.0f, 4.0f);
     t.localStructure = ClampF(p.localStructure, 0.0f, 4.0f);
     t.skinStructure = ClampF(p.skinStructure, -1.0f, 4.0f);
-    t.style = p.style;
+    // Style clamped to the three the model actually has, measured rather than assumed.
+    //
+    // Sweeping 0..6 through this model over identical synthetic frames: 0 and 1 each produce their
+    // own picture, and 2, 3, 4, 5 and 6 produce byte-identical output -- three runs each, the same
+    // three sums every time. The DLL clamps out-of-range styles to its last one and says nothing.
+    //
+    // So clamping here changes no behaviour and makes the log tell the truth: the "create tuning"
+    // line now reports the style the model was given rather than the number the header held, which
+    // is the whole reason every other field on this struct is clamped in this function too.
+    t.style = p.style <= 2u ? p.style : 2u;
+    // Preset is NOT clamped, on the same evidence and for the opposite reason.
+    //
+    // 'DLSSNR.Hint.Render.Preset' is a real key and the parameter probe shows the DLL reading it at
+    // create on every build -- but 0, 1, 2, 3, 4, 7 and 15 all produced byte-identical output here.
+    // Read and inert is not the same as out of range, and inventing a 0..3 bound would assert a
+    // boundary this measurement does not support in either direction. The GUI says what was
+    // measured instead.
     t.preset = p.preset;
     t.autoMask = p.autoMask ? 1u : 0u;
     return t;

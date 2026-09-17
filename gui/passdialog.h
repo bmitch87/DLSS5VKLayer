@@ -36,8 +36,17 @@ private:
 
     void writePass(uint32_t pass);
     void buildPage(uint32_t pass, QWidget* page);
+    // Skin structure is inert without the auto skin mask -- measured, see MainWindow's copy of this
+    // note. Here the mask can come from the pass or from the global setting depending on the pass's
+    // own tick, so the row follows whichever one this pass actually resolves to.
+    void updateSkinEnabled(uint32_t pass);
 
     ShmHeader* hdr = nullptr;
     QTabWidget* tabs = nullptr;
     std::array<std::vector<Row>, kMaxPasses> rows;
+    // Per pass: the skin value box, and the mask's control plus its override tick, which together
+    // decide whether the mask is on for this pass.
+    std::array<QDoubleSpinBox*, kMaxPasses> skinBox{};
+    std::array<QCheckBox*, kMaxPasses> maskBox{};
+    std::array<QCheckBox*, kMaxPasses> maskOverride{};
 };

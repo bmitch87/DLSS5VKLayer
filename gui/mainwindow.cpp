@@ -781,6 +781,7 @@ void MainWindow::applyDefaults() {
     ShmResetSettings(hdr);
     if (keyCombo) keyCombo->setCurrentIndex(0);
     if (binder) binder->Reload();
+    updateSkinStructureEnabled();
     if (rebuildSpin) {
         QSignalBlocker block(rebuildSpin);
         rebuildSpin->setValue(int(hdr->rebuildSettleMs.load()));
@@ -938,6 +939,7 @@ void MainWindow::loadSettingsFromFile(const QString& path) {
     hdr->tuningSeq.fetch_add(1);
     if (binder) binder->Reload();
     updateCompositionVisibility();
+    updateSkinStructureEnabled();
     lastSettingsBlob = settingsBlob();
     profileBlob = lastSettingsBlob;
     updateReloadBtn();
@@ -1187,6 +1189,9 @@ void MainWindow::maybePromptImport() {
 
 void MainWindow::updateStatus() {
     if (binder) binder->Reload();
+    // Reload blocks signals while it writes, so the mask's toggled() does not fire and the skin row
+    // would stay as the user last left it rather than as the header now reads.
+    updateSkinStructureEnabled();
     // The menu spinbox is not a bound control, so the poll keeps it honest the same way the binder
     // keeps the bound ones honest -- unless the user is mid-edit on it, which is not the moment to
     // overwrite the number under their cursor.
@@ -1300,6 +1305,33 @@ void MainWindow::updateStatus() {
     saveSettingsIfChanged();
 }
 
+// Skin structure follows the auto skin mask.
+//
+// Measured on this model over identical frames: with the mask off, skin strengths of 0, 2 and 4
+// produce byte-identical output, while with it on they separate cleanly and monotonically. The
+// exception is the -1 sentinel, which means "follow local structure" and still takes a different
+// path with the mask off -- so the row is disabled rather than forced, and whatever value is in it
+// is left alone.
+//
+// Same failure class as the UseAutoMask constant this project already fixed: a control that looks
+// live, writes its value all the way to the model, and changes no pixels.
+void MainWindow::updateSkinStructureEnabled() {
+    if (!skinStructureBox || !autoMaskBox) return;
+    const bool on = autoMaskBox->isChecked();
+    skinStructureBox->setEnabled(on);
+    if (!on)
+        skinStructureBox->setToolTip(FormatTip(
+            "Inert while the auto skin mask is off.\n"
+            "Measured: with the mask off, strengths of 0, 2 and 4 give byte-identical output. Turn "
+            "the mask on for this to mean anything."));
+    else
+        skinStructureBox->setToolTip(FormatTip(
+            "-1 follows local structure, which is the model's own default. It is not a strength of "
+            "zero.\n"
+            "Needs the auto skin mask: with the mask off, strengths of 0, 2 and 4 were measured to "
+            "give byte-identical output."));
+}
+
 void MainWindow::updateCompositionVisibility() {
     if (!compositionForm) return;
     const bool bypass = hdr && hdr->compositionBypass.load() != 0;
@@ -1352,8 +1384,17 @@ QWidget* MainWindow::buildSettings() {
         binder->AddBool(f, "Enabled", &ShmHeader::enabled,
                         "Run the model at all. Off leaves the game's own frame untouched.");
         binder->AddChoice(f, "Style", &ShmHeader::style, { "Default", "Natural", "Cinematic" },
-                          "The model's own processing profiles.", ShmBinder::AtCreate);
-        binder->AddInt(f, "Preset", &ShmHeader::preset, 0, 15, "The model's own render preset.",
+                          "The model's own processing profiles.\n"
+                          "Three, and only three: styles above Cinematic were swept through this "
+                          "model and produced output identical to Cinematic, so the list is not "
+                          "hiding anything.",
+                          ShmBinder::AtCreate);
+        binder->AddInt(f, "Preset", &ShmHeader::preset, 0, 15,
+                       "The model's own render preset.\n"
+                       "The model reads this every time a pass is built -- and on this model build "
+                       "no value from 0 to 15 changed the picture at all. Left at its full range "
+                       "rather than narrowed, because \"read and does nothing here\" is not the "
+                       "same as \"out of range\", and another model may differ.",
                        ShmBinder::AtCreate);
         binder->AddFloat(f, "Intensity", &ShmHeader::intensityBits, 0.0, 4.0, 0.05,
                          "How hard the model works.", ShmBinder::AtCreate);
@@ -1361,12 +1402,23 @@ QWidget* MainWindow::buildSettings() {
                          ShmBinder::AtCreate);
         binder->AddFloat(f, "Local tone", &ShmHeader::localToneBits, 0.0, 4.0, 0.05, "",
                          ShmBinder::AtCreate);
-        binder->AddFloat(f, "Skin structure", &ShmHeader::skinStructureBits, -1.0, 4.0, 0.05,
-                         "-1 follows local structure, which is the model's own default. It is not a "
-                         "strength of zero.",
-                         ShmBinder::AtCreate);
-        binder->AddBool(f, "Auto skin mask", &ShmHeader::autoMask, "The model's automatic skin mask.",
-                        ShmBinder::AtCreate);
+        skinStructureBox =
+            binder->AddFloat(f, "Skin structure", &ShmHeader::skinStructureBits, -1.0, 4.0, 0.05,
+                             "-1 follows local structure, which is the model's own default. It is not "
+                             "a strength of zero.\n"
+                             "Needs the auto skin mask: with the mask off, strengths of 0, 2 and 4 "
+                             "were measured to give byte-identical output. The mask is what tells the "
+                             "model where skin is, and without it there is nothing for a strength to "
+                             "apply to.",
+                             ShmBinder::AtCreate);
+        autoMaskBox =
+            binder->AddBool(f, "Auto skin mask", &ShmHeader::autoMask,
+                            "The model's automatic skin mask.\n"
+                            "Also the switch that makes Skin structure mean anything -- see its "
+                            "tooltip.",
+                            ShmBinder::AtCreate);
+        connect(autoMaskBox, &QCheckBox::toggled, this, &MainWindow::updateSkinStructureEnabled);
+        updateSkinStructureEnabled();
         binder->AddFloat(f, "Sharpness", &ShmHeader::sharpnessBits, 0.0, 1.0, 0.05,
                          "The one strength the model reads every frame, so it takes effect at once.");
     }
@@ -1682,5 +1734,6 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
     col->addStretch(1);
     binder->Reload();
     updateCompositionVisibility();
+    updateSkinStructureEnabled();
     return tabs;
 }

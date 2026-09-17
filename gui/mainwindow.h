@@ -80,6 +80,9 @@ private:
     bool ensureShm();
     QWidget* buildSettings();
     void updateCompositionVisibility();
+    // Skin structure does nothing with the auto skin mask off -- measured, not assumed. Rather than
+    // leave a live-looking control that changes no pixels, the row follows the mask.
+    void updateSkinStructureEnabled();
 
     QString projectDir;
     QString helperCliPath;
@@ -104,6 +107,8 @@ private:
     QComboBox* profileCombo = nullptr;
     QPushButton* profileSaveBtn = nullptr;
     QPushButton* passBtn = nullptr;
+    QDoubleSpinBox* skinStructureBox = nullptr;
+    QCheckBox* autoMaskBox = nullptr;
     QPushButton* captureBtn = nullptr;
     QPushButton* browseRunnerBtn = nullptr;
     QToolButton* gearBtn = nullptr;
