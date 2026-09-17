@@ -85,6 +85,9 @@ struct FrameSettings {
     // The channel order the crossing surfaces carry. See ProxyChannelOrder.
     uint32_t proxySwizzle = kProxyRgbaOrder;
 
+    // 1..3, an RGB residual gain applied after colour restoration. 1 is off. See selfLayersBits.
+    float selfLayers = 1.0f;
+
 
     static FrameSettings Read(const ShmHeader* h);
 };

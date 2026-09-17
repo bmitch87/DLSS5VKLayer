@@ -211,6 +211,10 @@ struct alignas(256) DlssNrConstants
     // 1: the crossing surfaces carry BGRA rather than RGBA. See ProxySwizzle in dlssnr.hlsl.
     uint32_t ProxySwizzle;
 
+    // 1..3: repeat the composed change as an RGB residual gain, after colour restoration. 1 is off
+    // and is the shipped picture. The second arm of the disagreement documented in dlssnr.hlsl.
+    float SelfLayers;
+
 
 };
 

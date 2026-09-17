@@ -128,6 +128,12 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
 
         s.proxySwizzle = h->proxySwizzle.load() != 0 ? kProxyBgraOrder : kProxyRgbaOrder;
 
+        // Below 1 would shrink the composed change through a path that is not meant to be a
+        // strength -- detail strength is that control -- so the floor is 1, which is off.
+        s.selfLayers = BitsToFloat(h->selfLayersBits.load());
+        if (!std::isfinite(s.selfLayers) || s.selfLayers < 1.0f) s.selfLayers = 1.0f;
+        if (s.selfLayers > 3.0f) s.selfLayers = 3.0f;
+
         s.colourTrust = float(h->colourTrustPercent.load()) / 100.0f;
         static const int forcedCt = [] {
             const char* v = getenv("DLSSNR_COLOUR_TRUST");
@@ -1219,6 +1225,7 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     c.GlowGain = s.glowGain;
     c.Reconstruct = s.reconstruct;
     c.ProxySwizzle = s.proxySwizzle;
+    c.SelfLayers = s.selfLayers;
     return c;
 }
 

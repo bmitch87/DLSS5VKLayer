@@ -37,7 +37,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 27;
+static constexpr uint32_t kShmVersion = 28;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -710,6 +710,19 @@ struct ShmHeader {
     // raster change and on the GPU; nobody has reported hitting this, and a detector for a problem
     // no one has reported is a second thing that can be wrong.
     std::atomic<uint32_t> proxySwizzle;
+
+    // 1..3: repeat the composed change as an RGB residual gain, after colour restoration. 1 is off,
+    // and off is the picture this project has always produced.
+    //
+    // An open disagreement, carried as a control rather than settled by argument. Our own shader
+    // states, in a comment, that extrapolating past the model's picture makes the channels spread
+    // apart faster than luminance does and that "a lit face at strength 2 clips to white" -- and
+    // routes strength above 1 into the luminance ratio instead, where the highlight guard can bound
+    // it. A shipping project does the extrapolation anyway, up to 3, as a user control.
+    //
+    // Both are falsifiable and neither side has a picture. This is the second arm, so somebody can
+    // take one: put the two side by side on a lit face and see which comment needs correcting.
+    std::atomic<uint32_t> selfLayersBits;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -725,7 +738,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 2132, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2136, "the header layout changed -- bump kShmVersion");
 
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
@@ -866,6 +879,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->glowGainBits.store(FloatToBits(1.0f));
     h->reconstructFilter.store(kReconstructBilinear);
     h->proxySwizzle.store(kProxyRgbaOrder);
+    h->selfLayersBits.store(FloatToBits(1.0f));
     h->intensityBits.store(FloatToBits(1.0f));
     h->localToneBits.store(FloatToBits(1.0f));
     h->localStructureBits.store(FloatToBits(1.0f));

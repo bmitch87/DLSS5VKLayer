@@ -83,6 +83,8 @@ const Setting kSettings[] = {
     { "whitepointtrim", &ShmHeader::whitePointTrimBits, true, "multiplier on a measured white point" },
     { "workingscale", &ShmHeader::workingScaleBits, true,
       "the fraction of the frame the model works at; above 1 there are no extra samples to find" },
+    { "selflayers", &ShmHeader::selfLayersBits, true,
+      "1-3, repeat the composed change as a gain on its difference from the frame; 1 is off" },
     { "swizzle", &ShmHeader::proxySwizzle, false,
       "channel order the model is handed: 0 rgba, 1 bgra" },
     { "reconstruct", &ShmHeader::reconstructFilter, false,

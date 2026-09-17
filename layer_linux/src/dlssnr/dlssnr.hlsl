@@ -38,7 +38,8 @@ cbuffer Params : register(b0)
     float gShadowGain;     // how much of the model's DARKENING reaches the frame. 1 = all of it
     float gGlowGain;       // how much of its BRIGHTENING reaches the frame. 1 = all of it
     uint  gReconstruct;    // how the model's answer is enlarged when it ran small. See SampleRecon.
-    uint  gProxySwizzle;   // 1: the crossing surfaces carry BGRA rather than RGBA. See ProxyOut.
+    uint  gProxySwizzle;   // 1: the crossing surfaces carry BGRA rather than RGBA. See ProxySwizzle.
+    float gSelfLayers;     // 1..3: repeat the composed change as an RGB residual gain. 1 = off.
 
 
 };
@@ -1251,6 +1252,22 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         //
         // Strength above 1 is carried below instead, as an amplification of the luminance ratio,
         // which the guard does bound.
+        //
+        // The claim has now been tested once and NOT settled, which is worth recording so nobody
+        // thinks it was. gSelfLayers (added as the opposing arm; see its block near the end of the
+        // resolve) was swept 1, 2, 3 on one held vkcube frame, four captured pairs each:
+        //
+        //     selfLayers 1   PSNR 32.21 dB   max channel 0.9111   pixels at/over 1.0: 0
+        //     selfLayers 2                   max channel 0.8667   pixels at/over 1.0: 0
+        //     selfLayers 3   PSNR 22.74 dB   max channel 0.8223   pixels at/over 1.0: 0
+        //
+        // The edit gets much stronger and clips at NEITHER end -- and the maximum channel falls as
+        // the gain rises, because this content's edit is predominantly darkening, which the
+        // directional-gain measurement found independently. Extrapolating a darkening residual
+        // drives pixels away from white, not into it.
+        //
+        // So this is not a refutation. The claim above is about a LIT FACE, where the model
+        // brightens, and vkcube contains nothing of the kind. It stands as written and untested.
         upgraded = lerp(original, HueOkLab(model * ratio, model), saturate(gTransferStrength));
     }
 
@@ -1501,6 +1518,34 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     if (gColourStrength > 1.0)
         result = ClampAp1(FromOkLab(float3(1.0, gColourStrength, gColourStrength) * ToOkLab(max(result, 0.0))));
+
+    // The second arm of a disagreement this shader states in writing a hundred lines above.
+    //
+    // Up there, `upgraded = lerp(original, ..., saturate(gTransferStrength))` saturates on purpose,
+    // and the comment says why: a lerp past 1 extrapolates, walking beyond the only well-formed
+    // picture in the pair, and the channels then spread apart faster than luminance does -- so the
+    // guard, which scales the whole triple by one scalar, corrects the luminance while preserving
+    // the spread. The claim is specific: "a lit face at strength 2 clips to white, and it starts to
+    // show just past 1". Strength above 1 is routed into the luminance ratio instead, where the
+    // guard can bound it.
+    //
+    // A shipping project does the extrapolation anyway, up to 3, as a user control described as
+    // amplifying the effect without another model evaluation. That is a falsifiable claim against a
+    // falsifiable claim, and neither side has a picture.
+    //
+    // So this is their arm, placed where theirs is: AFTER colour restoration. That placement is the
+    // substance, not a detail -- their ComposeLayers calls RestoreColour first, and below a colour
+    // strength of 1 the residual being amplified has already had the model's chroma removed, which
+    // is exactly the "channels spread apart" term our comment names. Their control may therefore be
+    // safe in combination with a colour strength we also have, and unsafe alone. That is the
+    // measurement worth taking, and it is one setting away now.
+    //
+    // Capped at 3 as theirs is, and 1 is off, so the shipped picture is untouched.
+    //
+    // Deliberately before replace mode below: that path discards the composition entirely and hands
+    // back the model's own decoded answer, so there is no composed change there to repeat.
+    if (gSelfLayers > 1.0)
+        result = max(original + (result - original) * min(gSelfLayers, 3.0), 0.0);
 
     // Replace mode: the model's answer IS the picture, decoded through Neutwo's exact inverse, with
     // NONE of the composition above -- no ratio, no highlight guard, no palette blend. This is the

@@ -164,6 +164,7 @@ static const SettingEntry kSettingsTable[] = {
     {"set_shadow_gain", &ShmHeader::shadowGainBits, true},
     {"set_reconstruction_filter", &ShmHeader::reconstructFilter, false},
     {"set_proxy_swizzle", &ShmHeader::proxySwizzle, false},
+    {"set_self_layers", &ShmHeader::selfLayersBits, true},
     {"set_glow_gain", &ShmHeader::glowGainBits, true},
     {"set_sharpness", &ShmHeader::sharpnessBits, true},
     {"set_motion_enabled", &ShmHeader::mvecEnabled, false},
@@ -1699,6 +1700,21 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
         // In the composition group, not the model group. These ask the model for nothing; they
         // decide how much of its answer lands, which is what every other control in this group
         // does. Where a control lives is this project's statement about what it costs.
+        compositionRows << binder->AddFloat(f, "Repeat the change", &ShmHeader::selfLayersBits,
+                       1.0, 3.0, 0.05,
+                       "Applies the composed change again, as a gain on the difference from the "
+                       "frame. 1 is off and is the picture this project has always produced.\n"
+                       "This is an open disagreement carried as a control. The composition shader "
+                       "argues in a comment that extrapolating past the model's picture makes the "
+                       "channels spread apart faster than luminance does, and that a lit face at "
+                       "strength 2 clips to white -- which is why Detail strength above 1 goes into "
+                       "the luminance ratio instead, where the highlight guard can bound it. "
+                       "Another project ships exactly this extrapolation up to 3.\n"
+                       "Neither side has a picture. If you take one, note that it is applied AFTER "
+                       "colour restoration: below a Color strength of 1 the difference being "
+                       "amplified has already had the model's chroma removed, so it may be safe "
+                       "there and unsafe at 1.",
+                       ShmBinder::Live);
         compositionRows << binder->AddFloat(f, "Darkening reaches", &ShmHeader::shadowGainBits,
                        0.0, 4.0, 0.05,
                        "How much of what the model DARKENED reaches the frame.\n"
