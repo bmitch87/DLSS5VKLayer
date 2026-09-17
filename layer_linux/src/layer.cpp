@@ -95,6 +95,35 @@ static bool VerboseEnabled() {
     return v;
 }
 
+// ---------------------------------------------------------------------------
+// Kill switches
+// ---------------------------------------------------------------------------
+// Four things can be wrong when a session hangs or corrupts: our own GPU work in this process, the
+// transport, the helper's evaluate, and the fact that we are hooked into the chain at all. The
+// picture cannot separate them -- gPassthrough and gApplyModel are shader-level, and both still
+// record the whole pass, cross the boundary and evaluate the model, so they bisect the half we can
+// already reason about by looking at the frame.
+//
+// These two bisect the other half, from the outside in. Each is the smallest early-out that exists
+// on the path it cuts, deliberately: a diagnostic with logic of its own is a second thing that can
+// be wrong. None of them is a compatibility mode -- each says so on entry and each leaves the
+// composition off, so a session that "works" with one set has not worked, it has been skipped.
+static bool DryRun() {
+    static const bool v = [] {
+        const char* p = getenv("DLSSNR_DRY_RUN");
+        return p && p[0] == '1';
+    }();
+    return v;
+}
+
+static bool NoRoundTrip() {
+    static const bool v = [] {
+        const char* p = getenv("DLSSNR_NO_ROUNDTRIP");
+        return p && p[0] == '1';
+    }();
+    return v;
+}
+
 static inline double NowMs() {
     return std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -958,7 +987,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         const char* v = getenv("DLSSNR_IDLE_REPAINT");
         return !(v && v[0] == '0');
     }();
-    if (repaintWanted && !dc->inert) {
+    // Not started under DRY_RUN. This thread composes on its own schedule, off the application's
+    // thread entirely, so a switch that only cuts the present path would leave it running -- and
+    // the one place the layer draws without being asked is the last place a bisection should find
+    // a surprise.
+    if (repaintWanted && !dc->inert && !DryRun()) {
         dc->repaintThread = std::thread([dc] {
             while (dc->repaintRun.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -1487,7 +1520,11 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     // or imported leaves that direction on the shared-memory transport, which is the arrangement
     // that shipped before. The flags written below say which surfaces this frame's bytes travel
     // through, and the helper honours them on exactly the frame they were set for.
-    sc.comp->SetDmaBuf(DmaBufEnabled());
+    // Both dma-buf directions are off under NO_ROUNDTRIP: the surfaces they name are the
+    // helper's, and the whole point of the switch is that the helper is not in this frame.
+    // That puts the proxy and the answer back in host memory, where the substitution below
+    // is one memcpy rather than a second GPU path written only for a diagnostic.
+    sc.comp->SetDmaBuf(DmaBufEnabled() && !NoRoundTrip());
 
     if (!sc.comp->Prepare(sc.width, sc.height, sc.format, fs, linearHdr, hdrProxy, hdrTransfer)) {
         Log("[layer] composition cannot run here: %s", sc.comp->Reason());
@@ -1619,7 +1656,25 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     const double tCapture = time ? NowMs() : 0.0;
 
     // ---- the round trip ----
-    if (!ShmProcessFrame(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ModelBytes(),
+    if (NoRoundTrip()) {
+        // The middle rung. Leg 1 recorded, submitted and fenced; leg 2 will record, submit and
+        // compose. Between them, nothing is published, nothing is waited for, and no other process
+        // is involved -- the answer is the proxy itself, so the composition runs over a model that
+        // returned the frame unchanged.
+        //
+        // What survives this is ours: our two legs, the surfaces, the barriers, the compose shader.
+        // What does not survive it is the transport or the helper, and DLSSNR_SKIP_EVALUATE tells
+        // those two apart.
+        static std::once_flag said;
+        std::call_once(said, [] {
+            Log("[layer] DLSSNR_NO_ROUNDTRIP=1: composing from the proxy. The helper is not being "
+                "asked for anything and the model is not running.");
+        });
+        void* answer = sc.comp->ModelPixels();
+        const void* proxy = sc.comp->ProxyPixels();
+        if (!answer || !proxy) return false;
+        if (answer != proxy) std::memcpy(answer, proxy, sc.comp->ModelBytes());
+    } else if (!ShmProcessFrame(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ModelBytes(),
                          sc.comp->ProxyPixels(), sc.comp->ModelPixels(), sc.comp->ProxyActive(),
                          answerViaFd, sc.comp->HdrProxyActive(),
                          /*frameRepeat=*/repaint || fs.holdFrame != 0)) {
@@ -1697,6 +1752,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         lk = std::unique_lock<std::mutex>(dc->lock);
         PollHotkeys(dc);
         if (!ShmNeuralEnabled(dc->shm)) return dc->vkQueuePresentKHR(queue, pPresentInfo);
+        if (DryRun()) {
+            // The bottom rung. The hooks are installed, the mapping is attached, the hotkeys are
+            // polled -- and nothing else happens. No command buffer, no submit, no transport, no
+            // helper.
+            //
+            // If the symptom survives this, it is not ours: what remains is the loader, the hook
+            // itself, and whatever else is in the chain. Nothing under this file's control runs.
+            static std::once_flag said;
+            std::call_once(said, [] {
+                Log("[layer] DLSSNR_DRY_RUN=1: presenting the game's own frames. No capture, no "
+                    "compose, no round trip. Nothing is being enhanced.");
+            });
+            if (dc->shm.hdr) {
+                dc->shm.hdr->layerPid.store(uint32_t(getpid()));
+                dc->shm.hdr->layerCompositionUp.store(0);
+                dc->shm.hdr->layerHeartbeat.fetch_add(1);
+            }
+            return dc->vkQueuePresentKHR(queue, pPresentInfo);
+        }
         uint32_t family = 0;
         auto qit = dc->queueFamilies.find(queue);
         if (qit != dc->queueFamilies.end()) family = qit->second;
@@ -1878,6 +1952,12 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v) {
     std::call_once(announced, [] {
         const char* v = getenv("VKLayer_DLSS5");
         Log("=== %s loaded (VKLayer_DLSS5=%s) ===", VK_LAYER_NAME, v ? v : "(unset)");
+        // Said here as well as at the point of use, because the point of use is inside the present
+        // path and a reader who scrolled past the first frame would never see it. A session run
+        // under one of these is not a session that worked.
+        if (DryRun() || NoRoundTrip())
+            Log("=== kill switches active:%s%s -- this session is NOT enhancing anything ===",
+                DryRun() ? " DLSSNR_DRY_RUN" : "", NoRoundTrip() ? " DLSSNR_NO_ROUNDTRIP" : "");
     });
     return VK_SUCCESS;
 }

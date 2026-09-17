@@ -36,6 +36,26 @@ static int TimeInterval() {
     return v > 0 ? v : 30;
 }
 
+// The helper's half of the kill switches (the layer holds DLSSNR_DRY_RUN and
+// DLSSNR_NO_ROUNDTRIP; see layer_linux/src/layer.cpp).
+//
+// This one cuts between the transport and the model, which is the last division the other two
+// cannot make: NO_ROUNDTRIP removes this process entirely, so a symptom that survives it and
+// disappears here belongs to the DLL, and one that survives both belongs to our Vulkan work in
+// here -- the import, the upload, the format conversion, the readback.
+//
+// The output is left equal to the input, which is the whole chain skipped rather than one pass of
+// it: the passes ping-pong, so an evaluate skipped in the middle would leave a later pass reading a
+// surface nothing wrote. Equal output is also what makes the switch checkable from outside -- the
+// composed frame is the game's own frame, pixel for pixel.
+static bool SkipEvaluate() {
+    static const bool v = [] {
+        const char* p = getenv("DLSSNR_SKIP_EVALUATE");
+        return p && p[0] == '1';
+    }();
+    return v;
+}
+
 static double NowMs() {
     static const LARGE_INTEGER freq = [] {
         LARGE_INTEGER f{};
@@ -3630,7 +3650,7 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     double evalGpuMs = 0.0;   // summed over the chain; -1 readings are not counted
     uint32_t timedPasses = 0;
 
-    for (uint32_t pass = 0; pass < passes; ++pass) {
+    for (uint32_t pass = 0; pass < passes && !SkipEvaluate(); ++pass) {
         // A failed rebuild leaves a hole; the chain runs without that pass rather than losing the
         // frame with it.
         if (!ns.ngx.features[pass]) continue;
@@ -3695,6 +3715,22 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         const double passGpuMs = ReadEvalTimestampMs(ns.vk);
         if (passGpuMs >= 0.0) { evalGpuMs += passGpuMs; ++timedPasses; }
         last = out;
+    }
+    if (SkipEvaluate()) {
+        // The frame as it arrived is the frame that goes back. Everything either side of the
+        // evaluate still runs: the import or upload above, the conversion and readback below, the
+        // sequence handshake, the status. Only the model is absent.
+        //
+        // The GPU cost floor below does not fire on this, and should not: with no evaluate there
+        // are no timestamp samples, and a check that reported "the model is not doing the work"
+        // here would only be repeating the switch back.
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Log("[helper] DLSSNR_SKIP_EVALUATE=1: answering with the frame that came in. The model "
+                "is not running and nothing is being enhanced.");
+        }
+        last = &ns.colorIn;
     }
     ns.mvecResetPending = false;
     ns.firstFrame = false;
@@ -3926,6 +3962,8 @@ int main() {
     // runner-installed handler while the helper is starting.
     InstallGuard();
     Log("=== dlssnr_helper starting ===");
+    if (SkipEvaluate())
+        Log("=== kill switch active: DLSSNR_SKIP_EVALUATE -- the model will not run ===");
     char exePath[MAX_PATH];
     if (GetModuleFileNameA(nullptr, exePath, MAX_PATH) > 0) {
         std::string dir(exePath);

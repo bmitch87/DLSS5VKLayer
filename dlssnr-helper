@@ -152,7 +152,7 @@ detect_install_dir() {
     "/usr/lib/dlssnr" \
     "$bin_dir" \
     "$bin_dir/.."; do
-    if [ -f "$c/helper/dlssnr_helper.exe" ] || [ -f "$c/build/dlssnr_helper.exe" ]; then
+    if [ -f "$c/helper/dlssnr_helper.exe" ] || [ -f "$c/build/dlssnr_helper.exe" ] || [ -f "$c/build/windows/windows/dlssnr_helper.exe" ]; then
       readlink -f "$c"
       return 0
     fi
@@ -170,6 +170,7 @@ detect_helper_exe() {
   for c in \
     "$d/helper/dlssnr_helper.exe" \
     "$d/build/dlssnr_helper.exe" \
+    "$d/build/windows/windows/dlssnr_helper.exe" \
     "/usr/lib64/dlssnr/helper/dlssnr_helper.exe" \
     "/usr/lib/dlssnr/helper/dlssnr_helper.exe" \
     "$HOME/.local/lib/dlssnr/helper/dlssnr_helper.exe"; do
@@ -322,6 +323,7 @@ detect_runner_probe() {
   d="$(detect_install_dir)"
   for c in \
     "$d/build/runner_probe" \
+    "$d/build/native/tools/runner_probe" \
     "$d/runner_probe" \
     "/usr/lib64/dlssnr/bin/runner_probe" \
     "/usr/bin/dlssnr-runner-probe" \
@@ -339,6 +341,7 @@ detect_shmctl() {
   d="$(detect_install_dir)"
   for c in \
     "$d/build/dlssnr-shmctl" \
+    "$d/build/native/tools/dlssnr-shmctl" \
     "$d/bin/dlssnr-shmctl" \
     "$d/dlssnr-shmctl" \
     "/usr/lib64/dlssnr/bin/dlssnr-shmctl" \
@@ -644,7 +647,7 @@ cmd_start() {
   set_prefix_dirs
   mkdir -p "$PREFIX_DIR"
   if running_pid; then
-    echo "helper already running (pid $(cat "$PID_FILE"))"
+    echo "helper already running (pid $(cat "$PID_FILE" 2>/dev/null || true))"
     return 0
   fi
   rm -f "$PID_FILE"
@@ -826,7 +829,7 @@ cmd_start() {
     sleep 0.25
   done
   if running_pid || [ -n "$(helper_pids)" ]; then
-    echo "helper started (pid $(cat "$PID_FILE"))"
+    echo "helper started (pid $(cat "$PID_FILE" 2>/dev/null || true))"
     echo "  runner: $runner_type $runner"
     echo "  prefix: $PREFIX_DIR"
     echo "  shm: $shm"
@@ -868,7 +871,7 @@ cmd_stop() {
   fi
 
   if running_pid; then
-    pid="$(cat "$PID_FILE")"
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
     for _ in $(seq 1 20); do
       kill -0 "$pid" 2>/dev/null || break
@@ -913,7 +916,7 @@ cmd_status() {
   if running_pid || [ -n "$pids" ]; then
     echo "helper running"
     if running_pid; then
-      echo "  runner pid: $(cat "$PID_FILE")"
+      echo "  runner pid: $(cat "$PID_FILE" 2>/dev/null || true)"
     fi
     if [ -n "$pids" ]; then
       echo "  helper pids: $(printf '%s' "$pids" | tr '\n' ' ')"
@@ -1102,6 +1105,25 @@ cmd_doctor() {
 
   nvapi="$(detect_runner_dll nvapi64.dll || true)"
   dxgi="$(detect_runner_dll dxgi.dll || true)"
+
+  # First, because it changes what every line under it means.
+  #
+  # Each kill switch makes the session hand back the game's own picture on purpose, and each is an
+  # environment variable that outlives the bisection it was set for -- left exported in a shell, in
+  # a wrapper script, in a Steam launch option. "It stopped working" and "DLSSNR_DRY_RUN=1 is still
+  # set" look identical from the outside, and nothing else in this report can tell them apart.
+  local kills=""
+  [ "${DLSSNR_DRY_RUN:-0}" = 1 ] && kills="$kills DLSSNR_DRY_RUN"
+  [ "${DLSSNR_NO_ROUNDTRIP:-0}" = 1 ] && kills="$kills DLSSNR_NO_ROUNDTRIP"
+  [ "${DLSSNR_SKIP_EVALUATE:-0}" = 1 ] && kills="$kills DLSSNR_SKIP_EVALUATE"
+  printf 'kill switches:%s\n' "${kills:- none set}"
+  if [ -n "$kills" ]; then
+    echo "  ACTIVE -- the picture is the game's own and nothing is being enhanced."
+    echo "  These are for bisecting a crash. Unset them before judging image quality."
+    ok=1
+  else
+    echo "  ok"
+  fi
 
   printf 'config: %s\n' "$CONFIG_FILE"
   if [ -f "$CONFIG_FILE" ]; then echo "  ok"; else echo "  missing"; ok=1; fi
