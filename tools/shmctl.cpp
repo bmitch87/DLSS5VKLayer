@@ -41,6 +41,8 @@ const Setting kSettings[] = {
     { "preset", &ShmHeader::preset, false, "model preset" },
     { "style", &ShmHeader::style, false, "0 default, 1 natural, 2 cinematic" },
     { "automask", &ShmHeader::autoMask, false, "0/1 automatic skin mask" },
+    { "uicorrection", &ShmHeader::uiCorrection, false,
+      "0/1 tell the model the frame already has the game's UI drawn on it" },
     { "intensity", &ShmHeader::intensityBits, true, "model intensity" },
     { "localtone", &ShmHeader::localToneBits, true, "local tone strength" },
     { "localstructure", &ShmHeader::localStructureBits, true, "local structure strength" },
@@ -190,7 +192,8 @@ bool ApplySetting(ShmHeader* h, const char* name, const char* value) {
         h->controlSeq.fetch_add(1);
         // Anything the model latches when its feature is built also bumps the tuning sequence, which
         // is what tells the helper to rebuild rather than to keep using a feature built with the old
-        // values. Sharpness is absent: it is read at evaluate, so a running feature follows it.
+        // values. Sharpness and uicorrection are absent: the parameter probe shows both being read
+        // at evaluate, so a running feature already follows them and a rebuild would buy nothing.
         static const char* kCreateTime[] = { "preset", "style", "automask", "intensity",
                                              "localtone", "localstructure", "skinstructure", "passes" };
         for (const char* k : kCreateTime) {

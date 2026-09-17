@@ -158,6 +158,7 @@ static const SettingEntry kSettingsTable[] = {
     {"set_local_tone", &ShmHeader::localToneBits, true},
     {"set_skin_structure", &ShmHeader::skinStructureBits, true},
     {"set_auto_mask", &ShmHeader::autoMask, false},
+    {"set_ui_correction", &ShmHeader::uiCorrection, false},
     {"set_sharpness", &ShmHeader::sharpnessBits, true},
     {"set_motion_enabled", &ShmHeader::mvecEnabled, false},
     {"set_motion_quality", &ShmHeader::mvecQuality, false},
@@ -1419,6 +1420,13 @@ QWidget* MainWindow::buildSettings() {
                             ShmBinder::AtCreate);
         connect(autoMaskBox, &QCheckBox::toggled, this, &MainWindow::updateSkinStructureEnabled);
         updateSkinStructureEnabled();
+        binder->AddBool(f, "UI correction", &ShmHeader::uiCorrection,
+                        "Tell the model this frame already has the game's interface drawn on it.\n"
+                        "A real control that was pinned to off in the code until now. Left off by "
+                        "default, which is the behaviour that shipped: other projects default it on, "
+                        "and that is not evidence here, because their pass runs before the game "
+                        "composites its UI and this one runs after it.\n"
+                        "Read every frame, so it takes effect at once and costs no rebuild.");
         binder->AddFloat(f, "Sharpness", &ShmHeader::sharpnessBits, 0.0, 1.0, 0.05,
                          "The one strength the model reads every frame, so it takes effect at once.");
     }

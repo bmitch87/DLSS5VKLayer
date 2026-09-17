@@ -48,6 +48,7 @@ struct NgxSnippet {
 
     // Last values the evaluate contract reported, so it says something only when it changes.
     unsigned int loggedAutoMask = 0xFFFFFFFFu;
+    unsigned int loggedUiCorrection = 0xFFFFFFFFu;
     float loggedMVecScaleX = -1.0f, loggedMVecScaleY = -1.0f;
     bool loggedDepthBound = false;
 
@@ -87,6 +88,10 @@ struct NgxTuning {
     uint32_t style = 0;
     uint32_t preset = 0;
     uint32_t autoMask = 1;
+    // DLSSNR.UICorrection. Read by the DLL at evaluate and never at create, so it is deliberately
+    // absent from the comparison below: changing it must not provoke a rebuild, because the running
+    // feature already follows it.
+    uint32_t uiCorrection = 0;
 
     bool operator==(const NgxTuning& o) const {
         return intensity == o.intensity && localTone == o.localTone &&

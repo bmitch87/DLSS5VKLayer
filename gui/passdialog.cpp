@@ -140,6 +140,15 @@ void PassDialog::buildPage(uint32_t pass, QWidget* page) {
     maskOverride[pass] = addRow("Auto skin mask", kOverrideAutoMask, automask,
                                 [automask] { return automask->isChecked() ? 1u : 0u; }, {});
 
+    auto* uicorr = new QCheckBox("on", page);
+    uicorr->setChecked(pc.uiCorrection.load() != 0);
+    uicorr->setToolTip(FormatTip(
+        "Tell the model this pass's frame already has the game's interface drawn on it. Read every "
+        "frame, so it costs no rebuild."));
+    connect(uicorr, &QCheckBox::toggled, this, [this, pass](bool) { writePass(pass); });
+    addRow("UI correction", kOverrideUiCorrection, uicorr,
+           [uicorr] { return uicorr->isChecked() ? 1u : 0u; }, {});
+
     // Both halves of the resolution move the skin row: the pass's own mask value, and whether the
     // pass names the mask at all -- untick it and the pass follows the global setting instead.
     connect(automask, &QCheckBox::toggled, this, [this, pass] { updateSkinEnabled(pass); });
@@ -184,12 +193,15 @@ void PassDialog::writePass(uint32_t pass) {
             case kOverrideStyle: pc.style.store(v); break;
             case kOverridePreset: pc.preset.store(v); break;
             case kOverrideAutoMask: pc.autoMask.store(v); break;
+            case kOverrideUiCorrection: pc.uiCorrection.store(v); break;
             default: break;
         }
     }
     pc.overrideMask.store(mask);
     hdr->controlSeq.fetch_add(1);
-    // Every one of these is latched when the pass's feature is built, so the helper has to know to
-    // rebuild rather than carry on with a feature made from the old values.
+    // Bumped whatever changed, because this dialog writes a whole pass at once and cannot say which
+    // field moved. The helper decides for itself whether a rebuild is actually owed -- it compares
+    // the resolved tuning by value, and the ones the model reads at evaluate (sharpness, UI
+    // correction) are absent from that comparison, so touching only those costs nothing.
     hdr->tuningSeq.fetch_add(1);
 }

@@ -770,7 +770,6 @@ void NgxSetResources(NgxSnippet& s, const NVSDK_NGX_Resource_VK& color,
     ps &= ParamSetUI(s.params, "DLSS.Indicator.Invert.Y.Axis", 0u, &seh);
     ps &= ParamSetUI(s.params, "DLSSNR.Enabled", 1u, &seh);
     ps &= ParamSetUI(s.params, "DLSSNR.Reset", 1u, &seh);
-    ps &= ParamSetUI(s.params, "DLSSNR.UICorrection", 0u, &seh);
 
     // Style, Intensity, LocalTone, LocalStructure, SkinStructure and UseAutoMask are absent
     // HERE and written per pass by NgxSetEvaluateTuning instead. The distinction is the
@@ -850,6 +849,19 @@ void NgxSetEvaluateTuning(NgxSnippet& s, const NgxTuning& t) {
     ParamSetF(s.params, "DLSSNR.LocalStructureStrength", t.localStructure, &seh);
     ParamSetF(s.params, "DLSSNR.SkinStructureStrength", t.skinStructure, &seh);
     ParamSetUI(s.params, "DLSSNR.UseAutoMask", t.autoMask, &seh);
+    // Was a constant 0 written from NgxSetResources -- the same shape as the UseAutoMask constant
+    // that turned out to be forcing the skin mask off regardless of the setting. The key is real
+    // (the string is in the DLL) and the parameter probe shows it being read at every evaluate, so
+    // the constant was a control with a user on the other end of it and nobody able to reach it.
+    ParamSetUI(s.params, "DLSSNR.UICorrection", t.uiCorrection, &seh);
+    // Read back and reported when it moves, so "I ticked the box" and "the model was told" are two
+    // observable facts rather than one assumption. Only on a change: this runs at every evaluate.
+    if (t.uiCorrection != s.loggedUiCorrection) {
+        unsigned int back = 0xFFFFFFFFu;
+        ParamGetUI(s.params, "DLSSNR.UICorrection", &back, &seh);
+        s.loggedUiCorrection = t.uiCorrection;
+        Log("[params] UICorrection=%u (read back %u)", t.uiCorrection, back);
+    }
 }
 
 // There is no sharpness parameter in this model, so this does nothing and says so once.

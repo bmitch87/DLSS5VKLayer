@@ -37,7 +37,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 22;
+static constexpr uint32_t kShmVersion = 23;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -70,6 +70,7 @@ enum PassOverrideBit : uint32_t {
     kOverridePreset = 1u << 5,
     kOverrideAutoMask = 1u << 6,
     kOverrideSharpness = 1u << 7,
+    kOverrideUiCorrection = 1u << 8,
 };
 
 // Where the white point comes from. The layer has no game exposure texture to read -- it sees a
@@ -216,6 +217,9 @@ struct PassControl {
     std::atomic<uint32_t> style;
     std::atomic<uint32_t> preset;
     std::atomic<uint32_t> autoMask;
+    // DLSSNR.UICorrection. Appended to this struct rather than inserted, so every field above keeps
+    // the offset it had; the pass array is what moves, and the version below moves with it.
+    std::atomic<uint32_t> uiCorrection;
 };
 
 // A pass's settings after the global values and its own overrides have been merged. Plain floats:
@@ -229,10 +233,19 @@ struct PassTuning {
     uint32_t style = 0;
     uint32_t preset = 0;
     uint32_t autoMask = 1;
+    // Whether the model is told the frame it is looking at already has interface drawn on it.
+    //
+    // Default 0, which is what this code has always written as a constant. NOT what every other
+    // project defaults it to -- their filter runs before the game composites its UI, ours runs after
+    // it, so their default is an answer to a different question and is not evidence for ours.
+    uint32_t uiCorrection = 0;
 
     bool SameCreateParams(const PassTuning& o) const {
         // Everything the model latches when its feature is built. Sharpness is absent because it is
         // read at evaluate, and so is the only one of these a running feature will actually follow.
+        // uiCorrection is absent for the same reason as sharpness: the parameter probe shows the DLL
+        // reading DLSSNR.UICorrection at evaluate and never at create, so a change to it is followed
+        // by the running feature and must not cost a rebuild.
         return intensity == o.intensity && localTone == o.localTone && localStructure == o.localStructure &&
                skinStructure == o.skinStructure && style == o.style && preset == o.preset && autoMask == o.autoMask;
     }
@@ -563,6 +576,18 @@ struct ShmHeader {
     // passed straight through, because the denominator is what the game asked the display for.
     std::atomic<uint32_t> layerPresentsLo;
     std::atomic<uint32_t> layerPresentsHi;
+
+    // DLSSNR.UICorrection: tell the model this frame already has interface composited onto it.
+    //
+    // A real key -- the string is in nvngx_dlssnr.dll and the parameter probe shows the DLL reading
+    // it at every evaluate -- which this code has written as a hard 0 since it was added, the same
+    // shape as the UseAutoMask constant that turned out to be forcing the skin mask off. A constant
+    // written to a key the model reads is a control, just one nobody can reach.
+    //
+    // Default 0, the behaviour that shipped. Other projects default it ON, and that is not evidence
+    // for us: their pass runs before the game composites its UI and ours runs after, so "is there
+    // interface in this picture" has opposite answers.
+    std::atomic<uint32_t> uiCorrection;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -578,13 +603,13 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1980, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2104, "the header layout changed -- bump kShmVersion");
 
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, pass) == 780, "layout changed -- bump kShmVersion");
-static_assert(offsetof(ShmHeader, mvecEnabled) == 1860, "layout changed -- bump kShmVersion");
+static_assert(offsetof(ShmHeader, mvecEnabled) == 1980, "layout changed -- bump kShmVersion");
 
 inline uint32_t FloatToBits(float f) {
     uint32_t u = 0;
@@ -709,6 +734,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->passes.store(1);
     h->enabled.store(1);
     h->autoMask.store(1);
+    h->uiCorrection.store(0);
     h->intensityBits.store(FloatToBits(1.0f));
     h->localToneBits.store(FloatToBits(1.0f));
     h->localStructureBits.store(FloatToBits(1.0f));
@@ -763,6 +789,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
         h->pass[i].style.store(0);
         h->pass[i].preset.store(0);
         h->pass[i].autoMask.store(1);
+        h->pass[i].uiCorrection.store(0);
     }
 }
 
@@ -792,6 +819,7 @@ inline PassTuning ShmResolvePass(const ShmHeader* h, uint32_t pass) {
     t.style = h->style.load();
     t.preset = h->preset.load();
     t.autoMask = h->autoMask.load();
+    t.uiCorrection = h->uiCorrection.load();
 
     if (pass >= kMaxPasses) return t;
     const uint32_t mask = h->pass[pass].overrideMask.load();
@@ -804,6 +832,7 @@ inline PassTuning ShmResolvePass(const ShmHeader* h, uint32_t pass) {
     if (mask & kOverrideStyle) t.style = h->pass[pass].style.load();
     if (mask & kOverridePreset) t.preset = h->pass[pass].preset.load();
     if (mask & kOverrideAutoMask) t.autoMask = h->pass[pass].autoMask.load();
+    if (mask & kOverrideUiCorrection) t.uiCorrection = h->pass[pass].uiCorrection.load();
     return t;
 }
 

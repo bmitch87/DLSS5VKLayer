@@ -3129,6 +3129,7 @@ static NgxTuning TuningFor(const ShmHeader* h, uint32_t pass) {
     // measured instead.
     t.preset = p.preset;
     t.autoMask = p.autoMask ? 1u : 0u;
+    t.uiCorrection = p.uiCorrection ? 1u : 0u;
     return t;
 }
 
