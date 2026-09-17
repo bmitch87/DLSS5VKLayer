@@ -25,6 +25,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "../../common/breadcrumbs.h"
+#include "../../common/frame_trace.h"
 #include "../../common/shm_protocol.h"
 #include "composition.h"
 #include "hotkey.h"
@@ -90,6 +92,76 @@ static int TimeInterval() {
 static bool VerboseEnabled() {
     static const bool v = [] {
         const char* p = getenv("DLSSNR_VERBOSE");
+        return p && p[0] == '1';
+    }();
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Kill switches
+// ---------------------------------------------------------------------------
+// Four things can be wrong when a session hangs or corrupts: our own GPU work in this process, the
+// transport, the helper's evaluate, and the fact that we are hooked into the chain at all. The
+// picture cannot separate them -- gPassthrough and gApplyModel are shader-level, and both still
+// record the whole pass, cross the boundary and evaluate the model, so they bisect the half we can
+// already reason about by looking at the frame.
+//
+// These two bisect the other half, from the outside in. Each is the smallest early-out that exists
+// on the path it cuts, deliberately: a diagnostic with logic of its own is a second thing that can
+// be wrong. None of them is a compatibility mode -- each says so on entry and each leaves the
+// composition off, so a session that "works" with one set has not worked, it has been skipped.
+static bool DryRun() {
+    static const bool v = [] {
+        const char* p = getenv("DLSSNR_DRY_RUN");
+        return p && p[0] == '1';
+    }();
+    return v;
+}
+
+static bool NoRoundTrip() {
+    static const bool v = [] {
+        const char* p = getenv("DLSSNR_NO_ROUNDTRIP");
+        return p && p[0] == '1';
+    }();
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Breadcrumbs
+// ---------------------------------------------------------------------------
+// One ring for the process rather than one per device. The thing being diagnosed is a thread that
+// stopped, and a thread presents on one device at a time; a second device's crumbs interleaving is
+// itself worth seeing, which a per-device ring would hide.
+static dlssnr::Breadcrumbs g_crumbs;
+
+// The frame trace, off unless DLSSNR_TRACE=1. See common/frame_trace.h -- the breadcrumbs answer
+// "where did it stop", this answers "what did the last few minutes look like", and neither
+// substitutes for the other.
+static dlssnr::FrameTrace g_trace;
+
+static void DumpCrumbs(const char* why) {
+    Log("[crumbs] %s -- last steps on the present path, newest first:", why);
+    bool any = false;
+    g_crumbs.Dump([&](const char* stage, uint32_t detail, double ageMs) {
+        any = true;
+        Log("[crumbs]   %-15s %8u  %9.2f ms ago", stage, detail, ageMs);
+    });
+    if (!any) Log("[crumbs]   (nothing recorded)");
+}
+
+// GPU-side checkpoints, off unless asked for.
+//
+// The CPU ring says which step this process was standing on. It cannot say where the GPU was, and
+// on a DEVICE_LOST that is the question -- the command buffer was submitted, the call returned,
+// and the work died somewhere inside it. VK_NV_device_diagnostic_checkpoints answers exactly that:
+// markers recorded into the stream, read back per queue after the loss.
+//
+// Off by default because it is not free the way the CPU ring is: each marker is a real command in
+// the buffer, the extension has to be added to the device, and neither has been measured on the
+// present path here. Switched on by DLSSNR_CHECKPOINTS=1, which is also what adds the extension.
+static bool CheckpointsEnabled() {
+    static const bool v = [] {
+        const char* p = getenv("DLSSNR_CHECKPOINTS");
         return p && p[0] == '1';
     }();
     return v;
@@ -333,7 +405,8 @@ static bool DmaBufEnabled() {
 }
 
 static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, const void* proxy,
-                          void* modelOut, bool proxyInRegion, bool answerFromFd, bool hdrEncode) {
+                          void* modelOut, bool proxyInRegion, bool answerFromFd, bool hdrEncode,
+                          bool frameRepeat) {
     if (s.dead) return false;
     if (!ShmOpen(s)) { s.dead = true; return false; }
     if (w > kMaxW || h > kMaxH || w < kMinW || h < kMinH) return false;
@@ -354,6 +427,9 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
     // Say what the bytes ARE before announcing them: the helper sizes its read by this, never by
     // what it hopes the layer has switched to. The release fence below covers it like the pixels.
     s.hdr->hdrEncode.store(hdrEncode ? 1u : 0u);
+    // And whether these are the same pixels as last time. Same placement and the same
+    // reason: it describes the bytes, so it is published by the statement announcing them.
+    s.hdr->frameRepeat.store(frameRepeat ? 1u : 0u);
     uint32_t req = s.hdr->seq_req.load() + 1;
     // The release pairs with the helper's acquire on seq_resp: everything this process wrote --
     // the proxy, whether by the GPU into the imported region or by the memcpy above -- is visible
@@ -361,6 +437,7 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
     // by leg 1's vkWaitForFences; this fence covers the host-visible ordering across processes.)
     std::atomic_thread_fence(std::memory_order_release);
     s.hdr->seq_req.store(req);
+    g_crumbs.Drop("HandoffWrite", req);
 
     // How long this frame may wait, which is a question about whether anyone is listening.
     //
@@ -382,6 +459,7 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
 
     // Wait for the helper (fail-open: present the original frame on timeout).
     const double tSignal = NowMs();
+    g_crumbs.Drop("HelperWait", req);
     for (;;) {
         if (s.hdr->seq_resp.load() >= req) {
             s.timeouts = 0;
@@ -425,6 +503,9 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
             "(seq_req=%u seq_resp=%u heartbeat=%u)",
             budgetMs, helperPresent ? "is present but silent" : "not running",
             s.hdr->seq_req.load(), s.hdr->seq_resp.load(), s.hdr->heartbeat.load());
+        // The one place where the crumbs name the OTHER process: everything here is ours and
+        // finished on time, which is the evidence that the helper is where it stopped.
+        DumpCrumbs("the helper stopped answering");
     }
     return false;
 }
@@ -547,11 +628,54 @@ struct DeviceChain {
     ShmMap shm;
     uint64_t framesComposed = 0;
     uint64_t framesPassedThrough = 0;
+    // Every present that reached the hook on this device, composed or not. The denominator for
+    // every per-frame number the header publishes; see layerPresents in common/shm_protocol.h.
+    uint64_t presentsSeen = 0;
+    // The queue the last present came in on, so the DEVICE_LOST path has something to ask for
+    // checkpoints. Atomic because NoteVk can be reached from the repaint thread as well.
+    std::atomic<VkQueue> lastQueue{VK_NULL_HANDLE};
     // Phase 5: the dma-buf exchange. The export sequences last imported; a new sequence means the
     // image behind the descriptor changed and the reference is taken again.
     uint32_t proxySeqSeen = 0;
     uint32_t answerSeqSeen = 0;
 };
+
+// A marker into the command stream, at the same points as the CPU crumbs above.
+//
+// The marker is the same string literal the crumb used, so a dump reads as one path rather than
+// two: the CPU line says where this thread stopped, the checkpoint says where the GPU was when the
+// device died. Passing the literal's address is what the extension asks for -- it hands the pointer
+// back untouched, so anything with static lifetime works and nothing has to be allocated or freed
+// on a path that is already failing.
+static inline void Checkpoint(DeviceChain* dc, VkCommandBuffer cb, const char* marker) {
+    if (dc->table.vkCmdSetCheckpointNV) dc->table.vkCmdSetCheckpointNV(cb, (const void*) marker);
+}
+
+// After a lost device, ask each queue what it had reached.
+//
+// VK_ERROR_DEVICE_LOST from a submit or a wait says the work died; it does not say which work. This
+// is the only call in Vulkan that answers that, and it is valid precisely in the state where
+// nothing else is -- the driver keeps the markers alive across the loss on purpose.
+static void DumpCheckpoints(DeviceChain* dc, VkQueue queue) {
+    if (!dc->table.vkGetQueueCheckpointDataNV || queue == VK_NULL_HANDLE) {
+        if (CheckpointsEnabled())
+            Log("[checkpoints] unavailable (the device did not enable "
+                "VK_NV_device_diagnostic_checkpoints)");
+        return;
+    }
+    uint32_t n = 0;
+    dc->table.vkGetQueueCheckpointDataNV(queue, &n, nullptr);
+    if (!n) { Log("[checkpoints] the queue reported none"); return; }
+    std::vector<VkCheckpointDataNV> data(n);
+    for (auto& d : data) d.sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+    dc->table.vkGetQueueCheckpointDataNV(queue, &n, data.data());
+    Log("[checkpoints] %u marker(s) the GPU had reached:", n);
+    for (uint32_t i = 0; i < n; ++i) {
+        const char* marker = (const char*) data[i].pCheckpointMarker;
+        Log("[checkpoints]   stage=0x%08x %s", (unsigned) data[i].stage,
+            marker ? marker : "(null)");
+    }
+}
 
 static std::unordered_map<VkInstance, InstanceChain> g_instances;
 static std::unordered_map<VkPhysicalDevice, InstanceChain*> g_phys;
@@ -829,7 +953,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
                                               VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
                                               VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
                                               // The repaint's, for handing an image back unpresented.
-                                              VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME };
+                                              VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
+                                              // Breadcrumbs for the GPU, under DLSSNR_CHECKPOINTS=1
+                                              // only -- see CheckpointsEnabled.
+                                              VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME };
     constexpr size_t kWantCount = sizeof(kWantExts) / sizeof(kWantExts[0]);
     constexpr size_t kExternalMemoryFd = 1;
     const VkDeviceCreateInfo* effective = pCreateInfo;
@@ -853,6 +980,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         for (size_t k = 0; k < kWantCount; ++k) {
             if (!ic->surfaceMaintenance1 &&
                 !std::strcmp(kWantExts[k], VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME))
+                continue;
+            // Asked for only when someone asked for it. Every other extension in this list buys a
+            // transport or a present path; this one buys evidence, and it puts a real command in
+            // the buffer at every marker to do so.
+            if (!CheckpointsEnabled() &&
+                !std::strcmp(kWantExts[k], VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME))
                 continue;
             if (!available[k] || enabled[k]) continue;
             // VK_EXT_external_memory_dma_buf requires this device extension.
@@ -908,6 +1041,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 #undef X
     dc->table.next_dpa = next_dpa;
     dc->table.Load(*pDevice);
+    if (CheckpointsEnabled())
+        Log("[checkpoints] DLSSNR_CHECKPOINTS=1: markers %s on this device. Measured at about "
+            "+0.22 ms per round trip here, which is why they are not on by default.",
+            dc->table.vkCmdSetCheckpointNV ? "are being recorded"
+                                           : "are NOT available (the device refused the extension)");
     dc->releaseImages = addedSwapMaint && dc->vkReleaseSwapchainImagesEXT != nullptr;
     if (!dc->vkQueuePresentKHR || !dc->vkCreateSwapchainKHR || !ic) dc->inert = true;
 
@@ -954,7 +1092,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         const char* v = getenv("DLSSNR_IDLE_REPAINT");
         return !(v && v[0] == '0');
     }();
-    if (repaintWanted && !dc->inert) {
+    // Not started under DRY_RUN. This thread composes on its own schedule, off the application's
+    // thread entirely, so a switch that only cuts the present path would leave it running -- and
+    // the one place the layer draws without being asked is the last place a bisection should find
+    // a surprise.
+    if (repaintWanted && !dc->inert && !DryRun()) {
         dc->repaintThread = std::thread([dc] {
             while (dc->repaintRun.load(std::memory_order_relaxed)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -1166,6 +1308,10 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
     }
     if (dc->vkDestroyDevice) dc->vkDestroyDevice(device, pAllocator);
     delete dc;
+    // The trace, written once and here: this is the last moment a layer reliably reaches in a
+    // process it does not own. Nothing is written per frame -- the point of the ring is that the
+    // recording costs nothing on disk until the session is over.
+    if (const char* path = g_trace.Write()) Log("[trace] wrote %s", path);
 }
 
 static DeviceChain* FindDevice(VkDevice device) {
@@ -1372,16 +1518,33 @@ static bool CreateResources(DeviceChain* dc, SwapchainState& sc, uint32_t family
 //
 // Losing the device also latches the layer inert, because after that point the fail-open path is the
 // only correct one and it costs nothing to take it directly.
+static void DumpCheckpoints(DeviceChain* dc, VkQueue queue);
+
 static bool NoteVk(DeviceChain* dc, VkResult r, const char* what) {
     if (r == VK_SUCCESS) return true;
     if (r == VK_ERROR_DEVICE_LOST) {
-        if (!dc->inert.exchange(true)) Log("[layer] %s -> DEVICE_LOST; layer inert for this device", what);
+        if (!dc->inert.exchange(true)) {
+            Log("[layer] %s -> DEVICE_LOST; layer inert for this device", what);
+            DumpCrumbs("device lost");
+            DumpCheckpoints(dc, dc->lastQueue.load(std::memory_order_relaxed));
+        }
         return false;
     }
     static std::atomic<uint32_t> reported{0};
-    if (reported.fetch_add(1) < 8) Log("[layer] %s -> %d", what, (int) r);
+    if (reported.fetch_add(1) < 8) {
+        if (r == VK_TIMEOUT) Log("[layer] %s -> TIMEOUT", what);
+        else Log("[layer] %s -> %d", what, (int) r);
+    }
     return false;
 }
+
+// Long enough that a slow part running a long pass chain at 4K is never cut off, short
+// enough that a driver which has stopped without losing the device does not park the
+// game's present thread for the rest of the session. A lost device already returns
+// VK_ERROR_DEVICE_LOST from the wait rather than hanging, so this covers the other case:
+// a stall with no result to report, which NoteVk could never see because the call never
+// returned.
+static constexpr uint64_t kFenceBudgetNs = 5ull * 1000ull * 1000ull * 1000ull;
 
 // Returns true if the swapchain image now holds the composed frame.
 //
@@ -1413,7 +1576,13 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     // than at the end of that frame keeps the game thread out of the GPU's way for the whole of the
     // helper's round trip. The capture pair that compose recorded lands with it.
     if (sc.leg2Pending) {
-        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fenceLeg2, VK_TRUE, UINT64_MAX),
+        g_crumbs.Drop("Leg2Wait");
+        dlssnr::TraceScope t(g_trace, "Leg2Wait");
+        // Bounded: on a timeout leg2Pending stays set, so the next present waits again
+        // rather than touching surfaces that compose may still be reading. Giving up for
+        // one frame is the fail-open path -- the game's own image is presented -- and the
+        // wait is retried until it succeeds or the device is lost.
+        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &sc.fenceLeg2, VK_TRUE, kFenceBudgetNs),
                     "vkWaitForFences(leg2)"))
             return false;
         dc->vkResetFences(d, 1, &sc.fenceLeg2);
@@ -1422,6 +1591,12 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     }
 
     dlssnr::FrameSettings fs = dlssnr::FrameSettings::Read(dc->shm.hdr);
+    // "Hold the next frame": this one is captured fresh, and the hold latches below once it has
+    // actually been through the model. Not consumed by a repaint, which re-composes a picture the
+    // layer already had rather than taking a new one.
+    const bool arming = !repaint && fs.holdFrame == kHoldArm;
+    if (arming) fs.holdFrame = kHoldOff;
+
     // A repaint holds the captured frame, whatever the setting says.
     //
     // Held, the frame is not read back from the swapchain while the encode, the model and the resolve
@@ -1468,7 +1643,11 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     // or imported leaves that direction on the shared-memory transport, which is the arrangement
     // that shipped before. The flags written below say which surfaces this frame's bytes travel
     // through, and the helper honours them on exactly the frame they were set for.
-    sc.comp->SetDmaBuf(DmaBufEnabled());
+    // Both dma-buf directions are off under NO_ROUNDTRIP: the surfaces they name are the
+    // helper's, and the whole point of the switch is that the helper is not in this frame.
+    // That puts the proxy and the answer back in host memory, where the substitution below
+    // is one memcpy rather than a second GPU path written only for a diagnostic.
+    sc.comp->SetDmaBuf(DmaBufEnabled() && !NoRoundTrip());
 
     if (!sc.comp->Prepare(sc.width, sc.height, sc.format, fs, linearHdr, hdrProxy, hdrTransfer)) {
         Log("[layer] composition cannot run here: %s", sc.comp->Reason());
@@ -1566,46 +1745,103 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         return true;
     };
     const auto waitAndReset = [&](VkFence fence) {
-        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences"))
+        const VkResult r = dc->vkWaitForFences(d, 1, &fence, VK_TRUE, kFenceBudgetNs);
+        if (r == VK_TIMEOUT) {
+            // Unlike leg 2's wait, this one cannot just be retried next frame: the command
+            // buffer it covers is the one this function re-begins, and beginning a buffer
+            // that is still executing is undefined. So the swapchain stands down for good
+            // and stops touching that buffer, which lets the in-flight work drain on its
+            // own. Pass-through is the fail-open state the rest of this file already uses.
+            if (!sc.passThrough) {
+                sc.passThrough = true;  // the caller releases the primary claim on seeing this
+                Log("[layer] leg 1 fence did not signal within %llu ms; this swapchain is "
+                    "now pass-through", (unsigned long long)(kFenceBudgetNs / 1000000ull));
+                DumpCrumbs("leg 1 did not signal");
+                DumpCheckpoints(dc, queue);
+            }
             return false;
+        }
+        if (!NoteVk(dc, r, "vkWaitForFences")) return false;
         dc->vkResetFences(d, 1, &fence);
         return true;
     };
 
     // ---- leg 1: the frame the model is shown ----
+    g_crumbs.Drop("Leg1Record");
     if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
+    Checkpoint(dc, cb, "Leg1Record");
     if (!sc.comp->RecordCapture(cb, swapchainImage, fs)) {
         dc->vkEndCommandBuffer(cb);
         return false;
     }
+    Checkpoint(dc, cb, "Leg1Recorded");
     // This one fence is real: the proxy the helper is about to read is written by these commands,
     // and the sequence number must not outrun the pixels it announces.
+    g_crumbs.Drop("Leg1Submit");
     if (!endAndSubmit(sc.fenceLeg1)) return false;
-    if (!waitAndReset(sc.fenceLeg1)) return false;
+    g_crumbs.Drop("Leg1Wait");
+    {
+        dlssnr::TraceScope t(g_trace, "Leg1Wait", sc.comp->ModelWidth(), sc.comp->ModelHeight());
+        if (!waitAndReset(sc.fenceLeg1)) return false;
+    }
     dropWaits();
     sc.comp->ConsumeMeter();
     const double tCapture = time ? NowMs() : 0.0;
 
     // ---- the round trip ----
-    if (!ShmProcessFrame(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ModelBytes(),
-                         sc.comp->ProxyPixels(), sc.comp->ModelPixels(), sc.comp->ProxyActive(),
-                         answerViaFd, sc.comp->HdrProxyActive())) {
-        // Fail-open. Leg 1 already put the image back in PRESENT_SRC_KHR, so the original frame is
-        // what gets presented and nothing else is owed.
-        return false;
+    if (NoRoundTrip()) {
+        // The middle rung. Leg 1 recorded, submitted and fenced; leg 2 will record, submit and
+        // compose. Between them, nothing is published, nothing is waited for, and no other process
+        // is involved -- the answer is the proxy itself, so the composition runs over a model that
+        // returned the frame unchanged.
+        //
+        // What survives this is ours: our two legs, the surfaces, the barriers, the compose shader.
+        // What does not survive it is the transport or the helper, and DLSSNR_SKIP_EVALUATE tells
+        // those two apart.
+        static std::once_flag said;
+        std::call_once(said, [] {
+            Log("[layer] DLSSNR_NO_ROUNDTRIP=1: composing from the proxy. The helper is not being "
+                "asked for anything and the model is not running.");
+        });
+        void* answer = sc.comp->ModelPixels();
+        const void* proxy = sc.comp->ProxyPixels();
+        if (!answer || !proxy) return false;
+        if (answer != proxy) std::memcpy(answer, proxy, sc.comp->ModelBytes());
+    } else {
+        dlssnr::TraceScope t(g_trace, "RoundTrip",
+                             dc->shm.hdr ? dc->shm.hdr->seq_req.load() + 1u : 0u);
+        if (!ShmProcessFrame(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ModelBytes(),
+                             sc.comp->ProxyPixels(), sc.comp->ModelPixels(), sc.comp->ProxyActive(),
+                             answerViaFd, sc.comp->HdrProxyActive(),
+                             /*frameRepeat=*/repaint || fs.holdFrame != 0)) {
+            // Fail-open. Leg 1 already put the image back in PRESENT_SRC_KHR, so the original frame
+            // is what gets presented and nothing else is owed.
+            return false;
+        }
     }
     sc.comp->MarkModelFrame();
+    // The round trip completed, so the frame now sitting in the composition has a real answer
+    // against it. Latch the hold; the next present freezes on this picture.
+    if (arming && dc->shm.hdr) {
+        dc->shm.hdr->holdFrame.store(kHoldOn);
+        dc->shm.hdr->controlSeq.fetch_add(1);
+        Log("[comp] hold armed: holding the frame that just completed a round trip");
+    }
     const double tHelper = time ? NowMs() : 0.0;
 
     // ---- leg 2: the answer, composed back ----
+    g_crumbs.Drop("Leg2Record");
     if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
+    Checkpoint(dc, cb, "Leg2Record");
     if (!sc.comp->RecordCompose(cb, swapchainImage, fs)) {
         dc->vkEndCommandBuffer(cb);
         return false;
     }
+    Checkpoint(dc, cb, "Leg2Recorded");
     // No wait. The present that follows runs on this same queue behind these commands, so the image
     // is composed before it is shown without the CPU ever parking here; the fence is collected at
     // the top of the next frame, where the reused surfaces actually need it.
+    g_crumbs.Drop("Leg2Submit");
     if (!endAndSubmit(sc.fenceLeg2)) return false;
     sc.leg2Pending = true;
     const double tReturn = time ? NowMs() : 0.0;
@@ -1628,6 +1864,17 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
             Log("[time] encode=%.2f helper=%.2f resolve=%.2f total=%.2f ms (model %ux%u)",
                 tCapture - t0, tHelper - tCapture, tReturn - tHelper, tReturn - t0,
                 sc.comp->ModelWidth(), sc.comp->ModelHeight());
+            // How far the measured white point has travelled, which is the precondition for
+            // deciding whether one trim scalar can be right across every scene. See
+            // Composition::ConsumeMeter. Printed beside the timings because that is the line
+            // anybody already leaves on for a long session.
+            float lo = 0.0f, hi = 0.0f, mean = 0.0f;
+            uint64_t n = 0;
+            sc.comp->WhitePointTravel(lo, hi, mean, n);
+            if (n)
+                Log("[white] measured %.4f now, %.4f..%.4f over %llu frames (mean %.4f, span x%.2f)",
+                    sc.comp->MeasuredWhitePoint(), lo, hi, (unsigned long long)n, mean,
+                    lo > 0.0f ? hi / lo : 0.0f);
         }
     }
     return true;
@@ -1649,6 +1896,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
     if (!dc || !dc->vkQueuePresentKHR) return VK_ERROR_INITIALIZATION_FAILED;
     dc->lastPresentMs.store(NowMs(), std::memory_order_relaxed);
 
+    // Counted here and nowhere else: before the enable gate, before the primary claim, before any
+    // decision about this frame. A present the layer declined to touch is still a present the game
+    // made, and it is precisely the ones we decline that make this number differ from layerFrames.
+    ++dc->presentsSeen;
+    if (dc->shm.hdr)
+        ShmStore64(dc->shm.hdr->layerPresentsLo, dc->shm.hdr->layerPresentsHi, dc->presentsSeen);
+    dc->lastQueue.store(queue, std::memory_order_relaxed);
+    g_crumbs.Drop("PresentEnter", uint32_t(dc->presentsSeen));
+    // The outermost event: everything below nests inside it, which is why the analyser must never
+    // sum durations across levels.
+    dlssnr::TraceScope tracePresent(g_trace, "Present", uint32_t(dc->presentsSeen));
+
     // Whether this call's wait semaphores have already been consumed by a submit of ours. They are
     // handed to the first swapchain we actually process; every path after that presents with none,
     // because a semaphore signalled once may only be waited on once. Presenting with them a second
@@ -1664,6 +1923,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         lk = std::unique_lock<std::mutex>(dc->lock);
         PollHotkeys(dc);
         if (!ShmNeuralEnabled(dc->shm)) return dc->vkQueuePresentKHR(queue, pPresentInfo);
+        if (DryRun()) {
+            // The bottom rung. The hooks are installed, the mapping is attached, the hotkeys are
+            // polled and the counters above have already moved -- and nothing else happens. No
+            // command buffer, no submit, no transport, no helper.
+            //
+            // If the symptom survives this, it is not ours: what remains is the loader, the hook
+            // itself, and whatever else is in the chain. Nothing under this file's control runs.
+            static std::once_flag said;
+            std::call_once(said, [] {
+                Log("[layer] DLSSNR_DRY_RUN=1: presenting the game's own frames. No capture, no "
+                    "compose, no round trip. Nothing is being enhanced.");
+            });
+            if (dc->shm.hdr) {
+                dc->shm.hdr->layerPid.store(uint32_t(getpid()));
+                dc->shm.hdr->layerCompositionUp.store(0);
+                dc->shm.hdr->layerHeartbeat.fetch_add(1);
+            }
+            return dc->vkQueuePresentKHR(queue, pPresentInfo);
+        }
         uint32_t family = 0;
         auto qit = dc->queueFamilies.find(queue);
         if (qit != dc->queueFamilies.end()) family = qit->second;
@@ -1704,6 +1982,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
                                                  waitCount, pPresentInfo->pWaitSemaphores,
                                                  /*repaint=*/false, &submittedWaits);
             waitsConsumed = waitsConsumed || submittedWaits;
+            // ProcessPresent stands a swapchain down for good if its leg 1 fence never
+            // signalled. Same reasoning as the CreateResources failure above: a claim
+            // left on a swapchain that no longer drives the channel stops any peer from
+            // taking it over.
+            if (sc.passThrough) ReleasePrimary(dc->self, pPresentInfo->pSwapchains[i]);
             if (!composed) ++dc->framesPassedThrough;
             if (VerboseEnabled()) {
                 Log("[present] swapchain=%p image=%u seq=%u composed=%d",
@@ -1716,21 +1999,32 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         if (TimeEnabled()) {
             static int frameNo = 0;
             if (++frameNo % TimeInterval() == 0) {
-                Log("[layer] composed=%llu passed through=%llu",
+                Log("[layer] presents=%llu composed=%llu passed through=%llu (%.2f presents "
+                    "per round trip)",
+                    (unsigned long long)dc->presentsSeen,
                     (unsigned long long)dc->framesComposed,
-                    (unsigned long long)dc->framesPassedThrough);
+                    (unsigned long long)dc->framesPassedThrough,
+                    dc->framesComposed ? double(dc->presentsSeen) / double(dc->framesComposed) : 0.0);
             }
         }
     }
 
-    if (!waitsConsumed) return dc->vkQueuePresentKHR(queue, pPresentInfo);
+    if (!waitsConsumed) {
+        g_crumbs.Drop("PresentOriginal");
+        const VkResult r = dc->vkQueuePresentKHR(queue, pPresentInfo);
+        g_crumbs.Drop("PresentExit", uint32_t(r));
+        return r;
+    }
 
     // pNext is carried through untouched: present ids, present timing and the rest belong to the
     // caller and none of them are about semaphores.
     VkPresentInfoKHR pi = *pPresentInfo;
     pi.waitSemaphoreCount = 0;
     pi.pWaitSemaphores = nullptr;
-    return dc->vkQueuePresentKHR(queue, &pi);
+    g_crumbs.Drop("PresentOriginal");
+    const VkResult r = dc->vkQueuePresentKHR(queue, &pi);
+    g_crumbs.Drop("PresentExit", uint32_t(r));
+    return r;
 }
 
 static DeviceChain* DeviceForQueue(VkQueue queue) {
@@ -1840,6 +2134,16 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v) {
     std::call_once(announced, [] {
         const char* v = getenv("VKLayer_DLSS5");
         Log("=== %s loaded (VKLayer_DLSS5=%s) ===", VK_LAYER_NAME, v ? v : "(unset)");
+        // Said here as well as at the point of use, because the point of use is inside the present
+        // path and a reader who scrolled past the first frame would never see it. A session run
+        // under one of these is not a session that worked.
+        if (DryRun() || NoRoundTrip())
+            Log("=== kill switches active:%s%s -- this session is NOT enhancing anything ===",
+                DryRun() ? " DLSSNR_DRY_RUN" : "", NoRoundTrip() ? " DLSSNR_NO_ROUNDTRIP" : "");
+        g_trace.Init("layer");
+        if (g_trace.Enabled())
+            Log("=== DLSSNR_TRACE=1: recording a frame trace; it is written when the device is "
+                "destroyed ===");
     });
     return VK_SUCCESS;
 }

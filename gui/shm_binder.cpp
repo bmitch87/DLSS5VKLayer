@@ -10,6 +10,25 @@
 
 #include <cmath>
 
+// The value ShmInitDefaults would put in a field.
+//
+// One scratch header, built once and never written to again, so this costs a couple of kilobytes of
+// static storage and nothing per control. Deliberately NOT the live header: that holds whatever the
+// user last chose, and the question every check below asks is about the defaults.
+uint32_t ShmBinder::DefaultRaw(Field field) const {
+    static const ShmHeader* defaults = [] {
+        auto* h = new ShmHeader{};
+        ShmInitDefaults(h);
+        return h;
+    }();
+    return (defaults->*field).load();
+}
+
+void ShmBinder::NoteDefault(const QString& label, bool ok, const QString& detail) {
+    if (ok) return;
+    _defaultProblems.push_back(label + ": " + detail);
+}
+
 // Each Add* pulls its own value out of the header the moment the control exists, so a control is
 // never showing something the header does not say. Relying on a single Reload() at the end of the
 // panel worked only for as long as nobody added a control after it, which is the kind of ordering
@@ -29,6 +48,10 @@ QCheckBox* ShmBinder::AddBool(QFormLayout* form, const QString& label, Field fie
     auto* w = new QCheckBox(label, _parent);
     w->setToolTip(FormatTip(tip));
     form->addRow(w);
+    const uint32_t def = DefaultRaw(field);
+    NoteDefault(label, def <= 1,
+                QString("bound as a checkbox but its default is %1, which is neither 0 nor 1")
+                    .arg(def));
     connect(w, &QCheckBox::toggled, this, [this, field, latch, invert](bool on) {
         const bool v = invert ? !on : on;
         Write(field, v ? 1u : 0u, latch);
@@ -49,6 +72,9 @@ QSpinBox* ShmBinder::AddInt(QFormLayout* form, const QString& label, Field field
     w->setRange(lo, hi);
     w->setToolTip(FormatTip(tip));
     form->addRow(label, w);
+    const int def = int(DefaultRaw(field));
+    NoteDefault(label, def >= lo && def <= hi,
+                QString("default %1 is outside this control's range %2..%3").arg(def).arg(lo).arg(hi));
     connect(w, QOverload<int>::of(&QSpinBox::valueChanged), this,
             [this, field, latch](int v) { Write(field, uint32_t(v < 0 ? 0 : v), latch); });
     _reloaders.push_back([this, w, field] {
@@ -68,6 +94,10 @@ QDoubleSpinBox* ShmBinder::AddFloat(QFormLayout* form, const QString& label, Fie
     w->setDecimals(step < 0.01 ? 3 : 2);
     w->setToolTip(FormatTip(tip));
     form->addRow(label, w);
+    const double deff = double(BitsToFloat(DefaultRaw(field)));
+    NoteDefault(label, deff >= lo && deff <= hi,
+                QString("default %1 is outside this control's range %2..%3")
+                    .arg(deff).arg(lo).arg(hi));
     connect(w, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
             [this, field, latch](double v) { Write(field, FloatToBits(float(v)), latch); });
     _reloaders.push_back([this, w, field] {
@@ -85,6 +115,10 @@ QComboBox* ShmBinder::AddChoice(QFormLayout* form, const QString& label, Field f
     w->addItems(options);
     w->setToolTip(FormatTip(tip));
     form->addRow(label, w);
+    const uint32_t defc = DefaultRaw(field);
+    NoteDefault(label, defc < uint32_t(options.count()),
+                QString("default index %1 but only %2 choices are offered")
+                    .arg(defc).arg(options.count()));
     connect(w, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this, field, latch](int i) { Write(field, uint32_t(i < 0 ? 0 : i), latch); });
     _reloaders.push_back([this, w, field] {
@@ -105,6 +139,10 @@ QSpinBox* ShmBinder::AddPercent(QFormLayout* form, const QString& label, Field f
     w->setSingleStep(5);
     w->setToolTip(FormatTip(tip));
     form->addRow(label, w);
+    const int defp = int(std::lround(double(BitsToFloat(DefaultRaw(field))) * 100.0));
+    NoteDefault(label, defp >= lo && defp <= hi,
+                QString("default %1%% is outside this control's range %2%%..%3%%")
+                    .arg(defp).arg(lo).arg(hi));
     connect(w, QOverload<int>::of(&QSpinBox::valueChanged), this,
             [this, field, latch](int v) { Write(field, FloatToBits(float(v) / 100.0f), latch); });
     _reloaders.push_back([this, w, field] {

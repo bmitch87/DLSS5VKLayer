@@ -26,6 +26,7 @@
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QDebug>
 #include <QLabel>
 #include <QIcon>
 #include <QLineEdit>
@@ -158,6 +159,13 @@ static const SettingEntry kSettingsTable[] = {
     {"set_local_tone", &ShmHeader::localToneBits, true},
     {"set_skin_structure", &ShmHeader::skinStructureBits, true},
     {"set_auto_mask", &ShmHeader::autoMask, false},
+    {"set_ui_correction", &ShmHeader::uiCorrection, false},
+    {"set_scene_cut_threshold", &ShmHeader::sceneCutThreshold, false},
+    {"set_shadow_gain", &ShmHeader::shadowGainBits, true},
+    {"set_reconstruction_filter", &ShmHeader::reconstructFilter, false},
+    {"set_proxy_swizzle", &ShmHeader::proxySwizzle, false},
+    {"set_self_layers", &ShmHeader::selfLayersBits, true},
+    {"set_glow_gain", &ShmHeader::glowGainBits, true},
     {"set_sharpness", &ShmHeader::sharpnessBits, true},
     {"set_motion_enabled", &ShmHeader::mvecEnabled, false},
     {"set_motion_quality", &ShmHeader::mvecQuality, false},
@@ -336,6 +344,7 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     buttons->addWidget(profileCombo);
     buttons->addWidget(profileSaveBtn);
     root->addLayout(buttons);
+
     connect(profileReloadBtn, &QToolButton::clicked, this, [this] {
         const int idx = profileCombo->currentIndex();
         if (idx > 0) loadSettingsFromFile(profileCombo->itemData(idx).toString());
@@ -781,6 +790,7 @@ void MainWindow::applyDefaults() {
     ShmResetSettings(hdr);
     if (keyCombo) keyCombo->setCurrentIndex(0);
     if (binder) binder->Reload();
+    updateSkinStructureEnabled();
     if (rebuildSpin) {
         QSignalBlocker block(rebuildSpin);
         rebuildSpin->setValue(int(hdr->rebuildSettleMs.load()));
@@ -938,6 +948,7 @@ void MainWindow::loadSettingsFromFile(const QString& path) {
     hdr->tuningSeq.fetch_add(1);
     if (binder) binder->Reload();
     updateCompositionVisibility();
+    updateSkinStructureEnabled();
     lastSettingsBlob = settingsBlob();
     profileBlob = lastSettingsBlob;
     updateReloadBtn();
@@ -1187,6 +1198,46 @@ void MainWindow::maybePromptImport() {
 
 void MainWindow::updateStatus() {
     if (binder) binder->Reload();
+    // Reload blocks signals while it writes, so the mask's toggled() does not fire and the skin row
+    // would stay as the user last left it rather than as the header now reads.
+    updateSkinStructureEnabled();
+    // Whether the chosen model fraction divides the frame the layer is actually presenting.
+    //
+    // KKY-03's point: a non-integer ratio undersamples in the image that FEEDS the model, before
+    // the model has done anything, so it is a cost paid on the way down as well as on the way up.
+    // Which fractions are exact depends on the raster, so this is computed from the live one rather
+    // than from a fixed list -- 50% is exact at 1920 and not at 1921.
+    //
+    // Marked rather than snapped. Snapping would move a value the user chose, and an inexact
+    // fraction is a legitimate thing to ask for once you know that is what you are asking for.
+    if (modelScaleNote && hdr) {
+        const uint32_t w = hdr->layerWidth.load(), h = hdr->layerHeight.load();
+        const double p = double(BitsToFloat(hdr->workingScaleBits.load()));
+        if (!w || !h || p <= 0.0) {
+            modelScaleNote->setText("<span style=\"color:#9e9e9e;\">no frame yet</span>");
+        } else {
+            const uint32_t mw = std::max<uint32_t>(64, uint32_t(std::lround(double(w) * p)));
+            const uint32_t mh = std::max<uint32_t>(64, uint32_t(std::lround(double(h) * p)));
+            const bool exact = mw > 0 && mh > 0 && w % mw == 0 && h % mh == 0;
+            modelScaleNote->setText(
+                QString("<span style=\"color:%1;\">%2x%3 from %4x%5 &mdash; %6</span>")
+                    .arg(exact ? "#43a047" : "#fb8c00")
+                    .arg(mw).arg(mh).arg(w).arg(h)
+                    .arg(exact ? QString("exact (1 model pixel = %1x%2 frame pixels)")
+                                     .arg(w / mw).arg(h / mh)
+                               : QString("not exact &mdash; the model's own input is resampled too")));
+        }
+    }
+
+    if (sceneCutLabel && hdr) {
+        const uint32_t score = hdr->sceneCutScore.load();
+        const uint32_t cuts = hdr->sceneCutCount.load();
+        const uint32_t thr = hdr->sceneCutThreshold.load();
+        sceneCutLabel->setText(
+            thr == 0 ? QString("detector off")
+                     : QString("%1 (threshold %2) - %3 cut%4 this session")
+                           .arg(score).arg(thr).arg(cuts).arg(cuts == 1 ? "" : "s"));
+    }
     // The menu spinbox is not a bound control, so the poll keeps it honest the same way the binder
     // keeps the bound ones honest -- unless the user is mid-edit on it, which is not the moment to
     // overwrite the number under their cursor.
@@ -1258,9 +1309,73 @@ void MainWindow::updateStatus() {
         active ? QString("<span style=\"color:#43a047;\">&#9679; Active</span>")
                : idle ? QString("<span style=\"color:#fb8c00;\">&#9679; Idle</span>")
                       : QString("<span style=\"color:#9e9e9e;\">&#9675; Inactive</span>");
-    statusLabel->setText(QString("Helper: %1&nbsp;&nbsp;&nbsp;%2").arg(state.toHtmlEscaped(), dot));
+    // The model's own cost and how much video memory it is holding. Both have been in the
+    // header for a long time and shown nowhere, and between them they answer the two
+    // questions a screenshot cannot: is the model doing work, and what is it costing. A pass
+    // that evaluates and returns its input unchanged looks identical to a healthy one in
+    // every other number on this window.
+    QString detail;
+    if (active || idle) {
+        const double evalMs = double(BitsToFloat(hdr->helperEvalMsBits.load()));
+        const uint32_t vram = hdr->helperVramMB.load();
+        const uint32_t feats = hdr->helperFeatures.load();
+        if (evalMs > 0.0 || vram) {
+            // "per round trip", not "per frame". The distinction is invisible while the two are
+            // equal and wrong in the flattering direction the moment they are not: a swapchain
+            // passed through, a frame that failed leg 1, or anything downstream generating frames
+            // we never saw all leave presents above round trips, and a cost divided by the frame
+            // rate would then read lower than it is.
+            detail = QString("&nbsp;&nbsp;&nbsp;<span style=\"color:#9e9e9e;\">"
+                             "%1 pass%2 &middot; %3 ms/round trip &middot; %4 MiB</span>")
+                         .arg(feats)
+                         .arg(feats == 1 ? "" : "es")
+                         .arg(evalMs, 0, 'f', 2)
+                         .arg(vram);
+            // And say how far apart they are, but only once they are. Rounding noise on a handful
+            // of frames is not a finding; a persistent ratio above 1.05 is, and it is the only
+            // place the window admits that not every present is a round trip.
+            const quint64 rt = ShmLoad64(hdr->layerFramesLo, hdr->layerFramesHi);
+            const quint64 pres = ShmLoad64(hdr->layerPresentsLo, hdr->layerPresentsHi);
+            if (rt > 0 && pres > rt) {
+                const double ratio = double(pres) / double(rt);
+                if (ratio >= 1.05)
+                    detail += QString("&nbsp;&nbsp;<span style=\"color:#9e9e9e;\">"
+                                      "(%1 presents per round trip)</span>")
+                                  .arg(ratio, 0, 'f', 2);
+            }
+        }
+    }
+    statusLabel->setText(
+        QString("Helper: %1&nbsp;&nbsp;&nbsp;%2%3").arg(state.toHtmlEscaped(), dot, detail));
 
     saveSettingsIfChanged();
+}
+
+// Skin structure follows the auto skin mask.
+//
+// Measured on this model over identical frames: with the mask off, skin strengths of 0, 2 and 4
+// produce byte-identical output, while with it on they separate cleanly and monotonically. The
+// exception is the -1 sentinel, which means "follow local structure" and still takes a different
+// path with the mask off -- so the row is disabled rather than forced, and whatever value is in it
+// is left alone.
+//
+// Same failure class as the UseAutoMask constant this project already fixed: a control that looks
+// live, writes its value all the way to the model, and changes no pixels.
+void MainWindow::updateSkinStructureEnabled() {
+    if (!skinStructureBox || !autoMaskBox) return;
+    const bool on = autoMaskBox->isChecked();
+    skinStructureBox->setEnabled(on);
+    if (!on)
+        skinStructureBox->setToolTip(FormatTip(
+            "Inert while the auto skin mask is off.\n"
+            "Measured: with the mask off, strengths of 0, 2 and 4 give byte-identical output. Turn "
+            "the mask on for this to mean anything."));
+    else
+        skinStructureBox->setToolTip(FormatTip(
+            "-1 follows local structure, which is the model's own default. It is not a strength of "
+            "zero.\n"
+            "Needs the auto skin mask: with the mask off, strengths of 0, 2 and 4 were measured to "
+            "give byte-identical output."));
 }
 
 void MainWindow::updateCompositionVisibility() {
@@ -1315,21 +1430,57 @@ QWidget* MainWindow::buildSettings() {
         binder->AddBool(f, "Enabled", &ShmHeader::enabled,
                         "Run the model at all. Off leaves the game's own frame untouched.");
         binder->AddChoice(f, "Style", &ShmHeader::style, { "Default", "Natural", "Cinematic" },
-                          "The model's own processing profiles.", ShmBinder::AtCreate);
-        binder->AddInt(f, "Preset", &ShmHeader::preset, 0, 15, "The model's own render preset.",
+                          "The model's own processing profiles.\n"
+                          "Three, and only three: styles above Cinematic were swept through this "
+                          "model and produced output identical to Cinematic, so the list is not "
+                          "hiding anything.\n"
+                          "Takes effect on the next frame: measured live on this model.",
+                          ShmBinder::Live);
+        binder->AddInt(f, "Preset", &ShmHeader::preset, 0, 15,
+                       "The model's own render preset.\n"
+                       "The model reads this every time a pass is built -- and on this model build "
+                       "no value from 0 to 15 changed the picture at all. Left at its full range "
+                       "rather than narrowed, because \"read and does nothing here\" is not the "
+                       "same as \"out of range\", and another model may differ.\n"
+                       "The one setting here that really is latched: changing it rebuilds the "
+                       "pass, which takes a moment.",
                        ShmBinder::AtCreate);
+        // Live, all six, measured: see NgxTuning::SameCreateParams. They used to cost a feature
+        // rebuild -- a device-wide stall and a fresh temporal history -- for a value the running
+        // feature was going to read at the next evaluate anyway.
         binder->AddFloat(f, "Intensity", &ShmHeader::intensityBits, 0.0, 4.0, 0.05,
-                         "How hard the model works.", ShmBinder::AtCreate);
-        binder->AddFloat(f, "Local structure", &ShmHeader::localStructureBits, 0.0, 4.0, 0.05, "",
-                         ShmBinder::AtCreate);
-        binder->AddFloat(f, "Local tone", &ShmHeader::localToneBits, 0.0, 4.0, 0.05, "",
-                         ShmBinder::AtCreate);
-        binder->AddFloat(f, "Skin structure", &ShmHeader::skinStructureBits, -1.0, 4.0, 0.05,
-                         "-1 follows local structure, which is the model's own default. It is not a "
-                         "strength of zero.",
-                         ShmBinder::AtCreate);
-        binder->AddBool(f, "Auto skin mask", &ShmHeader::autoMask, "The model's automatic skin mask.",
-                        ShmBinder::AtCreate);
+                         "How hard the model works.\n"
+                         "Takes effect on the next frame.", ShmBinder::Live);
+        binder->AddFloat(f, "Local structure", &ShmHeader::localStructureBits, 0.0, 4.0, 0.05,
+                         "Takes effect on the next frame.", ShmBinder::Live);
+        binder->AddFloat(f, "Local tone", &ShmHeader::localToneBits, 0.0, 4.0, 0.05,
+                         "Takes effect on the next frame.", ShmBinder::Live);
+        skinStructureBox =
+            binder->AddFloat(f, "Skin structure", &ShmHeader::skinStructureBits, -1.0, 4.0, 0.05,
+                             "-1 follows local structure, which is the model's own default. It is not "
+                             "a strength of zero.\n"
+                             "Needs the auto skin mask: with the mask off, strengths of 0, 2 and 4 "
+                             "were measured to give byte-identical output. The mask is what tells the "
+                             "model where skin is, and without it there is nothing for a strength to "
+                             "apply to.\n"
+                             "Takes effect on the next frame.",
+                             ShmBinder::Live);
+        autoMaskBox =
+            binder->AddBool(f, "Auto skin mask", &ShmHeader::autoMask,
+                            "The model's automatic skin mask.\n"
+                            "Also the switch that makes Skin structure mean anything -- see its "
+                            "tooltip.\n"
+                            "Takes effect on the next frame.",
+                            ShmBinder::Live);
+        connect(autoMaskBox, &QCheckBox::toggled, this, &MainWindow::updateSkinStructureEnabled);
+        updateSkinStructureEnabled();
+        binder->AddBool(f, "UI correction", &ShmHeader::uiCorrection,
+                        "Tell the model this frame already has the game's interface drawn on it.\n"
+                        "A real control that was pinned to off in the code until now. Left off by "
+                        "default, which is the behaviour that shipped: other projects default it on, "
+                        "and that is not evidence here, because their pass runs before the game "
+                        "composites its UI and this one runs after it.\n"
+                        "Read every frame, so it takes effect at once and costs no rebuild.");
         binder->AddFloat(f, "Sharpness", &ShmHeader::sharpnessBits, 0.0, 1.0, 0.05,
                          "The one strength the model reads every frame, so it takes effect at once.");
     }
@@ -1345,8 +1496,41 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                            "What fraction of the frame the model works at. The frame itself is never "
                            "reduced.\n"
                            "Below 100% also cuts what crosses shared memory, quadratically.\n"
-                           "Above 100% the model supersamples, which on this transport is expensive: "
-                           "at 200% on a 4K frame it is 132 MB each way, every frame.");
+                           "Above 100% does not supersample in the usual sense and is unlikely to "
+                           "help. Supersampling finds detail by taking MORE samples of the scene; "
+                           "this pass is shown a frame the game has already finished and presented, "
+                           "so there are no further samples anywhere in this architecture to find. "
+                           "Enlarging first only gives the model more pixels carrying the same "
+                           "information.\n"
+                           "It is also expensive: at 200% on a 4K frame the transport carries 132 MB "
+                           "each way, every frame. Treat it as an experiment, not a quality "
+                           "setting.\n"
+                           "The line below says whether this fraction divides the current frame "
+                           "exactly. One that does not makes the model's own input an undersampled "
+                           "picture before the model has done anything, which is a cost paid twice "
+                           "-- once going down and again coming back up.");
+        modelScaleNote = new QLabel("-", col->parentWidget());
+        modelScaleNote->setWordWrap(true);
+        modelScaleNote->setToolTip(FormatTip(
+            "An exact fraction lands every model pixel on a whole number of frame pixels. An "
+            "inexact one resamples on the way down as well as on the way up, so the reconstruction "
+            "filter is not the only thing deciding how the answer looks."));
+        f->addRow("", modelScaleNote);
+        binder->AddChoice(f, "Reconstruction filter", &ShmHeader::reconstructFilter,
+                          { "Bilinear", "Nearest", "Catmull-Rom" },
+                          "How the model's answer is enlarged when it ran below 100%.\n"
+                          "Does nothing at 100%: at the frame's own size every mode lands on texel "
+                          "centres.\n"
+                          "Bilinear is what every build before this one did. Nearest refuses to "
+                          "blend across a disocclusion, where neighbouring cells describe different "
+                          "surfaces. Catmull-Rom sharpens, on the argument that what is enlarged "
+                          "here becomes a residual against the frame rather than a picture in its "
+                          "own right.\n"
+                          "Five projects hold five positions on this and none shipped a "
+                          "measurement. Take one: hold a frame, capture at 100%, then at 50% with "
+                          "each mode, and compare each against the 100% answer with "
+                          "tools/capture_metrics <dir-a> <dir-b>.",
+                          ShmBinder::Live);
         binder->AddChoice(f, "Down-leg filter", &ShmHeader::scalingDownscaler,
                           { "(fsr1, unsupported)", "Bicubic", "Catmull-Rom", "Lanczos2", "Lanczos3",
                             "Kaiser2", "Kaiser3", "Magic" },
@@ -1370,13 +1554,45 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                           "How much of the frame's budget the flow estimate may take.");
         binder->AddChoice(f, "Motion units", &ShmHeader::mvecScaleMode,
                           { "Normalised", "Pixels", "UV 0..1" },
-                          "What the numbers in the field mean to the model.\n"
-                          "Pixels is what the estimate produces; the others are for matching a model "
-                          "that expects them.");
+                          "What the numbers in the motion field mean -- it describes the field, not "
+                          "a preference.\n"
+                          "This project's field is ALWAYS in full-resolution pixels: the estimate "
+                          "produces pixels and the deadzone shader writes pixels. Pixels is "
+                          "therefore the only setting that describes it, and the other two "
+                          "deliberately mis-scale it. They are an A/B tool, not a quality "
+                          "control.\n"
+                          "Kept because they say what a field COULD hold, and the scale they send "
+                          "is now the right way round: a normalised field is scaled by half the "
+                          "frame and a UV field by the whole of it.");
         binder->AddChoice(f, "Motion pixel size", &ShmHeader::mvecPixelSize,
                           { "1 px", "2 px", "4 px", "8 px" },
                           "The optical-flow grid spacing in source-image pixels. Unsupported grids "
-                          "fall back to the nearest grid the GPU can use.");
+                          "fall back to the nearest grid the GPU can use.\n\n"
+                          "Finer is not better here, and it is expensive. Measured on this "
+                          "project's reference card at 1080p, the flow pass alone costs about "
+                          "0.98 ms at 4 px, 2.57 ms at 2 px and 8.24 ms at 1 px -- eight times "
+                          "the cost at the finest setting. NVIDIA's own published comparison "
+                          "finds 1 px is not the highest-quality mode either: on their data a "
+                          "2x2 grid at the slow preset beat a 1x1 grid on every error metric at "
+                          "half the cost.\n\n"
+                          "4 px is the default. Treat 1 px as a diagnostic rather than a "
+                          "quality setting.");
+        binder->AddInt(f, "Scene-cut threshold", &ShmHeader::sceneCutThreshold, 0, 255,
+                       "How different one frame has to be from the last before the pass treats it "
+                       "as a new scene and throws its temporal history away.\n"
+                       "Mean absolute brightness difference over a 64x36 grid, 0-255.\n"
+                       "0 is the default and turns the detector off entirely: it throws the model's "
+                       "history away, and a false positive costs every frame of the run that "
+                       "triggered it while a false negative costs one smeared cut.\n"
+                       "55 is the value to start from if you want it on. The live score below is "
+                       "what it is compared against, so raise the threshold if cuts fire on a pan "
+                       "or a flashing light and lower it until they fire on your content's real "
+                       "cuts.");
+        sceneCutLabel = new QLabel("-", col->parentWidget());
+        sceneCutLabel->setToolTip(FormatTip(
+            "What the last frame actually scored, and how many cuts have fired this session. "
+            "Updates only while a game is presenting; a held or duplicate frame scores 0."));
+        f->addRow("Scene-cut score", sceneCutLabel);
     }
     {
         auto* f = group(col, "Input and precision");
@@ -1391,6 +1607,17 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                           "rather than a preference.\n"
                           "The model has the last word: if it refuses float input the pass falls back "
                           "to 8-bit on its own.");
+        binder->AddChoice(f, "Model channel order", &ShmHeader::proxySwizzle,
+                          { "RGBA", "BGRA" },
+                          "What channel order the model is handed, and expects back.\n"
+                          "RGBA is what every build of this project has sent. Builds of "
+                          "nvngx_dlssnr.dll do not all agree: if yours reads BGRA, the picture comes "
+                          "back with red and blue exchanged.\n"
+                          "Set this rather than reaching for the colour controls -- Color strength "
+                          "and Color bound both assume the model's hue means something, so on a "
+                          "swapped picture they make it worse.\n"
+                          "The swap is applied on the way out and undone on the way in, so only the "
+                          "model sees the difference.");
         binder->AddBool(f, "16-bit SDR intermediates", &ShmHeader::sdr16Multipass,
                         "Keep the images between SDR model passes at 16-bit. Disable to keep them "
                         "8-bit and reduce VRAM and GPU bandwidth use; HDR is always float16.",
@@ -1453,7 +1680,54 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                        "speckling.",
                        ShmBinder::Live);
 
-        compositionRows << binder->AddFloat(f, "Highlight guard", &ShmHeader::maxRatioBits, 1.0, 30.0,
+        // In the composition group, not the model group. These ask the model for nothing; they
+        // decide how much of its answer lands, which is what every other control in this group
+        // does. Where a control lives is this project's statement about what it costs.
+        compositionRows << binder->AddFloat(f, "Repeat the change", &ShmHeader::selfLayersBits,
+                       1.0, 3.0, 0.05,
+                       "Applies the composed change again, as a gain on the difference from the "
+                       "frame. 1 is off and is the picture this project has always produced.\n"
+                       "This is an open disagreement carried as a control. The composition shader "
+                       "argues in a comment that extrapolating past the model's picture makes the "
+                       "channels spread apart faster than luminance does, and that a lit face at "
+                       "strength 2 clips to white -- which is why Detail strength above 1 goes into "
+                       "the luminance ratio instead, where the highlight guard can bound it. "
+                       "Another project ships exactly this extrapolation up to 3.\n"
+                       "Neither side has a picture. If you take one, note that it is applied AFTER "
+                       "colour restoration: below a Color strength of 1 the difference being "
+                       "amplified has already had the model's chroma removed, so it may be safe "
+                       "there and unsafe at 1.",
+                       ShmBinder::Live);
+        compositionRows << binder->AddFloat(f, "Darkening reaches", &ShmHeader::shadowGainBits,
+                       0.0, 4.0, 0.05,
+                       "How much of what the model DARKENED reaches the frame.\n"
+                       "1 is all of it, which is what every build before this did. Below 1 keeps "
+                       "the model's brightening and holds back its shadows -- the answer to \"it "
+                       "looks crushed\".",
+                       ShmBinder::Live);
+        compositionRows << binder->AddFloat(f, "Brightening reaches", &ShmHeader::glowGainBits,
+                       0.0, 4.0, 0.05,
+                       "How much of what the model BRIGHTENED reaches the frame.\n"
+                       "1 is all of it. Below 1 is the answer to \"it looks blown out\": the "
+                       "model's shadow work stays and only the highlights are held back.\n"
+                       "Everything else in this group is symmetric -- the guard, the ratio clamp "
+                       "and the colour bound all treat too far the same way in both directions -- "
+                       "so before these two the only control for either complaint was Detail "
+                       "strength, which turns down the half that was right as well.",
+                       ShmBinder::Live);
+
+        // The minimum is 1.1 and not 1.0. At exactly 1.0 the luminance path is identity by
+        // construction -- addGuard's clamp becomes [1,1], and lift and drop are both
+        // lerp(x, x, t) -- so boundedRatio is 1 everywhere and the model's whole luminance
+        // verdict is divided back out. The slider's own minimum was an off switch for half
+        // the pass, at the end of a control whose other end is 30. Colour still moves at
+        // 1.0 through the colour strength and the OkLab hue path, so it is not a bypass;
+        // it is worse than a bypass, because it looks like a setting.
+        //
+        // dlssnr-shmctl can still set 1.0 deliberately -- "show me the pass with the
+        // luminance bound fully closed" is a legitimate thing to ask for, and a diagnostic
+        // should not be unreachable -- and it says what it is doing when asked.
+        compositionRows << binder->AddFloat(f, "Highlight guard", &ShmHeader::maxRatioBits, 1.1, 30.0,
                                             0.5,
                                             "How far the pass may move the light. A detail pass has "
                                             "no business restyling a light source, whatever the "
@@ -1523,10 +1797,15 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
         binder->AddBool(f, "Apply the model's edit", &ShmHeader::applyModel,
                         "Off keeps the whole pass running and shows the clean frame, so the cost is "
                         "unchanged and only the picture differs.");
-        binder->AddBool(f, "Hold frame", &ShmHeader::holdFrame,
-                        "Freeze the frame the pass works on, so changing a setting re-runs the model "
-                        "and the composition on the same picture.\n"
-                        "The only clean way to compare two settings.");
+        binder->AddChoice(f, "Frame hold", &ShmHeader::holdFrame,
+                          { "Running", "Holding", "Hold next frame" },
+                          "Freeze the frame the pass works on, so changing a setting re-runs the "
+                          "model and the composition on the same picture.\n"
+                          "The only clean way to compare two settings.\n"
+                          "\"Hold next frame\" arms it: the next frame that completes a round trip "
+                          "is captured and then held, and this box returns to Holding by itself. On "
+                          "a moving picture that is the difference between holding the frame you "
+                          "meant and holding the one after you reached for the control.");
         binder->AddChoice(f, "Proxy", &ShmHeader::reversibleMode,
                           { "Soft knee", "Neutwo", "Neutwo, replace", "Hybrid", "Hybrid, replace" },
                           "Which picture the model is shown, and whether its answer is composed onto "
@@ -1625,5 +1904,16 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
     col->addStretch(1);
     binder->Reload();
     updateCompositionVisibility();
+    updateSkinStructureEnabled();
+
+    // Every control has now declared its bounds, so the binder can say whether any of them would
+    // clamp the value ShmInitDefaults puts in its field. A disagreement is quiet and specific --
+    // the window silently rewrites a default the moment it opens, so "reset to defaults" stops
+    // producing the defaults -- and it is exactly the kind of thing three separate tables of
+    // sensible values drift into. Loud, because there is no correct response except to fix it.
+    for (const QString& problem : binder->DefaultProblems())
+        qWarning("dlssnr: control default disagrees with its bounds -- %s",
+                 qUtf8Printable(problem));
+
     return tabs;
 }

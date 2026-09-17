@@ -199,6 +199,22 @@ struct alignas(256) DlssNrConstants
     // How much of the relighting ratio comes from the neighbourhood. See ratioSmoothPercent.
     float RatioSmooth;
 
+    // The directional residual pair: how much of the model's darkening and of its brightening
+    // reaches the frame. Both 1.0 by default, which is every path this shader had before them.
+    float ShadowGain;
+    float GlowGain;
+
+    // How the model's answer is enlarged when it ran below the frame's size: 0 bilinear (what every
+    // build before it did), 1 nearest, 2 Catmull-Rom. See SampleRecon in dlssnr.hlsl.
+    uint32_t Reconstruct;
+
+    // 1: the crossing surfaces carry BGRA rather than RGBA. See ProxySwizzle in dlssnr.hlsl.
+    uint32_t ProxySwizzle;
+
+    // 1..3: repeat the composed change as an RGB residual gain, after colour restoration. 1 is off
+    // and is the shipped picture. The second arm of the disagreement documented in dlssnr.hlsl.
+    float SelfLayers;
+
 
 };
 

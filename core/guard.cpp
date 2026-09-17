@@ -1,5 +1,6 @@
 // Ported from standalone_runner/main.cpp:38-129 (verified fail-closed guard).
 #include "guard.h"
+#include <atomic>
 #include "logging.h"
 #include <csetjmp>
 #include <cstdio>
@@ -33,6 +34,37 @@ static void DescribeRange(uintptr_t addr, const char** outName, unsigned long lo
     *outName = "exe/other"; *outOffset = addr;
 }
 
+static std::atomic<bool> g_ngxFaulted{false};
+
+bool NgxFaulted() { return g_ngxFaulted.load(std::memory_order_relaxed); }
+void NoteNgxFault() { g_ngxFaulted.store(true, std::memory_order_relaxed); }
+
+// Plain atomics rather than a lock: the watcher reads these from another thread while the
+// calling thread may be inside code we cannot debug, and a lock held across an NGX call is
+// exactly the deadlock shape this whole area exists to avoid.
+static std::atomic<unsigned long long> g_ngxCallStart{0};
+static std::atomic<const char*> g_ngxCallWhat{nullptr};
+
+void NgxCallBegin(const char* what) {
+    g_ngxCallWhat.store(what, std::memory_order_relaxed);
+    // Stored last, so a reader never sees a start time with no name attached to it.
+    g_ngxCallStart.store(GetTickCount64(), std::memory_order_release);
+}
+
+void NgxCallEnd() { g_ngxCallStart.store(0, std::memory_order_release); }
+
+unsigned long long NgxCallOutstandingMs() {
+    const unsigned long long t = g_ngxCallStart.load(std::memory_order_acquire);
+    if (!t) return 0;
+    const unsigned long long now = GetTickCount64();
+    return now > t ? now - t : 1;  // never 0 while a call is outstanding
+}
+
+const char* NgxCallName() {
+    const char* n = g_ngxCallWhat.load(std::memory_order_relaxed);
+    return n ? n : "(unknown)";
+}
+
 static LONG WINAPI GuardVeh(EXCEPTION_POINTERS* ep) {
     if (!g_guardActive) return EXCEPTION_CONTINUE_SEARCH;
     // OutputDebugStringA/W raises these under Wine; never treat as a fault.
@@ -41,6 +73,9 @@ static LONG WINAPI GuardVeh(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_CONTINUE_SEARCH;
 
     g_guardCode = ep->ExceptionRecord->ExceptionCode;
+    // One-way and process-wide: this is the fact that outlives the call, the thread and the
+    // 24-hit disarm below. Set before anything else can go wrong on the way out.
+    NoteNgxFault();
     if (++g_guardHits >= 24) { g_guardActive = false; return EXCEPTION_CONTINUE_SEARCH; }
 
     auto* rec = ep->ExceptionRecord;

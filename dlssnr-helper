@@ -152,7 +152,7 @@ detect_install_dir() {
     "/usr/lib/dlssnr" \
     "$bin_dir" \
     "$bin_dir/.."; do
-    if [ -f "$c/helper/dlssnr_helper.exe" ] || [ -f "$c/build/dlssnr_helper.exe" ]; then
+    if [ -f "$c/helper/dlssnr_helper.exe" ] || [ -f "$c/build/dlssnr_helper.exe" ] || [ -f "$c/build/windows/windows/dlssnr_helper.exe" ]; then
       readlink -f "$c"
       return 0
     fi
@@ -170,6 +170,7 @@ detect_helper_exe() {
   for c in \
     "$d/helper/dlssnr_helper.exe" \
     "$d/build/dlssnr_helper.exe" \
+    "$d/build/windows/windows/dlssnr_helper.exe" \
     "/usr/lib64/dlssnr/helper/dlssnr_helper.exe" \
     "/usr/lib/dlssnr/helper/dlssnr_helper.exe" \
     "$HOME/.local/lib/dlssnr/helper/dlssnr_helper.exe"; do
@@ -290,7 +291,14 @@ install_wine_runtime_dll() {
     download_runtime_dll "$name" || return 1
     source="$DATA_DIR/binaries/$name"
   fi
-  cp "$source" "$target"
+  # --remove-destination, not a plain cp: cp follows an existing symlink and writes
+  # to whatever it points at. Wine, Winetricks, Proton and several distro packagings
+  # all leave symlinks in system32, so a plain cp here does not replace the link --
+  # it overwrites a file outside the prefix that the Wine installation or the
+  # distribution owns. This runs on every start with a system-Wine runner.
+  # (cp --remove-destination reported by ComfyUI-NVIDIA-DLSS-Frame-Interpolation,
+  # docs/linux.md:186-190, MIT.)
+  cp --remove-destination "$source" "$target"
   return 0
 }
 
@@ -315,6 +323,7 @@ detect_runner_probe() {
   d="$(detect_install_dir)"
   for c in \
     "$d/build/runner_probe" \
+    "$d/build/native/tools/runner_probe" \
     "$d/runner_probe" \
     "/usr/lib64/dlssnr/bin/runner_probe" \
     "/usr/bin/dlssnr-runner-probe" \
@@ -332,6 +341,7 @@ detect_shmctl() {
   d="$(detect_install_dir)"
   for c in \
     "$d/build/dlssnr-shmctl" \
+    "$d/build/native/tools/dlssnr-shmctl" \
     "$d/bin/dlssnr-shmctl" \
     "$d/dlssnr-shmctl" \
     "/usr/lib64/dlssnr/bin/dlssnr-shmctl" \
@@ -523,13 +533,23 @@ ensure_dxvk_config() {
       dxvk_device="$dev"
     fi
   fi
+  # hideNvidiaGpu belongs in BOTH branches, including the one that used to write an empty
+  # file: DXVK hides the NVIDIA GPU behind an AMD compatibility identity by default, and
+  # DXVK-NVAPI needs DXVK's dxgi.dll to discover the Vulkan device. If the identity is AMD,
+  # that discovery is the step that fails -- and it fails while the log is naming the
+  # NVIDIA card, which is what makes it hard to place. Our own helper renders through
+  # Vulkan rather than D3D12, so this has never been on our critical path; it is on the
+  # path of the component that answers NVAPI for the snippet.
   if [ -n "$ven" ] && [ -n "$dev" ]; then
     cat > "$DXVK_CONFIG_FILE" <<EOF
+dxgi.hideNvidiaGpu = False
 dxgi.customVendorId = $ven
 dxgi.customDeviceId = $dev
 EOF
   else
-    : > "$DXVK_CONFIG_FILE"
+    cat > "$DXVK_CONFIG_FILE" <<EOF
+dxgi.hideNvidiaGpu = False
+EOF
     echo "warning: no NVIDIA GPU detected; DXVK custom IDs are not set" >&2
   fi
 }
@@ -558,7 +578,9 @@ setup_prefix() {
   if [ -n "$dll" ]; then
     mkdir -p "$WINE_PREFIX_DIR/drive_c/windows/system32"
     if [ ! -f "$WINE_PREFIX_DIR/drive_c/windows/system32/vulkan-1.dll" ]; then
-      cp "$dll" "$WINE_PREFIX_DIR/drive_c/windows/system32/vulkan-1.dll"
+      # --remove-destination: see install_wine_runtime_dll. Never write through a
+      # symlink that a prefix we did not create may have left here.
+      cp --remove-destination "$dll" "$WINE_PREFIX_DIR/drive_c/windows/system32/vulkan-1.dll"
     fi
   else
     echo "warning: vendored DXVK vulkan-1.dll not found" >&2
@@ -625,7 +647,7 @@ cmd_start() {
   set_prefix_dirs
   mkdir -p "$PREFIX_DIR"
   if running_pid; then
-    echo "helper already running (pid $(cat "$PID_FILE"))"
+    echo "helper already running (pid $(cat "$PID_FILE" 2>/dev/null || true))"
     return 0
   fi
   rm -f "$PID_FILE"
@@ -688,17 +710,62 @@ cmd_start() {
   chmod 600 "$shm" 2>/dev/null || true
   shm_control resume
 
+  # An inherited LD_LIBRARY_PATH breaks the Wine-side NVIDIA shims: a CUDA install on it
+  # was reproduced elsewhere as the reason cuInit failed inside the prefix, and stripping
+  # the variable fixed it. The helper is a Windows PE run by Wine; nothing it loads should
+  # come from a host library path.
+  #
+  # This is the kind of failure that appears and disappears depending on how the helper was
+  # launched -- inherited from a shell that has CUDA on it, absent from the desktop entry --
+  # which is the hardest kind to report. Unset it for the child only, never in the parent,
+  # and keep an escape for anyone running a self-built Wine that genuinely needs one.
+  if [ -n "${LD_LIBRARY_PATH:-}" ] && [ "${DLSSNR_KEEP_LD_LIBRARY_PATH:-0}" != "1" ]; then
+    echo "note: dropping inherited LD_LIBRARY_PATH for the helper: $LD_LIBRARY_PATH" >&2
+    unset LD_LIBRARY_PATH
+  fi
+
   export WINEPREFIX="$WINE_PREFIX_DIR"
   export DLSSNR_SHM="$shm"
   export DLSSNR_UID="$UID"
   export DLSSNR_LOG="$log"
   export DXVK_CONFIG_FILE="$DXVK_CONFIG_FILE"
   export WINEDEBUG="${WINEDEBUG:--all}"
+  # Same decision as WINEDEBUG, applied to the other noise source. The child's stdout and
+  # stderr are redirected into the helper log -- the file we ask users to attach to a bug
+  # report -- so DXVK's own logging lands in the middle of our [ngx] and [time] lines. The
+  # :- form leaves it overridable for anyone actually debugging DXVK.
+  export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-none}"
+  # Two independent projects report NGX rendering a frame and then crashing or wedging
+  # during cleanup, and both name these as the mitigation. They are Wine's own heap flags,
+  # the ones Proton exposes as PROTON_HEAP_DELAY_FREE / PROTON_HEAP_ZERO_MEMORY.
+  #
+  # Not free, and the cost is not measured here: DELAY_FREE defers frees so the prefix heap
+  # grows, and ZERO_MEMORY is a memset per allocation. Our allocation pattern is bursty at
+  # start-up and at feature rebuilds rather than per frame, which is why this is judged the
+  # right default -- but it is a judgement, so both stay overridable.
+  export WINE_HEAP_DELAY_FREE="${WINE_HEAP_DELAY_FREE:-1}"
+  export WINE_HEAP_ZERO_MEMORY="${WINE_HEAP_ZERO_MEMORY:-1}"
   if [ -n "$binaries" ]; then
     export DLSSNR_BIN_DIR="Z:$binaries"
   fi
+  # When the helper has been pinned to a specific card, point DXVK at the same one, so
+  # DXVK-NVAPI's view of the machine agrees with the device we actually render on. Reducing
+  # DXVK to one visible adapter also makes its ordinal trivially 0, which removes a class of
+  # enumeration-order bug rather than working around it.
+  if [ -n "${DLSSNR_GPU_UUID:-}" ]; then
+    export DXVK_FILTER_DEVICE_UUID="$DLSSNR_GPU_UUID"
+  fi
   if [ "$runner_type" = "proton" ]; then
     export PROTON_ENABLE_NVAPI=1
+    # PROTON_ENABLE_NVAPI on its own is not enough: Proton still presents an AMD
+    # compatibility identity unless this is cleared, and DXVK-NVAPI cannot discover the
+    # NVIDIA device behind one. The symptom is maximally confusing -- "no NVIDIA adapter"
+    # while the log names the NVIDIA adapter two lines earlier.
+    export PROTON_HIDE_NVIDIA_GPU=0
+    # The WINE_HEAP_* pair above does nothing under a Proton launcher, which reads the
+    # PROTON_ names and sets the WINE_ ones itself. Setting both covers both runners.
+    export PROTON_HEAP_DELAY_FREE="${PROTON_HEAP_DELAY_FREE:-1}"
+    export PROTON_HEAP_ZERO_MEMORY="${PROTON_HEAP_ZERO_MEMORY:-1}"
     # DXVK-NVAPI (bundled by Proton-CachyOS/GE and friends, switched on by PROTON_ENABLE_NVAPI above)
     # already answers NVAPI inside the prefix. Loading the vendored nvapi64.dll on top of it faults in
     # its DllMain, so tell the helper to leave NVAPI to the runner. See core/ngx_snippet.cpp.
@@ -712,6 +779,25 @@ cmd_start() {
   fi
   if [ "$runner_type" = "wine" ]; then
     export DXVK_ENABLE_NVAPI=1
+    # Deliberately NOT set here: DXVK_NVAPI_DRS_NGX_DLSS_NR_OVERRIDE=on.
+    #
+    # Another project sets it and documents it as one of the switches that makes DLSS-NR
+    # work under Wine, which made it look like the cheapest possible win. It is inert.
+    # DXVK-NVAPI builds the variable name as DXVK_NVAPI_DRS_<setting>, and the settings it
+    # knows are a fixed list -- sixteen NGX_* names in the build we ship, checked by
+    # scanning nvapi64.dll:
+    #
+    #   NGX_DLAA_OVERRIDE, NGX_DLSSG_{MODE,MULTI_FRAME_COUNT,DYNAMIC_*},
+    #   NGX_DLSS_FG_OVERRIDE[_RENDER_PRESET_SELECTION],
+    #   NGX_DLSS_RR_{MODE,OVERRIDE,OVERRIDE_RENDER_PRESET_SELECTION,OVERRIDE_SCALING_RATIO},
+    #   NGX_DLSS_SR_{MODE,OVERRIDE,OVERRIDE_RENDER_PRESET_SELECTION,OVERRIDE_SCALING_RATIO},
+    #   NGX_DLSS_OVERRIDE_OPTIMAL_SETTINGS
+    #
+    # Super Resolution, Ray Reconstruction, Frame Generation and DLAA. There is no Neural
+    # Rendering setting, and no string containing DLSSNR, "neural" or _NR_ anywhere in the
+    # binary. An unknown suffix is simply never looked up, so setting it does nothing at
+    # all -- which is exactly the kind of control this project has twice removed for
+    # looking real while nothing listened. Re-check the list before adding it back.
     unset DLSSNR_SKIP_NVAPI
     export WINEDLLOVERRIDES="vulkan-1=n,b;nvapi64=n,b;dxgi=n,b;d3d11=n,b${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
   fi
@@ -743,7 +829,7 @@ cmd_start() {
     sleep 0.25
   done
   if running_pid || [ -n "$(helper_pids)" ]; then
-    echo "helper started (pid $(cat "$PID_FILE"))"
+    echo "helper started (pid $(cat "$PID_FILE" 2>/dev/null || true))"
     echo "  runner: $runner_type $runner"
     echo "  prefix: $PREFIX_DIR"
     echo "  shm: $shm"
@@ -761,10 +847,31 @@ cmd_stop() {
 
   if [ -f "$shm" ]; then
     shm_control quit
+    # Give the polite request a moment to be acted on before escalating.
+    #
+    # There was no wait here at all: the quit flag was set and TERM followed immediately, so
+    # the orderly path -- release the features, shut the snippet down, unload -- essentially
+    # never ran, and we could not have noticed, because a helper killed before it logs
+    # anything looks exactly like a helper that exited cleanly. Verified by instrumenting a
+    # session: with the TERM removed, the helper exits on its own in well under a second and
+    # logs the whole teardown; with it, the log stops mid-loop.
+    #
+    # This matters more now that teardown refuses to re-enter a faulted NGX: that decision
+    # is only reachable if teardown runs.
+    if [ -f "$PID_FILE" ]; then
+      local _qpid
+      _qpid="$(cat "$PID_FILE" 2>/dev/null || true)"
+      if [ -n "$_qpid" ]; then
+        for _ in $(seq 1 24); do
+          kill -0 "$_qpid" 2>/dev/null || break
+          sleep 0.25
+        done
+      fi
+    fi
   fi
 
   if running_pid; then
-    pid="$(cat "$PID_FILE")"
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
     for _ in $(seq 1 20); do
       kill -0 "$pid" 2>/dev/null || break
@@ -809,7 +916,7 @@ cmd_status() {
   if running_pid || [ -n "$pids" ]; then
     echo "helper running"
     if running_pid; then
-      echo "  runner pid: $(cat "$PID_FILE")"
+      echo "  runner pid: $(cat "$PID_FILE" 2>/dev/null || true)"
     fi
     if [ -n "$pids" ]; then
       echo "  helper pids: $(printf '%s' "$pids" | tr '\n' ' ')"
@@ -848,6 +955,31 @@ install_dir=$(detect_install_dir)
 helper_exe=$(detect_helper_exe || true)
 dxvk_dll=$(detect_dxvk_dll || true)
 EOF
+  # What cmd_start would actually put in the child's environment. These are the settings a
+  # bug report otherwise cannot show: every one of them is invisible once the helper is
+  # running, and three of them decide whether NVAPI can find the GPU at all.
+  cat <<EOF
+env_wine_heap_delay_free=${WINE_HEAP_DELAY_FREE:-1}
+env_wine_heap_zero_memory=${WINE_HEAP_ZERO_MEMORY:-1}
+env_dxvk_log_level=${DXVK_LOG_LEVEL:-none}
+env_ld_library_path_inherited=$([ -n "${LD_LIBRARY_PATH:-}" ] && echo "${LD_LIBRARY_PATH}" || echo "(none)")
+env_ld_library_path_kept=${DLSSNR_KEEP_LD_LIBRARY_PATH:-0}
+env_gpu_uuid=${DLSSNR_GPU_UUID:-(unset)}
+env_gpu_index=${DLSSNR_GPU_INDEX:-(unset)}
+EOF
+  if [ "$runner_type" = "proton" ]; then
+    cat <<EOF
+env_proton_enable_nvapi=1
+env_proton_hide_nvidia_gpu=0
+env_proton_heap_delay_free=${PROTON_HEAP_DELAY_FREE:-1}
+env_proton_heap_zero_memory=${PROTON_HEAP_ZERO_MEMORY:-1}
+EOF
+  fi
+  if [ -f "$DXVK_CONFIG_FILE" ]; then
+    echo "dxvk_config_contents<<END"
+    cat "$DXVK_CONFIG_FILE"
+    echo "END"
+  fi
 }
 
 cmd_detect_gpu() {
@@ -974,6 +1106,25 @@ cmd_doctor() {
   nvapi="$(detect_runner_dll nvapi64.dll || true)"
   dxgi="$(detect_runner_dll dxgi.dll || true)"
 
+  # First, because it changes what every line under it means.
+  #
+  # Each kill switch makes the session hand back the game's own picture on purpose, and each is an
+  # environment variable that outlives the bisection it was set for -- left exported in a shell, in
+  # a wrapper script, in a Steam launch option. "It stopped working" and "DLSSNR_DRY_RUN=1 is still
+  # set" look identical from the outside, and nothing else in this report can tell them apart.
+  local kills=""
+  [ "${DLSSNR_DRY_RUN:-0}" = 1 ] && kills="$kills DLSSNR_DRY_RUN"
+  [ "${DLSSNR_NO_ROUNDTRIP:-0}" = 1 ] && kills="$kills DLSSNR_NO_ROUNDTRIP"
+  [ "${DLSSNR_SKIP_EVALUATE:-0}" = 1 ] && kills="$kills DLSSNR_SKIP_EVALUATE"
+  printf 'kill switches:%s\n' "${kills:- none set}"
+  if [ -n "$kills" ]; then
+    echo "  ACTIVE -- the picture is the game's own and nothing is being enhanced."
+    echo "  These are for bisecting a crash. Unset them before judging image quality."
+    ok=1
+  else
+    echo "  ok"
+  fi
+
   printf 'config: %s\n' "$CONFIG_FILE"
   if [ -f "$CONFIG_FILE" ]; then echo "  ok"; else echo "  missing"; ok=1; fi
 
@@ -986,6 +1137,20 @@ cmd_doctor() {
   printf 'prefix: %s\n' "$det_prefix"
   if [ -d "$det_prefix/drive_c" ]; then
     echo "  ok"
+    # A prefix whose wineboot succeeded but whose DLL installation did not reports "ok" on
+    # drive_c alone and then fails at run time with an NGX error code. install_wine_runtime_dll
+    # warns and carries on, so the only record of a failed install is a line nobody scrolls
+    # back to. We know exactly which files we tried to put there, so check for them.
+    if [ "$det_runner_type" = "wine" ]; then
+      for f in vulkan-1.dll nvapi64.dll dxgi.dll; do
+        if [ -f "$det_prefix/drive_c/windows/system32/$f" ]; then
+          echo "  system32/$f: ok"
+        else
+          echo "  system32/$f: error -- missing; run 'dlssnr-helper setup'"
+          ok=1
+        fi
+      done
+    fi
   elif [ "$det_runner_type" = "proton" ]; then
     echo "  will be created by Proton on first run"
   else
@@ -1002,10 +1167,53 @@ cmd_doctor() {
   printf 'binaries: %s\n' "$det_binaries"
   if [ -f "$det_binaries/nvngx_dlssnr.dll" ]; then
     echo "  nvngx_dlssnr.dll: ok"
+    # Identify it. Several projects have shown that different builds of this file behave
+    # differently and that a version number does not tell them apart, so a report that does
+    # not say WHICH model produced it cannot be acted on. The helper logs the same facts at
+    # load time; this is the half a user can run without starting anything.
+    if command -v sha256sum >/dev/null 2>&1; then
+      printf '    sha256: %s\n' "$(sha256sum "$det_binaries/nvngx_dlssnr.dll" | cut -d" " -f1)"
+    fi
+    printf '    bytes: %s\n' "$(stat -c %s "$det_binaries/nvngx_dlssnr.dll" 2>/dev/null || echo "?")"
+    if command -v strings >/dev/null 2>&1; then
+      for field in NGXMinimumDriverVersion NGXGpuArchitecture; do
+        v="$(strings -a -el "$det_binaries/nvngx_dlssnr.dll" 2>/dev/null |
+             grep -A1 -x "$field" | tail -1)"
+        [ -n "$v" ] && printf '    %s: %s\n' "$field" "$v"
+      done
+    fi
   else
     echo "  nvngx_dlssnr.dll: error -- missing (required)"
     ok=1
   fi
+  # Every copy, not only the one that would win. Two copies with different hashes is a
+  # diagnosis, and it is invisible today.
+  extra="$(find "$det_binaries" -maxdepth 1 -name 'nvngx_dlssnr*.dll' 2>/dev/null | wc -l)"
+  if [ "$extra" -gt 1 ]; then
+    echo "  note: more than one nvngx_dlssnr*.dll is present:"
+    find "$det_binaries" -maxdepth 1 -name 'nvngx_dlssnr*.dll' 2>/dev/null |
+      while read -r m; do printf '    %s\n' "$m"; done
+  fi
+
+  # The driver's own Wine-side NGX bridge. We never look for it at run time and it is not
+  # ours to ship, but on Linux it is how the NGX core reaches the driver, so whether it
+  # exists is exactly the kind of question this command should be able to answer.
+  echo "nvidia wine bridge:"
+  bridge=""
+  for d in /usr/lib/nvidia/wine /usr/lib64/nvidia/wine /usr/lib/x86_64-linux-gnu/nvidia/wine; do
+    if [ -f "$d/_nvngx.dll" ]; then bridge="$d/_nvngx.dll"; break; fi
+  done
+  if [ -n "$bridge" ]; then
+    echo "  _nvngx.dll: $bridge"
+  else
+    echo "  _nvngx.dll: not found (only matters if the core library fails to initialise)"
+  fi
+  if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q libnvidia-ngx; then
+    echo "  libnvidia-ngx: present"
+  else
+    echo "  libnvidia-ngx: not found via ldconfig"
+  fi
+
   if [ -f "$det_binaries/nvngx.dll" ]; then
     echo "  nvngx.dll: ok"
   else

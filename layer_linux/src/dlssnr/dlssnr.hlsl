@@ -35,6 +35,11 @@ cbuffer Params : register(b0)
                            //    PQ-decoded on the way in and PQ-encoded on the way out.
     float gColourTrust;    // maximum chroma displacement from the frame, in normalized units
     float gRatioSmooth;    // how much of the relighting ratio to take from the neighbourhood
+    float gShadowGain;     // how much of the model's DARKENING reaches the frame. 1 = all of it
+    float gGlowGain;       // how much of its BRIGHTENING reaches the frame. 1 = all of it
+    uint  gReconstruct;    // how the model's answer is enlarged when it ran small. See SampleRecon.
+    uint  gProxySwizzle;   // 1: the crossing surfaces carry BGRA rather than RGBA. See ProxySwizzle.
+    float gSelfLayers;     // 1..3: repeat the composed change as an RGB residual gain. 1 = off.
 
 
 };
@@ -285,6 +290,93 @@ float3 SrgbToLinear(float3 v)
 {
     v = saturate(v);
     return lerp(v / 12.92, pow((v + 0.055) / 1.055, 2.4), step(0.04045, v));
+}
+
+// How the model's answer is enlarged when it ran below the frame's resolution.
+//
+// Five projects hold five positions on this and none of them shipped a picture, so it is a mode
+// rather than a decision: 0 is exactly what this shader has always done, and the other two are
+// reachable for measurement without anyone having to rebuild.
+//
+//   0 BILINEAR      the sampler's own filtering. What every build before this did.
+//   1 NEAREST       the nearest source texel, no blending at all.
+//   2 CATMULL-ROM   a sharpening cubic, nine bilinear fetches folded from sixteen taps.
+//
+// The argument for NEAREST is that a smooth filter invents detail across a disocclusion, where the
+// neighbouring cells describe different surfaces, and that an interpolated PICTURE is a picture of
+// something that was never there. The argument against it here is the one worth holding on to:
+// three of the four objections to a smooth filter are objections to interpolating a picture, and
+// what leaves this function is not composed as a picture -- the resolve turns it into a residual
+// against the frame's own full-resolution proxy, and a residual is not a picture.
+//
+// Which of those is right is a measurement, and it is the user's to take: hold a frame, capture at
+// 100%, then at 50% and 75% with each mode, and compare each against the 100% answer.
+//
+// CATMULL-ROM has negative lobes, so it can undershoot below zero on a gradient edge. Clamped at
+// zero here rather than left to the caller: the SDR path saturates on the way into SrgbToLinear
+// and would not notice, but the float path multiplies the value by a white point and a negative
+// there is light with a sign, which nothing downstream is written to expect.
+float4 SampleCatmullRom(Texture2D<float4> tex, float2 uv, float2 texSize)
+{
+    // The standard nine-fetch fold: sixteen cubic taps become nine bilinear ones by sampling
+    // between texel pairs at the position their two weights put the centre of mass.
+    float2 samplePos = uv * texSize;
+    float2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    float2 f = samplePos - texPos1;
+
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+
+    float2 w12 = w1 + w2;
+    // w12 is zero only if w1 and w2 cancel, which the Catmull-Rom basis does not do on [0,1);
+    // guarded anyway, because a NaN here would reach the composition.
+    float2 offset12 = w2 / max(w12, 1e-6);
+
+    float2 p0 = (texPos1 - 1.0) / texSize;
+    float2 p3 = (texPos1 + 2.0) / texSize;
+    float2 p12 = (texPos1 + offset12) / texSize;
+
+    float4 r = 0.0;
+    r += tex.SampleLevel(gLinear, float2(p0.x,  p0.y),  0) * (w0.x  * w0.y);
+    r += tex.SampleLevel(gLinear, float2(p12.x, p0.y),  0) * (w12.x * w0.y);
+    r += tex.SampleLevel(gLinear, float2(p3.x,  p0.y),  0) * (w3.x  * w0.y);
+
+    r += tex.SampleLevel(gLinear, float2(p0.x,  p12.y), 0) * (w0.x  * w12.y);
+    r += tex.SampleLevel(gLinear, float2(p12.x, p12.y), 0) * (w12.x * w12.y);
+    r += tex.SampleLevel(gLinear, float2(p3.x,  p12.y), 0) * (w3.x  * w12.y);
+
+    r += tex.SampleLevel(gLinear, float2(p0.x,  p3.y),  0) * (w0.x  * w3.y);
+    r += tex.SampleLevel(gLinear, float2(p12.x, p3.y),  0) * (w12.x * w3.y);
+    r += tex.SampleLevel(gLinear, float2(p3.x,  p3.y),  0) * (w3.x  * w3.y);
+
+    return float4(max(r.rgb, 0.0), r.a);
+}
+
+// The channel order the crossing surfaces carry.
+//
+// Our proxy is R8G8B8A8_UNORM and we have always written RGB into it. Several builds of
+// nvngx_dlssnr.dll exist and they do not all agree about that: a user whose build reads BGRA gets
+// red and blue exchanged, and the only colour controls this project offers -- colour strength and
+// the colour bound -- make it WORSE, because both assume the model's hue means something.
+//
+// A swap on the way out and the same swap on the way back in. Applied to both crossing surfaces, so
+// the composition sees the same values either way and only the MODEL sees a different channel
+// order; that is what makes this a setting about the model rather than a colour control.
+//
+// Manual only. An automatic version would have to decide from the picture, once per raster change
+// and on the GPU, and nobody has hit this yet -- a detector for a problem no one has reported is a
+// second thing that can be wrong.
+float3 ProxySwizzle(float3 v) { return gProxySwizzle != 0 ? v.bgr : v; }
+
+float4 SampleRecon(Texture2D<float4> tex, float2 uv, float2 texSize)
+{
+    // Mode 0 is the call this shader has always made, written out rather than routed through the
+    // cases below, so the default path is the same instruction sequence it was.
+    if (gReconstruct == 0) return tex.SampleLevel(gLinear, uv, 0);
+    if (gReconstruct == 1) return tex.SampleLevel(gLinear, (floor(uv * texSize) + 0.5) / texSize, 0);
+    return SampleCatmullRom(tex, uv, texSize);
 }
 
 // ST 2084 (PQ), in the normalised form both ends of this pipeline use: 1.0 means 10000 nits at the
@@ -713,7 +805,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         if (gHdrProxy != 0)
         {
             float3 lin = gHdrTransfer != 0 ? PqToLinear(frame) : frame;
-            gTarget[id.xy] = float4(lin / NormScale(), source.a);
+            gTarget[id.xy] = float4(ProxySwizzle(lin / NormScale()), source.a);
             return;
         }
 
@@ -722,7 +814,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // damage, so it goes through untouched.
         if (gPassthrough != 0)
         {
-            gTarget[id.xy] = float4(frame, source.a);
+            gTarget[id.xy] = float4(ProxySwizzle(frame), source.a);
             return;
         }
 
@@ -755,7 +847,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // alpha, so the default stays byte-identical.
         float alpha = gReversibleMode != 0 ? 1.0 : source.a;
 
-        gTarget[id.xy] = float4(LinearToSrgb(display), alpha);
+        gTarget[id.xy] = float4(ProxySwizzle(LinearToSrgb(display)), alpha);
         return;
     }
 
@@ -797,21 +889,35 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     // Sampled rather than loaded: when the model ran at a reduced resolution these are smaller than the
     // frame, and its edit is enlarged here while the frame underneath stays untouched.
-    float4 proxySample = gSource.SampleLevel(gLinear, cmpUv, 0);
-    float4 modelSample = gModel.SampleLevel(gLinear, cmpUv, 0);
+    //
+    // WHICH filter does the enlarging is gReconstruct. At full model raster every mode lands on
+    // texel centres and none of them is doing anything, so the choice only exists below 100%.
+    float2 reconSize;
+    {
+        uint rw, rh;
+        gSource.GetDimensions(rw, rh);
+        reconSize = float2(rw, rh);
+    }
+    float4 proxySample = SampleRecon(gSource, cmpUv, reconSize);
+    float4 modelSample = SampleRecon(gModel, cmpUv, reconSize);
 
     // Nothing was encoded on the way in, so nothing is decoded here either. The float16 proxy is
     // linear light already -- the sRGB decode would fold the highlights flat.
+    // Swapped back on the way in, so everything below sees RGB whatever crossed. The proxy is our
+    // own encode and the answer is the model's, and both went out through the same swap.
+    const float3 proxyRaw = ProxySwizzle(proxySample.rgb);
+    const float3 modelRaw = ProxySwizzle(modelSample.rgb);
+
     float3 proxy, model;
     if (gHdrProxy != 0 || gPassthrough != 0)
     {
-        proxy = proxySample.rgb;
-        model = modelSample.rgb;
+        proxy = proxyRaw;
+        model = modelRaw;
     }
     else
     {
-        proxy = SrgbToLinear(proxySample.rgb);
-        model = SrgbToLinear(modelSample.rgb);
+        proxy = SrgbToLinear(proxyRaw);
+        model = SrgbToLinear(modelRaw);
     }
 
     // The model's own answer, kept before the matched-residual block below can rewrite `model`, so the
@@ -841,8 +947,12 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             const float2 off = float2(nb == 0 ? -1.0 : nb == 1 ? 1.0 : 0.0,
                                       nb == 2 ? -1.0 : nb == 3 ? 1.0 : 0.0) * texel;
             const float2 uvn = saturate(cmpUv + off);
-            float3 pn = gSource.SampleLevel(gLinear, uvn, 0).rgb;
-            float3 mn = gModel.SampleLevel(gLinear, uvn, 0).rgb;
+            // The same filter as the centre tap above, deliberately. gainSharp is built from the
+            // reconstructed centre and gainSmooth from these; reconstructing them differently
+            // would make the two disagree about the same pixel for a reason that is not the
+            // neighbourhood.
+            float3 pn = ProxySwizzle(SampleRecon(gSource, uvn, reconSize).rgb);
+            float3 mn = ProxySwizzle(SampleRecon(gModel, uvn, reconSize).rgb);
             if (gHdrProxy == 0 && gPassthrough == 0)
             {
                 pn = SrgbToLinear(pn);
@@ -902,6 +1012,33 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     // Coring was tried here and removed: the per-frame churn's amplitude overlaps the real detail's,
     // so an amplitude threshold cannot separate them -- it only relocated the noise to the threshold.
+
+    // The directional pair: how much of what the model DARKENED reaches the frame, and how much of
+    // what it BRIGHTENED does, as two separate numbers.
+    //
+    // Everything downstream of here is symmetric -- the guard, the ratio clamp and the colour bound
+    // all treat "too far" the same way in both directions -- and that is not what a user reports. A
+    // pass that looks blown out and a pass that looks crushed are different complaints with the same
+    // single control between them, so the only answer available was to turn the whole edit down and
+    // lose the half that was right.
+    //
+    // Classified on the UNMODIFIED residual, before either gain touches it, so the branch cannot
+    // select its own reference: whether a pixel counts as darkened is a fact about what the model
+    // said, not about what this code is about to do to it.
+    //
+    // Skipped entirely at 1.0/1.0, which is the default, so a default build is bit-identical rather
+    // than nearly so. Rebuilding `model` as `proxy + edit` is exact in real arithmetic and not in
+    // floating point, and "the shipped configuration cannot be changed by this at all" is worth more
+    // than one saved branch.
+    if (gShadowGain != 1.0 || gGlowGain != 1.0)
+    {
+        float editLuma = dot(edit, kLuma);
+        edit *= (editLuma < 0.0 ? gShadowGain : gGlowGain);
+        // Back into a picture, because everything below composes `model` rather than the residual.
+        // The two paths that use `edit` directly -- matched residual and transfer 2 -- read it after
+        // this point, so they carry the gains as well and the three agree.
+        model = proxy + edit;
+    }
 
     if (gDebugView == 3)
     {
@@ -1115,6 +1252,22 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         //
         // Strength above 1 is carried below instead, as an amplification of the luminance ratio,
         // which the guard does bound.
+        //
+        // The claim has now been tested once and NOT settled, which is worth recording so nobody
+        // thinks it was. gSelfLayers (added as the opposing arm; see its block near the end of the
+        // resolve) was swept 1, 2, 3 on one held vkcube frame, four captured pairs each:
+        //
+        //     selfLayers 1   PSNR 32.21 dB   max channel 0.9111   pixels at/over 1.0: 0
+        //     selfLayers 2                   max channel 0.8667   pixels at/over 1.0: 0
+        //     selfLayers 3   PSNR 22.74 dB   max channel 0.8223   pixels at/over 1.0: 0
+        //
+        // The edit gets much stronger and clips at NEITHER end -- and the maximum channel falls as
+        // the gain rises, because this content's edit is predominantly darkening, which the
+        // directional-gain measurement found independently. Extrapolating a darkening residual
+        // drives pixels away from white, not into it.
+        //
+        // So this is not a refutation. The claim above is about a LIT FACE, where the model
+        // brightens, and vkcube contains nothing of the kind. It stands as written and untested.
         upgraded = lerp(original, HueOkLab(model * ratio, model), saturate(gTransferStrength));
     }
 
@@ -1227,7 +1380,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     //
     // The guard is symmetric, so raising it to allow stronger relighting allows equally strong
     // *darkening* -- and a light source is exactly where that shows. At a guard of 1 the clamp is
-    // [1,1] and a lamp comes out white; at 3 the same lamp is allowed down to a third of itself and
+    // [1,1] and a lamp comes out white -- and note that this is not only a property to reason
+    // about, it was reachable from the interface: the slider's minimum was 1.0, where lift and drop
+    // are both lerp(x, x, t) = 1 and boundedRatio is 1 everywhere, so the whole luminance verdict
+    // is divided back out and half the pass silently stops. The slider now starts at 1.1; the CLI
+    // can still ask for 1.0 on purpose and says what that does; at 3 the same lamp is allowed down to a third of itself and
     // visibly dims, which reads as the value inverting. Detail strength makes it worse rather than
     // better, because it raises the ratio to a power: at 2.0 a ratio of 0.85 becomes 0.72.
     //
@@ -1361,6 +1518,34 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     if (gColourStrength > 1.0)
         result = ClampAp1(FromOkLab(float3(1.0, gColourStrength, gColourStrength) * ToOkLab(max(result, 0.0))));
+
+    // The second arm of a disagreement this shader states in writing a hundred lines above.
+    //
+    // Up there, `upgraded = lerp(original, ..., saturate(gTransferStrength))` saturates on purpose,
+    // and the comment says why: a lerp past 1 extrapolates, walking beyond the only well-formed
+    // picture in the pair, and the channels then spread apart faster than luminance does -- so the
+    // guard, which scales the whole triple by one scalar, corrects the luminance while preserving
+    // the spread. The claim is specific: "a lit face at strength 2 clips to white, and it starts to
+    // show just past 1". Strength above 1 is routed into the luminance ratio instead, where the
+    // guard can bound it.
+    //
+    // A shipping project does the extrapolation anyway, up to 3, as a user control described as
+    // amplifying the effect without another model evaluation. That is a falsifiable claim against a
+    // falsifiable claim, and neither side has a picture.
+    //
+    // So this is their arm, placed where theirs is: AFTER colour restoration. That placement is the
+    // substance, not a detail -- their ComposeLayers calls RestoreColour first, and below a colour
+    // strength of 1 the residual being amplified has already had the model's chroma removed, which
+    // is exactly the "channels spread apart" term our comment names. Their control may therefore be
+    // safe in combination with a colour strength we also have, and unsafe alone. That is the
+    // measurement worth taking, and it is one setting away now.
+    //
+    // Capped at 3 as theirs is, and 1 is off, so the shipped picture is untouched.
+    //
+    // Deliberately before replace mode below: that path discards the composition entirely and hands
+    // back the model's own decoded answer, so there is no composed change there to repeat.
+    if (gSelfLayers > 1.0)
+        result = max(original + (result - original) * min(gSelfLayers, 3.0), 0.0);
 
     // Replace mode: the model's answer IS the picture, decoded through Neutwo's exact inverse, with
     // NONE of the composition above -- no ratio, no highlight guard, no palette blend. This is the

@@ -111,6 +111,29 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
         if (!std::isfinite(s.ratioSmooth) || s.ratioSmooth < 0.0f) s.ratioSmooth = 0.0f;
         if (s.ratioSmooth > 1.0f) s.ratioSmooth = 1.0f;
 
+        // Clamped to [0, 4] like the other strengths: below 0 would invert the model's verdict in
+        // one direction only, which is not a setting anybody means, and the upper bound is the one
+        // the rest of the composition uses.
+        s.shadowGain = BitsToFloat(h->shadowGainBits.load());
+        s.glowGain = BitsToFloat(h->glowGainBits.load());
+        if (!std::isfinite(s.shadowGain) || s.shadowGain < 0.0f) s.shadowGain = 1.0f;
+        if (!std::isfinite(s.glowGain) || s.glowGain < 0.0f) s.glowGain = 1.0f;
+        if (s.shadowGain > 4.0f) s.shadowGain = 4.0f;
+        if (s.glowGain > 4.0f) s.glowGain = 4.0f;
+
+        // Clamped to a mode the shader has, so a header written by a newer build falls back to the
+        // behaviour that shipped rather than to whatever the last branch happens to be.
+        s.reconstruct = h->reconstructFilter.load();
+        if (s.reconstruct > kReconstructCatmullRom) s.reconstruct = kReconstructBilinear;
+
+        s.proxySwizzle = h->proxySwizzle.load() != 0 ? kProxyBgraOrder : kProxyRgbaOrder;
+
+        // Below 1 would shrink the composed change through a path that is not meant to be a
+        // strength -- detail strength is that control -- so the floor is 1, which is off.
+        s.selfLayers = BitsToFloat(h->selfLayersBits.load());
+        if (!std::isfinite(s.selfLayers) || s.selfLayers < 1.0f) s.selfLayers = 1.0f;
+        if (s.selfLayers > 3.0f) s.selfLayers = 3.0f;
+
         s.colourTrust = float(h->colourTrustPercent.load()) / 100.0f;
         static const int forcedCt = [] {
             const char* v = getenv("DLSSNR_COLOUR_TRUST");
@@ -1198,6 +1221,11 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     c.HdrTransfer = _hdrProxy ? _hdrTransfer : 0u;
     c.ColourTrust = s.colourTrust;
     c.RatioSmooth = s.ratioSmooth;
+    c.ShadowGain = s.shadowGain;
+    c.GlowGain = s.glowGain;
+    c.Reconstruct = s.reconstruct;
+    c.ProxySwizzle = s.proxySwizzle;
+    c.SelfLayers = s.selfLayers;
     return c;
 }
 
@@ -1595,6 +1623,35 @@ void Composition::ConsumeMeter() {
     const float* mirror = (const float*) _meterMirror.mapped;
     _measuredWhitePoint = mirror[1];
     _meterSteadiness = mirror[3];
+
+    // How far the measured white point actually travels over a session.
+    //
+    // AEX-05 proposes replacing the single trim scalar with a curve of (whitePoint, trim) anchors,
+    // on the grounds that one number cannot be right across every scene. That is plausible and it
+    // is unmeasured: nothing here has ever recorded the RANGE the measurement covers, only its
+    // current value, so "the trim has to follow the white point" and "the white point barely moves
+    // in practice" are indistinguishable from anything this project has logged.
+    //
+    // This is the precondition, not the feature. It costs two comparisons a frame and prints one
+    // line every TimeInterval() frames under DLSSNR_TIME, so a real session with day and night
+    // scenes answers the question without anyone building the curve first. If the span turns out
+    // to be narrow, AEX-05 closes; if it is wide, this is the evidence that it should be built.
+    if (_measuredWhitePoint > 0.0f) {
+        if (_whiteSeen == 0 || _measuredWhitePoint < _whiteMin) _whiteMin = _measuredWhitePoint;
+        if (_measuredWhitePoint > _whiteMax) _whiteMax = _measuredWhitePoint;
+        ++_whiteSeen;
+        _whiteSum += double(_measuredWhitePoint);
+    }
+}
+
+// min/max/mean of the measured white point across this session, and how many frames it covers.
+// Zero frames means the meter has never offered a reading -- a manual white point, or content the
+// meter refuses.
+void Composition::WhitePointTravel(float& lo, float& hi, float& mean, uint64_t& frames) const {
+    lo = _whiteSeen ? _whiteMin : 0.0f;
+    hi = _whiteSeen ? _whiteMax : 0.0f;
+    mean = _whiteSeen ? float(_whiteSum / double(_whiteSeen)) : 0.0f;
+    frames = _whiteSeen;
 }
 
 }  // namespace dlssnr

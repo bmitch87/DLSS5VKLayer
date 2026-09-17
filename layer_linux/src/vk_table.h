@@ -26,6 +26,9 @@ namespace dlssnr {
     X(vkGetPhysicalDeviceMemoryProperties2)                                                        \
     X(vkGetPhysicalDeviceProperties2)
 
+// The last two are VK_NV_device_diagnostic_checkpoints and come back null unless the device
+// enabled it -- which this layer only asks for under DLSSNR_CHECKPOINTS=1. Resolving a name the
+// device does not have is defined to return null, so they cost nothing when it did not.
 #define DLSSNR_DEVICE_FN_LIST(X)                                                                   \
     X(vkDestroyDevice)                                                                             \
     X(vkGetDeviceQueue)                                                                            \
@@ -99,7 +102,9 @@ X(vkCmdBindPipeline)                                                            
     X(vkDestroyQueryPool)                                                                          \
     X(vkCmdResetQueryPool)                                                                         \
     X(vkCmdWriteTimestamp)                                                                         \
-    X(vkGetQueryPoolResults)
+    X(vkGetQueryPoolResults)                                                                      \
+    X(vkCmdSetCheckpointNV)                                                                        \
+    X(vkGetQueueCheckpointDataNV)
 
 struct InstanceTable {
     PFN_vkGetInstanceProcAddr next_gipa = nullptr;

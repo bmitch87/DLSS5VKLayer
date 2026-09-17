@@ -74,6 +74,20 @@ struct FrameSettings {
     // How much of the relighting ratio comes from the neighbourhood. See ratioSmoothPercent.
     float ratioSmooth = 0.0f;
 
+    // How much of the model's darkening and of its brightening reaches the frame. Both 1 is every
+    // path this composition had before them, and the shader skips its branch entirely at 1/1.
+    float shadowGain = 1.0f;
+    float glowGain = 1.0f;
+
+    // How the model's answer is enlarged when it ran small. See ReconstructFilter.
+    uint32_t reconstruct = kReconstructBilinear;
+
+    // The channel order the crossing surfaces carry. See ProxyChannelOrder.
+    uint32_t proxySwizzle = kProxyRgbaOrder;
+
+    // 1..3, an RGB residual gain applied after colour restoration. 1 is off. See selfLayersBits.
+    float selfLayers = 1.0f;
+
 
     static FrameSettings Read(const ShmHeader* h);
 };
@@ -210,6 +224,8 @@ class Composition {
     // What the meter settled on, or 0 when it has not taken a usable reading. For the interface, so
     // the number in use is visible rather than inferred.
     float MeasuredWhitePoint() const { return _measuredWhitePoint; }
+    // The range the measured white point has covered this session. See ConsumeMeter.
+    void WhitePointTravel(float& lo, float& hi, float& mean, uint64_t& frames) const;
 
   private:
     struct Image {
@@ -306,6 +322,11 @@ class Composition {
     VkDescriptorSet _meterDescriptorSet = VK_NULL_HANDLE;
     VkSampler _meterSampler = VK_NULL_HANDLE;
     float _measuredWhitePoint = 0.0f;
+    // Whole-session travel of the measurement above, kept outside any ring so a long run still
+    // reports its own shape. See ConsumeMeter for what the question is.
+    float _whiteMin = 0.0f, _whiteMax = 0.0f;
+    double _whiteSum = 0.0;
+    uint64_t _whiteSeen = 0;
     float _meterSteadiness = 0.0f;
     HostBuffer _download{}, _upload{}, _captureBuf{};
 

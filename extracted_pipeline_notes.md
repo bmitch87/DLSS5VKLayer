@@ -108,6 +108,12 @@ GPU drain → snippet `ReleaseFeature` → Core `DestroyParameters` → snippet 
 | `DLSSNR.Hint.Render.Preset` | `settings.preset` (0–3) | 1122 |
 | `NVSDK_NGX_Parameter_Width` / `_Height` | same | 1123-1124 |
 | `NVSDK_NGX_Parameter_PerfQualityValue` | `NVSDK_NGX_PerfQuality_Value_Balanced` | 1125-1127 |
+
+> Note: the layer ships `UltraPerformance` (3) here, not `Balanced` (1). The two have
+> disagreed since some point after this note was written. The key is live -- the DLL
+> validates it and refuses some values -- so which is right is a measurement, not a
+> transcription error to silently correct. See `core/ngx_abi.h`, `NVSDK_NGX_PerfQuality_Value`.
+
 | `NVSDK_NGX_Parameter_CreationNodeMask` / `_VisibilityNodeMask` | `1u` | 1128-1129 |
 
 NR is **same-resolution only**: init rejects mismatched input/output extents (`:1557-1562`). Format contract: input `R8G8B8A8_UNORM` or `B8G8R8A8_UNORM` (BGRA→RGBA converted by compute), output must be `R8G8B8A8_UNORM` (`:1563-1570`).

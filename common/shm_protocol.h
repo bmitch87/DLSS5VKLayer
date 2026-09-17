@@ -37,7 +37,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 20;
+static constexpr uint32_t kShmVersion = 28;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -55,6 +55,24 @@ static constexpr size_t kHeaderBytes = 65536;
 // DlssNr::kMaxPasses and sizes the per-pass arrays below.
 static constexpr uint32_t kMaxPasses = 30;
 
+// The scene-cut detector's default threshold: mean absolute luma difference over a 64x36 grid.
+//
+// 0, which means the detector is OFF unless somebody turns it on. It is a control that throws the
+// model's temporal history away, and the cost of a false positive is paid on every frame of the run
+// that triggered it while the cost of a false negative is one smeared cut.
+//
+// 55 of 255 is the value the detector used when it was always on, and the value to put back if you
+// want it: it is close to the 0.24 of full scale -- about 61 -- that an independent implementation
+// arrived at, which is the only outside number available for it. The one measurement taken here had
+// a synthetic cut scoring 58 against that 55, which is a margin of three, and that is the other
+// reason this is off by default rather than on.
+static constexpr uint32_t kSceneCutThresholdDefault = 0;
+
+// What the detector uses when it IS switched on, and what an environment override falls back to
+// when it names a value out of range. Kept separate from the default above so "off by default" and
+// "this is the number that works" stay two different statements.
+static constexpr uint32_t kSceneCutThresholdSuggested = 55;
+
 static constexpr size_t kReasonBytes = 192;
 static constexpr size_t kNameBytes = 128;
 
@@ -70,6 +88,7 @@ enum PassOverrideBit : uint32_t {
     kOverridePreset = 1u << 5,
     kOverrideAutoMask = 1u << 6,
     kOverrideSharpness = 1u << 7,
+    kOverrideUiCorrection = 1u << 8,
 };
 
 // Where the white point comes from. The layer has no game exposure texture to read -- it sees a
@@ -161,6 +180,45 @@ enum ProxyFormat : uint32_t {
     kProxyRgba16F = 2,
 };
 
+// What holdFrame means. A third value rather than a second field: the size and the existing two
+// meanings are unchanged, so every reader that only understands off and on is still right about
+// both of them.
+// How the model's answer is enlarged when it ran below the frame's resolution.
+//
+// Only reachable below 100% model resolution: at the frame's own size every one of these lands on
+// texel centres and none of them is doing anything.
+// The channel order the model is handed, and expects back.
+enum ProxyChannelOrder : uint32_t {
+    kProxyRgbaOrder = 0,
+    kProxyBgraOrder = 1,
+};
+
+enum ReconstructFilter : uint32_t {
+    // The sampler's own bilinear. What every build before this did, and the default.
+    kReconstructBilinear = 0,
+    // The nearest source texel, no blending. The argument for it is that a smooth filter invents
+    // detail across a disocclusion, where neighbouring cells describe different surfaces.
+    kReconstructNearest = 1,
+    // A sharpening cubic, nine bilinear fetches folded from sixteen taps. The argument for it is
+    // that three of the four objections to a smooth filter are objections to interpolating a
+    // PICTURE, and what this enlarges becomes a residual against the frame's own full-resolution
+    // proxy rather than a picture in its own right.
+    kReconstructCatmullRom = 2,
+};
+
+enum HoldFrameMode : uint32_t {
+    kHoldOff = 0,
+    kHoldOn = 1,
+    // Capture the NEXT frame that completes a round trip, then become kHoldOn by itself.
+    //
+    // The frame it arms on is captured fresh -- the arm is not a hold, it is a request for one --
+    // and the latch happens only after that frame has been through the model, so what ends up held
+    // is a frame with a complete answer rather than one caught mid-flight. An idle repaint does not
+    // consume it: a repaint re-composes a picture the layer already had, which is not the "next
+    // frame" anybody meant.
+    kHoldArm = 2,
+};
+
 enum MVecScaleMode : uint32_t {
     kMVecNormalized = 0,
     kMVecPixels = 1,
@@ -216,6 +274,9 @@ struct PassControl {
     std::atomic<uint32_t> style;
     std::atomic<uint32_t> preset;
     std::atomic<uint32_t> autoMask;
+    // DLSSNR.UICorrection. Appended to this struct rather than inserted, so every field above keeps
+    // the offset it had; the pass array is what moves, and the version below moves with it.
+    std::atomic<uint32_t> uiCorrection;
 };
 
 // A pass's settings after the global values and its own overrides have been merged. Plain floats:
@@ -229,13 +290,25 @@ struct PassTuning {
     uint32_t style = 0;
     uint32_t preset = 0;
     uint32_t autoMask = 1;
+    // Whether the model is told the frame it is looking at already has interface drawn on it.
+    //
+    // Default 0, which is what this code has always written as a constant. NOT what every other
+    // project defaults it to -- their filter runs before the game composites its UI, ours runs after
+    // it, so their default is an answer to a different question and is not evidence for ours.
+    uint32_t uiCorrection = 0;
 
-    bool SameCreateParams(const PassTuning& o) const {
-        // Everything the model latches when its feature is built. Sharpness is absent because it is
-        // read at evaluate, and so is the only one of these a running feature will actually follow.
-        return intensity == o.intensity && localTone == o.localTone && localStructure == o.localStructure &&
-               skinStructure == o.skinStructure && style == o.style && preset == o.preset && autoMask == o.autoMask;
-    }
+    // What the model latches when its feature is built: the preset, and nothing else.
+    //
+    // This used to name seven fields, and six of them did not belong. The parameter probe showed
+    // the DLL reading those six at every evaluate and only the preset at create; a picture test
+    // then confirmed it, with the rebuild debounce pushed out so that ONE feature, built once,
+    // served every value -- style, intensity, local tone, local structure, skin structure and the
+    // auto mask each moved the output on their own, reproducibly, with zero rebuilds. The numbers
+    // are in core/ngx_snippet.h, next to NgxTuning::SameCreateParams, which is the copy of this
+    // question that the helper actually acts on.
+    //
+    // Sharpness and uiCorrection were already absent, for the same reason arrived at earlier.
+    bool SameCreateParams(const PassTuning& o) const { return preset == o.preset; }
 };
 
 struct ShmHeader {
@@ -335,6 +408,10 @@ struct ShmHeader {
     // In this architecture it is cheaper than upstream: the layer already holds the captured proxy
     // and the model's last answer, so holding means not re-capturing rather than keeping a frame
     // alive somewhere it would not otherwise be.
+    //
+    // Three values, not two -- see HoldFrameMode. Off and on are what they always were; arm exists
+    // because on a moving picture "hold" always lands one frame too late. You see the frame you
+    // want, you reach for the control, and by the time it is set the scene has moved on.
     std::atomic<uint32_t> holdFrame;
 
     // The filter for the supersampling down-leg. See Downscaler; only read when workingScale > 1.
@@ -526,6 +603,24 @@ struct ShmHeader {
     // blown and black pixels wearing whatever colour the texture had. Carrying a ratio at full
     // spatial frequency is the mistake: what the model knows at this scale is how much light belongs
     // here, not which pixel is brighter than its neighbour, and the frame already knows that.
+    //
+    // Default 100, and that default now has a measurement rather than only the argument above.
+    // One held frame, four captured pairs per round, with the guard raised to 8 and detail at 2 --
+    // which is the configuration this control exists for, since at the default guard there is
+    // little for it to hold:
+    //
+    //     ratioSmooth 100   laplacian after/before 0.4479   sobel 0.4365
+    //     ratioSmooth   0   laplacian after/before 0.3817   sobel 0.4154
+    //
+    // Per-pixel ratios cost more fine detail than neighbourhood ratios do (0.3817 against 0.4479)
+    // and pull the two statistics apart, while 100 keeps them together. That is the direction the
+    // argument predicts, so the default stands.
+    //
+    // Stated honestly: this was measured on vkcube, whose picture is flat. The failure the control
+    // is really for -- blown and black speckle on DETAILED content at a high guard -- cannot be
+    // produced by this content at all, so what is above is corroboration and not a demonstration.
+    // Anyone with a real game and a high guard can settle it properly with
+    // `tools/measure.sh ratiosmooth 100 0`.
     std::atomic<uint32_t> ratioSmoothPercent;
 
     // SDR uses 8-bit ping-pong images by default. Enable 16-bit UNORM to avoid quantising between
@@ -533,6 +628,112 @@ struct ShmHeader {
     std::atomic<uint32_t> sdr16Multipass;
     std::atomic<uint32_t> mvecPixelSize;
 
+    // Whether this request carries the SAME picture as the last one, written by the layer
+    // immediately before seq_req, next to hdrEncode and for the same reason: it describes
+    // the bytes, so it has to be published by the statement that announces them.
+    //
+    // The idle repaint re-runs the whole chain over a frame that is deliberately held, so
+    // the helper receives the same picture several times and, until now, could not tell.
+    // Each repaint was another frame of a perfectly static scene to the model: its temporal
+    // state advanced, the flow engine was handed prev == curr, and nothing raised a reset --
+    // so the answer for a held frame depended on how many repaints had happened to it,
+    // which makes every measurement taken on a held frame unreproducible by construction.
+    //
+    // holdFrame is not a substitute. It is a setting, it says what the LAYER is doing, and
+    // it is not written next to the pixels; this is a property of one request.
+    std::atomic<uint32_t> frameRepeat;
+
+    // Presents seen by the layer, against layerFrames (round trips). Two counters, not one, because
+    // they are not the same event and the gap between them is the number every per-frame cost here
+    // has to be divided by.
+    //
+    // Every timing this header publishes is per ROUND TRIP. A reader that divides by the frame rate
+    // is asking a different question and gets a flattering answer, and the discrepancy is invisible
+    // while the two happen to be equal. They are not equal whenever a swapchain is passed through, a
+    // frame fails leg 1, the composition is disabled mid-session -- or something downstream of us
+    // generates frames we never saw, which is the case that cannot be detected from in here and can
+    // at least be counted from out here.
+    //
+    // Counted for every present that reaches the hook on a live device, including the ones that are
+    // passed straight through, because the denominator is what the game asked the display for.
+    std::atomic<uint32_t> layerPresentsLo;
+    std::atomic<uint32_t> layerPresentsHi;
+
+    // DLSSNR.UICorrection: tell the model this frame already has interface composited onto it.
+    //
+    // A real key -- the string is in nvngx_dlssnr.dll and the parameter probe shows the DLL reading
+    // it at every evaluate -- which this code has written as a hard 0 since it was added, the same
+    // shape as the UseAutoMask constant that turned out to be forcing the skin mask off. A constant
+    // written to a key the model reads is a control, just one nobody can reach.
+    //
+    // Default 0, the behaviour that shipped. Other projects default it ON, and that is not evidence
+    // for us: their pass runs before the game composites its UI and ours runs after, so "is there
+    // interface in this picture" has opposite answers.
+    std::atomic<uint32_t> uiCorrection;
+
+    // The scene-cut detector's threshold, in mean absolute luma difference over a 64x36 grid,
+    // 0-255. 0 turns the detector off entirely.
+    //
+    // It was a compile-once environment variable and nothing else, so a user whose content trips
+    // false cuts -- a strobing light, a title sequence, a fast pan -- had no control and, worse, no
+    // readout: nothing said whether cuts were firing or what the frames were scoring. A threshold
+    // with no score beside it cannot be tuned by anybody.
+    std::atomic<uint32_t> sceneCutThreshold;
+    // What the last frame actually scored, published every frame by the helper. Read-only from
+    // outside; the point is to make the threshold above adjustable against something.
+    std::atomic<uint32_t> sceneCutScore;
+    // How many cuts this session has fired, so a run can be judged without watching the log.
+    std::atomic<uint32_t> sceneCutCount;
+
+    // The directional residual pair: how much of what the model DARKENED reaches the frame, and how
+    // much of what it BRIGHTENED does. Both 1.0 by default, which is exactly the behaviour that
+    // shipped -- the shader skips the branch entirely at 1/1, so a default build is bit-identical.
+    //
+    // Everything else in the composition is symmetric: the highlight guard, the ratio clamp and the
+    // colour bound all treat "too far" the same in both directions. That is not what a user
+    // reports. "It looks blown out" and "it looks crushed" are different complaints, and the only
+    // control that used to answer either of them was detail strength, which turns down the half
+    // that was right along with the half that was not.
+    //
+    // In the COMPOSITION group rather than the model group, in the interface and here: this does
+    // not ask the model for anything, it decides how much of the model's answer lands. Where a
+    // control lives is a statement about what it costs.
+    std::atomic<uint32_t> shadowGainBits;
+    std::atomic<uint32_t> glowGainBits;
+
+    // How the model's answer is enlarged when it ran below the frame's resolution. See
+    // ReconstructFilter, and SampleRecon in dlssnr.hlsl.
+    //
+    // A mode rather than a decision, because five projects hold five positions on it and not one of
+    // them shipped a picture. 0 is exactly what every build before this did, so the question can be
+    // asked on real content without anyone rebuilding, and answered by capture rather than by
+    // argument.
+    std::atomic<uint32_t> reconstructFilter;
+
+    // What channel order the crossing surfaces carry: 0 RGBA (every build so far), 1 BGRA.
+    //
+    // Our proxy is R8G8B8A8_UNORM and we have always written RGB into it. Builds of
+    // nvngx_dlssnr.dll do not all agree about that, and a user whose build reads BGRA gets red and
+    // blue exchanged with no control that helps -- colour strength and the colour bound both make
+    // it worse, because both assume the model's hue means something.
+    //
+    // Manual, and manual only. An automatic version would have to decide from the picture, once per
+    // raster change and on the GPU; nobody has reported hitting this, and a detector for a problem
+    // no one has reported is a second thing that can be wrong.
+    std::atomic<uint32_t> proxySwizzle;
+
+    // 1..3: repeat the composed change as an RGB residual gain, after colour restoration. 1 is off,
+    // and off is the picture this project has always produced.
+    //
+    // An open disagreement, carried as a control rather than settled by argument. Our own shader
+    // states, in a comment, that extrapolating past the model's picture makes the channels spread
+    // apart faster than luminance does and that "a lit face at strength 2 clips to white" -- and
+    // routes strength above 1 into the luminance ratio instead, where the highlight guard can bound
+    // it. A shipping project does the extrapolation anyway, up to 3, as a user control.
+    //
+    // Both are falsifiable and neither side has a picture. This is the second arm, so somebody can
+    // take one: put the two side by side on a lit face and see which comment needs correcting.
+    std::atomic<uint32_t> selfLayersBits;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -548,13 +749,13 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1968, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2136, "the header layout changed -- bump kShmVersion");
 
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, helperState) == 176, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, pass) == 780, "layout changed -- bump kShmVersion");
-static_assert(offsetof(ShmHeader, mvecEnabled) == 1860, "layout changed -- bump kShmVersion");
+static_assert(offsetof(ShmHeader, mvecEnabled) == 1980, "layout changed -- bump kShmVersion");
 
 inline uint32_t FloatToBits(float f) {
     uint32_t u = 0;
@@ -614,7 +815,8 @@ inline void ShmResetSettings(ShmHeader* h) {
         uint32_t proxyExportSeq, proxyPid, proxyFd, proxyGen;
         uint32_t answerExportSeq, answerPid, answerFd, answerGen;
         uint32_t layerProxySeq, layerAnswerSeq;
-        uint32_t hdrDetected, hdrActive, proxyFormat, hdrEncode;
+        uint32_t hdrDetected, hdrActive, proxyFormat, hdrEncode, frameRepeat;
+        uint32_t layerPresentsLo, layerPresentsHi, sceneCutScore, sceneCutCount;
     } v;
 #define DLSSNR_SAVE(f) v.f = h->f.load()
     DLSSNR_SAVE(seq_req); DLSSNR_SAVE(seq_resp); DLSSNR_SAVE(width); DLSSNR_SAVE(height);
@@ -633,6 +835,8 @@ inline void ShmResetSettings(ShmHeader* h) {
     DLSSNR_SAVE(answerExportSeq); DLSSNR_SAVE(answerPid); DLSSNR_SAVE(answerFd);
     DLSSNR_SAVE(answerGen); DLSSNR_SAVE(layerProxySeq); DLSSNR_SAVE(layerAnswerSeq);
     DLSSNR_SAVE(hdrDetected); DLSSNR_SAVE(hdrActive); DLSSNR_SAVE(proxyFormat); DLSSNR_SAVE(hdrEncode);
+    DLSSNR_SAVE(frameRepeat); DLSSNR_SAVE(layerPresentsLo); DLSSNR_SAVE(layerPresentsHi);
+    DLSSNR_SAVE(sceneCutScore); DLSSNR_SAVE(sceneCutCount);
 #undef DLSSNR_SAVE
     char helperReason[kReasonBytes], layerReason[kReasonBytes], gameName[kNameBytes];
     std::memcpy(helperReason, h->helperReason, sizeof(helperReason));
@@ -657,6 +861,8 @@ inline void ShmResetSettings(ShmHeader* h) {
     DLSSNR_LOAD(answerExportSeq); DLSSNR_LOAD(answerPid); DLSSNR_LOAD(answerFd);
     DLSSNR_LOAD(answerGen); DLSSNR_LOAD(layerProxySeq); DLSSNR_LOAD(layerAnswerSeq);
     DLSSNR_LOAD(hdrDetected); DLSSNR_LOAD(hdrActive); DLSSNR_LOAD(proxyFormat); DLSSNR_LOAD(hdrEncode);
+    DLSSNR_LOAD(frameRepeat); DLSSNR_LOAD(layerPresentsLo); DLSSNR_LOAD(layerPresentsHi);
+    DLSSNR_LOAD(sceneCutScore); DLSSNR_LOAD(sceneCutCount);
 #undef DLSSNR_LOAD
     std::memcpy(h->helperReason, helperReason, sizeof(helperReason));
     std::memcpy(h->layerReason, layerReason, sizeof(layerReason));
@@ -676,6 +882,15 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->passes.store(1);
     h->enabled.store(1);
     h->autoMask.store(1);
+    h->uiCorrection.store(0);
+    h->sceneCutThreshold.store(kSceneCutThresholdDefault);
+    h->sceneCutScore.store(0);
+    h->sceneCutCount.store(0);
+    h->shadowGainBits.store(FloatToBits(1.0f));
+    h->glowGainBits.store(FloatToBits(1.0f));
+    h->reconstructFilter.store(kReconstructBilinear);
+    h->proxySwizzle.store(kProxyRgbaOrder);
+    h->selfLayersBits.store(FloatToBits(1.0f));
     h->intensityBits.store(FloatToBits(1.0f));
     h->localToneBits.store(FloatToBits(1.0f));
     h->localStructureBits.store(FloatToBits(1.0f));
@@ -730,6 +945,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
         h->pass[i].style.store(0);
         h->pass[i].preset.store(0);
         h->pass[i].autoMask.store(1);
+        h->pass[i].uiCorrection.store(0);
     }
 }
 
@@ -759,6 +975,7 @@ inline PassTuning ShmResolvePass(const ShmHeader* h, uint32_t pass) {
     t.style = h->style.load();
     t.preset = h->preset.load();
     t.autoMask = h->autoMask.load();
+    t.uiCorrection = h->uiCorrection.load();
 
     if (pass >= kMaxPasses) return t;
     const uint32_t mask = h->pass[pass].overrideMask.load();
@@ -771,6 +988,7 @@ inline PassTuning ShmResolvePass(const ShmHeader* h, uint32_t pass) {
     if (mask & kOverrideStyle) t.style = h->pass[pass].style.load();
     if (mask & kOverridePreset) t.preset = h->pass[pass].preset.load();
     if (mask & kOverrideAutoMask) t.autoMask = h->pass[pass].autoMask.load();
+    if (mask & kOverrideUiCorrection) t.uiCorrection = h->pass[pass].uiCorrection.load();
     return t;
 }
 
