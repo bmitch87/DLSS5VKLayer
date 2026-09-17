@@ -569,6 +569,24 @@ struct ShmHeader {
     // blown and black pixels wearing whatever colour the texture had. Carrying a ratio at full
     // spatial frequency is the mistake: what the model knows at this scale is how much light belongs
     // here, not which pixel is brighter than its neighbour, and the frame already knows that.
+    //
+    // Default 100, and that default now has a measurement rather than only the argument above.
+    // One held frame, four captured pairs per round, with the guard raised to 8 and detail at 2 --
+    // which is the configuration this control exists for, since at the default guard there is
+    // little for it to hold:
+    //
+    //     ratioSmooth 100   laplacian after/before 0.4479   sobel 0.4365
+    //     ratioSmooth   0   laplacian after/before 0.3817   sobel 0.4154
+    //
+    // Per-pixel ratios cost more fine detail than neighbourhood ratios do (0.3817 against 0.4479)
+    // and pull the two statistics apart, while 100 keeps them together. That is the direction the
+    // argument predicts, so the default stands.
+    //
+    // Stated honestly: this was measured on vkcube, whose picture is flat. The failure the control
+    // is really for -- blown and black speckle on DETAILED content at a high guard -- cannot be
+    // produced by this content at all, so what is above is corroboration and not a demonstration.
+    // Anyone with a real game and a high guard can settle it properly with
+    // `tools/measure.sh ratiosmooth 100 0`.
     std::atomic<uint32_t> ratioSmoothPercent;
 
     // SDR uses 8-bit ping-pong images by default. Enable 16-bit UNORM to avoid quantising between
