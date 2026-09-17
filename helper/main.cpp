@@ -1369,6 +1369,18 @@ struct OpticalFlowState {
     // Set whenever the pair this engine is about to compare does not follow from the pair
     // it last saw, and consumed by the next execute.
     bool hintsStale = true;
+    // What the device says it can do, read once at setup and logged. These have been
+    // available in VkPhysicalDeviceOpticalFlowPropertiesNV since the extension shipped and
+    // were queried and thrown away: the code read supportedOutputGridSizes out of the same
+    // struct and ignored the four capability booleans beside it.
+    bool costSupported = false;
+    bool globalSupported = false;
+    bool bidirSupported = false;
+    GpuImage cost{};        // per-block matching cost, at the flow grid, when enabled
+    GpuImage globalFlow{};  // one vector for the whole frame, 1x1, when enabled
+    VkFormat costFormat = VK_FORMAT_UNDEFINED;
+    bool costEnabled = false;
+    bool globalEnabled = false;
     bool currentToPrevious = true;
     bool flowTransferSrc = false;
     bool gpuConvertChecked = false;
@@ -1704,6 +1716,8 @@ static void DestroyOpticalFlow(VkCtx& c, OpticalFlowState& f) {
     DestroyImage2D(c, f.prev);
     DestroyImage2D(c, f.curr);
     DestroyImage2D(c, f.out);
+    DestroyImage2D(c, f.cost);
+    DestroyImage2D(c, f.globalFlow);
     f.enabled = false;
     f.inputFormat = f.flowFormat = VK_FORMAT_UNDEFINED;
     f.grid = 1;
@@ -1713,6 +1727,9 @@ static void DestroyOpticalFlow(VkCtx& c, OpticalFlowState& f) {
     f.userDisabled = false;
     f.hasPrev = false;
     f.hintsStale = true;
+    f.costEnabled = false;
+    f.globalEnabled = false;
+    f.costFormat = VK_FORMAT_UNDEFINED;
     f.currentToPrevious = true;
     f.flowTransferSrc = false;
     f.gpuConvertChecked = false;
@@ -1744,6 +1761,12 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
         props2.pNext = &props;
         vkGetPhysicalDeviceProperties2(c.physical, &props2);
         if (props.supportedOutputGridSizes) supported = props.supportedOutputGridSizes;
+        f.costSupported = props.costSupported == VK_TRUE;
+        f.globalSupported = props.globalFlowSupported == VK_TRUE;
+        f.bidirSupported = props.bidirectionalFlowSupported == VK_TRUE;
+        Log("[mvec] device caps: cost=%d global_flow=%d bidirectional=%d hint=%d grids=%#x",
+            int(f.costSupported), int(f.globalSupported), int(f.bidirSupported),
+            int(props.hintSupported == VK_TRUE), (unsigned)props.supportedOutputGridSizes);
         if (w < props.minWidth || h < props.minHeight || w > props.maxWidth || h > props.maxHeight) {
             Log("[mvec] size %ux%u outside NVOF limits %ux%u..%ux%u",
                 w, h, props.minWidth, props.minHeight, props.maxWidth, props.maxHeight);
@@ -1796,23 +1819,88 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
         return false;
     }
 
-    VkOpticalFlowSessionCreateInfoNV sci{};
-    sci.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_SESSION_CREATE_INFO_NV;
-    sci.width = w;
-    sci.height = h;
-    sci.imageFormat = f.inputFormat;
-    sci.flowVectorFormat = f.flowFormat;
-    sci.costFormat = VK_FORMAT_UNDEFINED;
-    sci.outputGridSize = gridBit;
-    sci.hintGridSize = VK_OPTICAL_FLOW_GRID_SIZE_UNKNOWN_NV;
-    sci.performanceLevel = quality == kMVecFast ? VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_FAST_NV
-        : quality == kMVecQuality ? VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_SLOW_NV
-                                          : VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_MEDIUM_NV;
-    sci.flags = 0;
-    if (vkCreateOpticalFlowSessionNV(c.device, &sci, nullptr, &f.session) != VK_SUCCESS) {
-        Log("[mvec] vkCreateOpticalFlowSessionNV failed");
+    // The engine can produce more than a forward vector field, and we have been asking for
+    // the least it offers: flags were hardcoded to 0 and costFormat to UNDEFINED, on a device
+    // that reports cost, global flow and bidirectional flow all supported.
+    //
+    // A ladder rather than a single request, because a capability the device advertises can
+    // still be refused for this particular session -- a grid, a format and a raster it does
+    // not like in combination. Each rung asks for less than the one above and the first that
+    // creates wins, so a driver that refuses the extras still gets exactly the session it
+    // got before.
+    //
+    // BOTH_DIRECTIONS is deliberately not a rung yet. It costs a second full flow surface
+    // every frame and nothing reads it until the round-trip gate exists; a capability with
+    // no consumer is a cost with no benefit. The device says it is available, which is the
+    // fact that gate needs.
+    const bool wantCost = f.costSupported;
+    const bool wantGlobal = f.globalSupported;
+    if (wantCost) {
+        const VkFormat costPreferred[] = { VK_FORMAT_R8_UINT, VK_FORMAT_R32_UINT };
+        if (!QueryOpticalFlowFormat(c, VK_OPTICAL_FLOW_USAGE_COST_BIT_NV, costPreferred,
+                                    uint32_t(sizeof(costPreferred) / sizeof(costPreferred[0])),
+                                    f.costFormat)) {
+            f.costFormat = VK_FORMAT_UNDEFINED;
+        }
+    }
+
+    struct Rung { bool cost; bool global; const char* name; };
+    const Rung ladder[] = {
+        { true,  true,  "cost+global" },
+        { true,  false, "cost" },
+        { false, true,  "global" },
+        { false, false, "forward only" },
+    };
+
+    const char* takenRung = "forward only";
+    for (const Rung& rung : ladder) {
+        if (rung.cost && (!wantCost || f.costFormat == VK_FORMAT_UNDEFINED)) continue;
+        if (rung.global && !wantGlobal) continue;
+
+        VkOpticalFlowSessionCreateInfoNV sci{};
+        sci.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_SESSION_CREATE_INFO_NV;
+        sci.width = w;
+        sci.height = h;
+        sci.imageFormat = f.inputFormat;
+        sci.flowVectorFormat = f.flowFormat;
+        sci.costFormat = rung.cost ? f.costFormat : VK_FORMAT_UNDEFINED;
+        sci.outputGridSize = gridBit;
+        sci.hintGridSize = VK_OPTICAL_FLOW_GRID_SIZE_UNKNOWN_NV;
+        sci.performanceLevel = quality == kMVecFast ? VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_FAST_NV
+            : quality == kMVecQuality ? VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_SLOW_NV
+                                              : VK_OPTICAL_FLOW_PERFORMANCE_LEVEL_MEDIUM_NV;
+        sci.flags = 0;
+        if (rung.cost) sci.flags |= VK_OPTICAL_FLOW_SESSION_CREATE_ENABLE_COST_BIT_NV;
+        if (rung.global) sci.flags |= VK_OPTICAL_FLOW_SESSION_CREATE_ENABLE_GLOBAL_FLOW_BIT_NV;
+
+        if (vkCreateOpticalFlowSessionNV(c.device, &sci, nullptr, &f.session) != VK_SUCCESS) {
+            f.session = VK_NULL_HANDLE;
+            continue;
+        }
+        f.costEnabled = rung.cost;
+        f.globalEnabled = rung.global;
+        takenRung = rung.name;
+        break;
+    }
+    if (!f.session) {
+        Log("[mvec] vkCreateOpticalFlowSessionNV failed on every rung");
         DestroyOpticalFlow(c, f);
         return false;
+    }
+
+    // The extra surfaces the rung asked for. A failure here drops back to a plain forward
+    // session rather than failing the whole flow path: the extras are diagnostics and
+    // future inputs, and the vector field is the thing that matters.
+    if (f.costEnabled &&
+        !CreateImage2DOpticalFlow(c, f.costFormat, ow, oh, VK_OPTICAL_FLOW_USAGE_COST_BIT_NV, f.cost)) {
+        Log("[mvec] cost image creation failed; continuing without it");
+        f.costEnabled = false;
+    }
+    if (f.globalEnabled &&
+        !CreateImage2DOpticalFlow(c, f.flowFormat, 1, 1, VK_OPTICAL_FLOW_USAGE_GLOBAL_FLOW_BIT_NV,
+                                  f.globalFlow)) {
+        Log("[mvec] global-flow image creation failed; continuing without it");
+        f.globalEnabled = false;
     }
 
     GpuImage& refImg = f.currentToPrevious ? f.prev : f.curr;
@@ -1823,6 +1911,22 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
         VK_OPTICAL_FLOW_SESSION_BINDING_POINT_INPUT_NV, inImg.view, VK_IMAGE_LAYOUT_GENERAL);
     VkResult bindOut = vkBindOpticalFlowSessionImageNV(c.device, f.session,
         VK_OPTICAL_FLOW_SESSION_BINDING_POINT_FLOW_VECTOR_NV, f.out.view, VK_IMAGE_LAYOUT_GENERAL);
+    if (f.costEnabled) {
+        if (vkBindOpticalFlowSessionImageNV(c.device, f.session,
+                VK_OPTICAL_FLOW_SESSION_BINDING_POINT_COST_NV, f.cost.view,
+                VK_IMAGE_LAYOUT_GENERAL) != VK_SUCCESS) {
+            Log("[mvec] could not bind the cost image; continuing without it");
+            f.costEnabled = false;
+        }
+    }
+    if (f.globalEnabled) {
+        if (vkBindOpticalFlowSessionImageNV(c.device, f.session,
+                VK_OPTICAL_FLOW_SESSION_BINDING_POINT_GLOBAL_FLOW_NV, f.globalFlow.view,
+                VK_IMAGE_LAYOUT_GENERAL) != VK_SUCCESS) {
+            Log("[mvec] could not bind the global-flow image; continuing without it");
+            f.globalEnabled = false;
+        }
+    }
     if (bindRef != VK_SUCCESS || bindIn != VK_SUCCESS || bindOut != VK_SUCCESS) {
         Log("[mvec] failed to bind NVOF session images ref=%d input=%d out=%d",
             (int)bindRef, (int)bindIn, (int)bindOut);
@@ -1852,8 +1956,8 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
     // "external_hints" rather than "hints": this field is sci.hintGridSize, an external
     // hint GRID that we genuinely do not supply. It is not the session's own temporal
     // hints, which are per-execute and were on unconditionally until they were named here.
-    Log("[mvec] session grid=%u perf=%u cost=off external_hints=off flags=%u",
-        f.grid, (unsigned)sci.performanceLevel, (unsigned)sci.flags);
+    Log("[mvec] session grid=%u rung=%s cost=%s global_flow=%s external_hints=off",
+        f.grid, takenRung, f.costEnabled ? "on" : "off", f.globalEnabled ? "on" : "off");
     return true;
 }
 
