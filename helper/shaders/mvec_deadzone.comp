@@ -29,6 +29,35 @@ layout(constant_id = 4) const uint  cDstH     = 1080u; // MVec height
 layout(constant_id = 6) const float cDeadzone = 0.5;   // px, full-res units
 layout(constant_id = 7) const uint  cBilinear = 1u;    // 1 = bilinear upscale, 0 = nearest
 
+// Confidence ramp over the engine's per-block matching cost. INERT when cCostHi <= cCostLo,
+// which is the shipped default and is deliberate: NVOF cost is an unnormalised per-block
+// matching cost whose scale depends on grid size and performance level, so any threshold is
+// per-configuration and inventing one here would silently delete real motion. The capability
+// is wired and off, which is a far better state than not wired: measuring it needs a config
+// change rather than a rebuild.
+//
+// A ramp rather than a cut, because a binary confidence threshold makes a cell near the
+// boundary alternate between "moved" and "did not move" on successive frames, and that
+// flicker goes straight into a temporal accumulator.
+layout(constant_id = 8) const float cCostLo   = 0.0;
+layout(constant_id = 9) const float cCostHi   = 0.0;
+layout(constant_id = 10) const uint cHasCost  = 0u;
+
+// Forward/backward round-trip gate. Also inert by default.
+//
+// A forward vector is evidence that something moved only if the backward vector where it
+// lands comes back. Where content is occluded in the reference frame, or the estimator
+// locked onto a repeating pattern, the two contradict each other -- and that is the failure
+// a magnitude deadzone cannot see, because above its search range the engine returns a
+// SMALL wrong vector rather than a large one.
+//
+// The tolerance scales with the motion: a 20 px vector is allowed more round-trip error than
+// a static one, which is what separates a large correct vector from a large wrong one.
+// Rejection is by zeroing rather than fading -- an occluded cell has no motion to scale down.
+layout(constant_id = 11) const uint  cRoundTrip    = 0u;
+layout(constant_id = 12) const float cRoundTripAbs = 0.75;  // px of slack at zero motion
+layout(constant_id = 13) const float cRoundTripRel = 0.05;  // plus this much per px of motion
+
 layout(rg16ui,   binding = 0) uniform readonly  highp uimage2D srcFlow;
 // rg16f, matching VK_FORMAT_R16G16_SFLOAT exactly. This declared rgba16f, and a storage
 // image whose declared format does not match its view's is undefined for the WHOLE image,
@@ -37,6 +66,12 @@ layout(rg16ui,   binding = 0) uniform readonly  highp uimage2D srcFlow;
 // composition shader's deliberate Rgba32f-over-UNORM mismatch, which is inherited from
 // upstream and measured, this one was simply wrong.
 layout(rg16f,    binding = 1) uniform writeonly highp image2D  dstMVec;
+// Always declared and always bound, whatever the session granted: a descriptor has to be
+// valid for every binding the shader declares, so an absent surface is bound as a 1x1
+// stand-in and the spec constants above decide whether it is read. Same reasoning as the
+// composition pass's dummy image.
+layout(r8ui,     binding = 2) uniform readonly  highp uimage2D srcCost;
+layout(rg16ui,   binding = 3) uniform readonly  highp uimage2D srcBack;
 
 #ifndef FLOW_FIXED5
 #error "compile with -D FLOW_FIXED5=1 (R16G16_SFIXED5_NV) or -D FLOW_FIXED5=0 (R16G16_SFLOAT)"
@@ -59,9 +94,32 @@ vec2 DecodeFlow(uvec2 raw) {
 
 // Deadzone applied per NVOF grid vector: low-magnitude noise clamps to exact
 // zero so DLSSNR static accumulation stays perfectly locked.
+//
+// Order matters. Confidence scales the vector FIRST and the deadzone cuts second, so a
+// low-confidence vector shrinks toward zero and is then cut on what it has become. Cutting
+// on the raw magnitude first would let a confidently-wrong large vector through and discard
+// a faint but trustworthy one.
 vec2 SampleFlow(ivec2 p) {
     p = clamp(p, ivec2(0), ivec2(int(cSrcW), int(cSrcH)) - 1);
     vec2 v = DecodeFlow(imageLoad(srcFlow, p).xy);
+
+    if (cHasCost != 0u && cCostHi > cCostLo) {
+        float cost = float(imageLoad(srcCost, p).x);
+        v *= clamp((cCostHi - cost) / (cCostHi - cCostLo), 0.0, 1.0);
+    }
+
+    if (cRoundTrip != 0u) {
+        // Read the backward field where the forward vector LANDS, not where it starts.
+        ivec2 land = clamp(p + ivec2(round(v / float(cGrid))),
+                           ivec2(0), ivec2(int(cSrcW), int(cSrcH)) - 1);
+        vec2 b = DecodeFlow(imageLoad(srcBack, land).xy);
+        vec2 residual = v + b;
+        float slack = cRoundTripAbs + cRoundTripRel * length(v);
+        if (dot(residual, residual) > slack * slack) {
+            return vec2(0.0);
+        }
+    }
+
     if (dot(v, v) < cDeadzone * cDeadzone) {
         return vec2(0.0);
     }

@@ -174,6 +174,7 @@ VK_FN(vkCreateShaderModule) VK_FN(vkDestroyShaderModule)
 VK_FN(vkCreatePipelineLayout) VK_FN(vkDestroyPipelineLayout)
 VK_FN(vkCreateComputePipelines) VK_FN(vkDestroyPipeline)
 VK_FN(vkCmdBindPipeline) VK_FN(vkCmdDispatch) VK_FN(vkCmdBindDescriptorSets)
+VK_FN(vkCmdPushDescriptorSetKHR)
 VK_FN(vkCreateDescriptorSetLayout) VK_FN(vkDestroyDescriptorSetLayout)
 VK_FN(vkCreateDescriptorPool) VK_FN(vkDestroyDescriptorPool)
 VK_FN(vkAllocateDescriptorSets) VK_FN(vkUpdateDescriptorSets)
@@ -244,6 +245,16 @@ struct VkCtx {
     bool flowQueryAvailable = false;
     bool fenceTimedOut = false;  // the GPU stopped retiring our work; stand down
     bool memoryBudget = false;   // VK_EXT_memory_budget is available
+    // VK_KHR_push_descriptor: lets the MVec pass hand its images to the command buffer at
+    // record time instead of owning a pool, a set and the question of whether that set is
+    // still in flight. It stops being a nicety the moment the binding COUNT varies with what
+    // the optical-flow session granted, because a pool sized for one rung has to be torn
+    // down and rebuilt for another.
+    bool pushDescriptors = false;
+    // 1x1 stand-ins for the two optional bindings, so every declared binding always has a
+    // valid descriptor whatever rung the session took.
+    GpuImage dummyCost{};
+    GpuImage dummyBack{};
     VkResult lastQueueResult = VK_SUCCESS;  // why the last submit or fence wait failed
     VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
     bool pinMissed = false;      // DLSSNR_GPU_UUID/INDEX named a device that is not here
@@ -383,6 +394,7 @@ static bool CreateContext(VkCtx& c) {
     LOAD(vkCreateDescriptorSetLayout) LOAD(vkDestroyDescriptorSetLayout)
     LOAD(vkCreateDescriptorPool) LOAD(vkDestroyDescriptorPool)
     LOAD(vkAllocateDescriptorSets) LOAD(vkUpdateDescriptorSets)
+    LOAD(vkCmdPushDescriptorSetKHR)
 #undef LOAD
 
     uint32_t devCount = 0;
@@ -506,6 +518,7 @@ static bool CreateContext(VkCtx& c) {
         if (HasDeviceExt(c.physical, e)) enabled.push_back(e);
     c.sync2 = HasDeviceExt(c.physical, "VK_KHR_synchronization2");
     c.memoryBudget = HasDeviceExt(c.physical, "VK_EXT_memory_budget");
+    c.pushDescriptors = HasDeviceExt(c.physical, "VK_KHR_push_descriptor");
     VkPhysicalDeviceOpticalFlowFeaturesNV flowFeatures{};
     flowFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV;
     flowFeatures.opticalFlow = VK_TRUE;
@@ -1376,6 +1389,10 @@ struct OpticalFlowState {
     bool costSupported = false;
     bool globalSupported = false;
     bool bidirSupported = false;
+    VkImageView costBitsView = nullptr;  // r8ui view of the cost image
+    VkImageView backBitsView = nullptr;  // R16G16_UINT view of the backward flow
+    GpuImage back{};        // backward flow field, when the both-directions rung was taken
+    bool backEnabled = false;
     GpuImage cost{};        // per-block matching cost, at the flow grid, when enabled
     GpuImage globalFlow{};  // one vector for the whole frame, 1x1, when enabled
     VkFormat costFormat = VK_FORMAT_UNDEFINED;
@@ -1576,6 +1593,52 @@ static uint32_t MVecBilinear() {
     return v;
 }
 
+// Both gates are read from the environment and both ship inert.
+//
+// The cost thresholds default equal, which disables the ramp: NVOF cost is an unnormalised
+// per-block matching cost whose scale depends on the grid and the performance level, so any
+// threshold is per-configuration and a number invented here would silently delete real
+// motion. The round trip defaults off because its tolerance has not been calibrated on game
+// content -- the project it comes from measured it on video, where every object is real, and
+// reported that on synthetic patterns it went the other way. Wired and off is a much better
+// state than not wired: measuring either needs a variable, not a rebuild.
+static float MVecEnvFloat(const char* name, float def) {
+    const char* p = getenv(name);
+    if (!p || !*p) return def;
+    return (float)atof(p);
+}
+
+static float MVecCostLo() {
+    static const float v = MVecEnvFloat("DLSSNR_MVEC_COST_LO", 0.0f);
+    return v;
+}
+
+static float MVecCostHi() {
+    static const float v = MVecEnvFloat("DLSSNR_MVEC_COST_HI", 0.0f);
+    return v;
+}
+
+static bool MVecRoundTrip() {
+    static const bool v = [] {
+        const char* p = getenv("DLSSNR_MVEC_ROUNDTRIP");
+        return p && p[0] == '1';
+    }();
+    return v;
+}
+
+// Slack at zero motion, plus this much per pixel of motion. The scaling is the point: a
+// 20 px vector is allowed 1.75 px of round-trip error and a static one 0.75, which is what
+// separates a large correct vector from a large wrong one. A fixed threshold cannot.
+static float MVecRoundTripAbs() {
+    static const float v = MVecEnvFloat("DLSSNR_MVEC_ROUNDTRIP_ABS", 0.75f);
+    return v;
+}
+
+static float MVecRoundTripRel() {
+    static const float v = MVecEnvFloat("DLSSNR_MVEC_ROUNDTRIP_REL", 0.05f);
+    return v;
+}
+
 static float MVecDeadzone() {
     static const float v = [] {
         const char* p = getenv("DLSSNR_MVEC_DEADZONE");
@@ -1585,6 +1648,20 @@ static float MVecDeadzone() {
         return f;
     }();
     return v;
+}
+
+static constexpr uint32_t kMVecBindings = 4;
+
+// One place that decides what each binding points at, used by both the pool path and the
+// push path so they cannot drift. GENERAL throughout: these are STORAGE_IMAGE descriptors
+// and a storage image may only be GENERAL.
+static void MVecDescriptorImages(VkCtx& c, OpticalFlowState& f, NeuralState& ns,
+                                 VkDescriptorImageInfo* out) {
+    out[0] = { nullptr, f.outBitsView, VK_IMAGE_LAYOUT_GENERAL };
+    out[1] = { nullptr, ns.mv.view, VK_IMAGE_LAYOUT_GENERAL };
+    out[2] = { nullptr, f.costBitsView ? f.costBitsView : c.dummyCost.view, VK_IMAGE_LAYOUT_GENERAL };
+    out[3] = { nullptr, f.backBitsView ? f.backBitsView : c.dummyBack.view,
+               VK_IMAGE_LAYOUT_GENERAL };
 }
 
 static bool EnsureMVecComputeObjects(VkCtx& c) {
@@ -1605,8 +1682,12 @@ static bool EnsureMVecComputeObjects(VkCtx& c) {
         c.mvShaderFixed5 = nullptr;
         return false;
     }
-    VkDescriptorSetLayoutBinding bindings[2] = {};
-    for (uint32_t i = 0; i < 2; ++i) {
+    // Four now: flow in, MVec out, cost, backward flow. The last two are read only when
+    // their spec constants say so, but a descriptor has to be valid for every binding the
+    // shader declares, so they are always bound -- to a 1x1 stand-in when the session did
+    // not grant them.
+    VkDescriptorSetLayoutBinding bindings[kMVecBindings] = {};
+    for (uint32_t i = 0; i < kMVecBindings; ++i) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         bindings[i].descriptorCount = 1;
@@ -1614,7 +1695,12 @@ static bool EnsureMVecComputeObjects(VkCtx& c) {
     }
     VkDescriptorSetLayoutCreateInfo dli{};
     dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dli.bindingCount = 2; dli.pBindings = bindings;
+    dli.bindingCount = kMVecBindings; dli.pBindings = bindings;
+    // With push descriptors the images are handed to the command buffer at record time, so
+    // there is no pool, no set, and no question of updating a set that may still be in
+    // flight. The pool path stays as the fallback -- unlike the project this came from we
+    // should not refuse a driver over it, because the existing path works.
+    if (c.pushDescriptors) dli.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     if (vkCreateDescriptorSetLayout(c.device, &dli, nullptr, &c.mvDescLayout) != VK_SUCCESS) return false;
     VkPipelineLayoutCreateInfo pli{};
     pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1638,17 +1724,48 @@ static void DestroyMVecComputePass(VkCtx& c, OpticalFlowState& f) {
     f.mvSet = nullptr;  // freed with the pool
     if (f.outBitsView && vkDestroyImageView) vkDestroyImageView(c.device, f.outBitsView, nullptr);
     f.outBitsView = nullptr;
+    if (f.costBitsView && vkDestroyImageView) vkDestroyImageView(c.device, f.costBitsView, nullptr);
+    f.costBitsView = nullptr;
+    if (f.backBitsView && vkDestroyImageView) vkDestroyImageView(c.device, f.backBitsView, nullptr);
+    f.backBitsView = nullptr;
     f.gpuCompute = false;
 }
 
 // Builds the per-size compute pipeline + descriptor set. The compute pass reads
 // the raw NVOF texels through a size-compatible R16G16_UINT view of the session
 // output image and writes filtered vectors straight into the MVec resource.
+// The 1x1 stand-ins, made once and kept. Vulkan requires a valid descriptor for every
+// binding the shader declares, whether or not the shader reads it, and the two optional
+// bindings exist or not depending on the rung the session took. One tiny image each is a far
+// smaller price than compiling a variant per combination.
+static bool EnsureMVecDummies(VkCtx& c, VkFormat costFormat) {
+    if (!c.dummyCost.image) {
+        if (!CreateImage2DUsage(c, costFormat == VK_FORMAT_UNDEFINED ? VK_FORMAT_R8_UINT : costFormat,
+                                1, 1, VK_IMAGE_USAGE_STORAGE_BIT, c.dummyCost))
+            return false;
+    }
+    if (!c.dummyBack.image) {
+        // Created directly as R16G16_UINT rather than as a flow-format image with an alias
+        // view over it. The real backward surface has to be aliased because the ENGINE
+        // writes it in the flow format and the shader reads it as bits; nothing writes this
+        // one, so there is no reason to give it two formats -- and giving it two would need
+        // MUTABLE_FORMAT, which is the exact spec violation already fixed once in this file.
+        if (!CreateImage2DUsage(c, VK_FORMAT_R16G16_UINT, 1, 1,
+                                VK_IMAGE_USAGE_STORAGE_BIT, c.dummyBack))
+            return false;
+    }
+    return true;
+}
+
 static bool BuildMVecComputePass(NeuralState& ns, uint32_t ow, uint32_t oh) {
     VkCtx& c = ns.vk;
     OpticalFlowState& f = ns.flow;
     DestroyMVecComputePass(c, f);
     if (!c.mvComputeSupported || !ns.mv.image || !f.out.image || !EnsureMVecComputeObjects(c)) return false;
+    if (!EnsureMVecDummies(c, f.costFormat)) {
+        Log("[mvec] could not create the stand-in images for the optional bindings");
+        return false;
+    }
     const bool fixed5 = f.flowFormat == VK_FORMAT_R16G16_SFIXED5_NV;
     if (!fixed5 && f.flowFormat != VK_FORMAT_R16G16_SFLOAT) return false;  // two modules, two formats
     VkImageViewCreateInfo vi{};
@@ -1661,24 +1778,56 @@ static bool BuildMVecComputePass(NeuralState& ns, uint32_t ow, uint32_t oh) {
         Log("[mvec] R16G16_UINT view on NVOF output failed");
         return false;
     }
+    // The backward field is the same format as the forward one and is read the same way, so
+    // it gets the same size-compatible R16G16_UINT alias. The cost image is already an
+    // integer format and only needs a plain view. Both are optional: a failure here means
+    // that gate cannot run, not that the pass cannot.
+    if (f.backEnabled && f.back.image) {
+        vi.image = f.back.image;
+        vi.format = VK_FORMAT_R16G16_UINT;
+        if (vkCreateImageView(c.device, &vi, nullptr, &f.backBitsView) != VK_SUCCESS) {
+            Log("[mvec] R16G16_UINT view on the backward flow failed; round trip unavailable");
+            f.backBitsView = nullptr;
+        }
+    }
+    if (f.costEnabled && f.cost.image) {
+        vi.image = f.cost.image;
+        vi.format = f.costFormat;
+        if (vkCreateImageView(c.device, &vi, nullptr, &f.costBitsView) != VK_SUCCESS) {
+            Log("[mvec] cost view failed; the cost ramp is unavailable");
+            f.costBitsView = nullptr;
+        }
+    }
     struct SpecData {
         uint32_t grid, srcW, srcH, dstW, dstH;
         float deadzone;
         uint32_t bilinear;
+        float costLo, costHi;
+        uint32_t hasCost;
+        uint32_t roundTrip;
+        float roundTripAbs, roundTripRel;
     } data{};
     data.grid = f.grid ? f.grid : 1u;
     data.srcW = ow; data.srcH = oh;
     data.dstW = ns.mv.width; data.dstH = ns.mv.height;
     data.deadzone = MVecDeadzone();
     data.bilinear = MVecBilinear();
-    // Constants 0-4, 6, 7; there is no constant 5 any more -- the format moved from a
+    data.costLo = MVecCostLo();
+    data.costHi = MVecCostHi();
+    data.hasCost = f.costEnabled && f.costBitsView ? 1u : 0u;
+    data.roundTrip = f.backEnabled && f.backBitsView && MVecRoundTrip() ? 1u : 0u;
+    data.roundTripAbs = MVecRoundTripAbs();
+    data.roundTripRel = MVecRoundTripRel();
+    // Constants 0-4 and 6-13; there is no constant 5 any more -- the format moved from a
     // specialization constant to the choice of module.
-    VkSpecializationMapEntry entries[7] = {
+    VkSpecializationMapEntry entries[13] = {
         {0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4},
         {4, 16, 4}, {6, 20, 4}, {7, 24, 4},
+        {8, 28, 4}, {9, 32, 4}, {10, 36, 4},
+        {11, 40, 4}, {12, 44, 4}, {13, 48, 4},
     };
     VkSpecializationInfo sp{};
-    sp.mapEntryCount = 7; sp.pMapEntries = entries;
+    sp.mapEntryCount = 13; sp.pMapEntries = entries;
     sp.dataSize = sizeof(data); sp.pData = &data;
     VkComputePipelineCreateInfo cpi{};
     cpi.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -1693,41 +1842,48 @@ static bool BuildMVecComputePass(NeuralState& ns, uint32_t ow, uint32_t oh) {
         DestroyMVecComputePass(c, f);
         return false;
     }
-    VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 };
-    VkDescriptorPoolCreateInfo dpci{};
-    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &poolSize;
-    if (vkCreateDescriptorPool(c.device, &dpci, nullptr, &f.mvPool) != VK_SUCCESS) {
-        DestroyMVecComputePass(c, f);
-        return false;
+    // Only the pool path needs a pool. With push descriptors the images go to the command
+    // buffer at record time, and the whole "is this set still in flight" question never
+    // arises -- which is what makes a binding count that varies with the session's rung
+    // cheap rather than a rebuild.
+    if (!c.pushDescriptors) {
+        VkDescriptorPoolSize poolSize{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMVecBindings };
+        VkDescriptorPoolCreateInfo dpci{};
+        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpci.maxSets = 1; dpci.poolSizeCount = 1; dpci.pPoolSizes = &poolSize;
+        if (vkCreateDescriptorPool(c.device, &dpci, nullptr, &f.mvPool) != VK_SUCCESS) {
+            DestroyMVecComputePass(c, f);
+            return false;
+        }
+        VkDescriptorSetAllocateInfo dsai{};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = f.mvPool; dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &c.mvDescLayout;
+        if (vkAllocateDescriptorSets(c.device, &dsai, &f.mvSet) != VK_SUCCESS) {
+            DestroyMVecComputePass(c, f);
+            return false;
+        }
+        VkDescriptorImageInfo info[kMVecBindings];
+        MVecDescriptorImages(c, f, ns, info);
+        VkWriteDescriptorSet writes[kMVecBindings] = {};
+        for (uint32_t i = 0; i < kMVecBindings; ++i) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = f.mvSet;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[i].pImageInfo = &info[i];
+        }
+        vkUpdateDescriptorSets(c.device, kMVecBindings, writes, 0, nullptr);
     }
-    VkDescriptorSetAllocateInfo dsai{};
-    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsai.descriptorPool = f.mvPool; dsai.descriptorSetCount = 1; dsai.pSetLayouts = &c.mvDescLayout;
-    if (vkAllocateDescriptorSets(c.device, &dsai, &f.mvSet) != VK_SUCCESS) {
-        DestroyMVecComputePass(c, f);
-        return false;
-    }
-    // GENERAL, not SHADER_READ_ONLY_OPTIMAL: this is bound as a STORAGE_IMAGE and read with
-    // imageLoad, and a storage image may only be GENERAL (or SHARED_PRESENT). The declared
-    // layout here and the image's actual layout at dispatch have to agree, so the barrier
-    // before the dispatch moves to GENERAL too.
-    VkDescriptorImageInfo srcInfo{ nullptr, f.outBitsView, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo dstInfo{ nullptr, ns.mv.view, VK_IMAGE_LAYOUT_GENERAL };
-    VkWriteDescriptorSet writes[2] = {};
-    for (uint32_t i = 0; i < 2; ++i) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = f.mvSet;
-        writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        writes[i].pImageInfo = i == 0 ? &srcInfo : &dstInfo;
-    }
-    vkUpdateDescriptorSets(c.device, 2, writes, 0, nullptr);
     f.gpuCompute = true;
     Log("[mvec] GPU deadzone pass ready grid=%u flow=%ux%u mvec=%ux%u fixed5=%u deadzone=%.3f",
         data.grid, ow, oh, data.dstW, data.dstH, fixed5 ? 1u : 0u, data.deadzone);
-    Log("[mvec] upsample filter: %s", data.bilinear ? "bilinear" : "nearest");
+    Log("[mvec] upsample filter: %s  descriptors=%s", data.bilinear ? "bilinear" : "nearest",
+        c.pushDescriptors ? "push" : "pool");
+    Log("[mvec] cost ramp %s (lo=%.3f hi=%.3f)  round-trip gate %s (abs=%.2f rel=%.3f)",
+        data.hasCost && data.costHi > data.costLo ? "ON" : "inert", data.costLo, data.costHi,
+        data.roundTrip ? "ON" : "inert", data.roundTripAbs, data.roundTripRel);
     return true;
 }
 
@@ -1742,6 +1898,7 @@ static void DestroyOpticalFlow(VkCtx& c, OpticalFlowState& f) {
     DestroyImage2D(c, f.out);
     DestroyImage2D(c, f.cost);
     DestroyImage2D(c, f.globalFlow);
+    DestroyImage2D(c, f.back);
     f.enabled = false;
     f.inputFormat = f.flowFormat = VK_FORMAT_UNDEFINED;
     f.grid = 1;
@@ -1753,6 +1910,7 @@ static void DestroyOpticalFlow(VkCtx& c, OpticalFlowState& f) {
     f.hintsStale = true;
     f.costEnabled = false;
     f.globalEnabled = false;
+    f.backEnabled = false;
     f.costFormat = VK_FORMAT_UNDEFINED;
     f.currentToPrevious = true;
     f.flowTransferSrc = false;
@@ -1868,18 +2026,55 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
         }
     }
 
-    struct Rung { bool cost; bool global; const char* name; };
-    const Rung ladder[] = {
-        { true,  true,  "cost+global" },
-        { true,  false, "cost" },
-        { false, true,  "global" },
-        { false, false, "forward only" },
+    // Both directions is only asked for when something will read it: it costs a second full
+    // flow surface every frame, and the round-trip gate is the only consumer.
+    const bool wantBoth = f.bidirSupported && MVecRoundTrip();
+
+    // The order is measured, not assumed, and the measurement is the reason this is not the
+    // obvious ladder. On the driver this was developed against (RTX 5090, Blackwell), asking
+    // for ENABLE_COST and BOTH_DIRECTIONS together does not fail -- the session creates, every
+    // bind succeeds, validation is clean -- and the engine then writes ZEROS into both the
+    // forward and the backward field. Silently. Sampling the surfaces directly is the only
+    // way it shows:
+    //
+    //     cost + global                 forward OK
+    //     bidirectional alone           forward OK, backward OK (exactly negated)
+    //     global + bidirectional        forward OK, backward OK
+    //     cost + bidirectional          both fields ZERO
+    //     cost + global + bidirectional both fields ZERO
+    //
+    // So cost and bidirectional never appear on the same rung. Which family is tried first
+    // depends on what is asked for: the round-trip gate needs the backward field, everything
+    // else is better served by the cost buffer.
+    //
+    // This is also the answer to why a ladder at all. A capability the device advertises can
+    // be refused for a particular session -- but it can also be accepted and then not
+    // delivered, which no return code will tell you about.
+    struct Rung { bool cost; bool global; bool both; const char* name; };
+    const Rung bidirFirst[] = {
+        { false, true,  true,  "global+bidirectional" },
+        { false, false, true,  "bidirectional" },
+        { true,  true,  false, "cost+global" },
+        { true,  false, false, "cost" },
+        { false, true,  false, "global" },
+        { false, false, false, "forward only" },
     };
+    const Rung costFirst[] = {
+        { true,  true,  false, "cost+global" },
+        { true,  false, false, "cost" },
+        { false, true,  false, "global" },
+        { false, false, false, "forward only" },
+    };
+    const Rung* ladder = wantBoth ? bidirFirst : costFirst;
+    const size_t ladderCount = wantBoth ? sizeof(bidirFirst) / sizeof(bidirFirst[0])
+                                        : sizeof(costFirst) / sizeof(costFirst[0]);
 
     const char* takenRung = "forward only";
-    for (const Rung& rung : ladder) {
+    for (size_t ri = 0; ri < ladderCount; ++ri) {
+        const Rung& rung = ladder[ri];
         if (rung.cost && (!wantCost || f.costFormat == VK_FORMAT_UNDEFINED)) continue;
         if (rung.global && !wantGlobal) continue;
+        if (rung.both && !wantBoth) continue;
 
         VkOpticalFlowSessionCreateInfoNV sci{};
         sci.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_SESSION_CREATE_INFO_NV;
@@ -1896,6 +2091,7 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
         sci.flags = 0;
         if (rung.cost) sci.flags |= VK_OPTICAL_FLOW_SESSION_CREATE_ENABLE_COST_BIT_NV;
         if (rung.global) sci.flags |= VK_OPTICAL_FLOW_SESSION_CREATE_ENABLE_GLOBAL_FLOW_BIT_NV;
+        if (rung.both) sci.flags |= VK_OPTICAL_FLOW_SESSION_CREATE_BOTH_DIRECTIONS_BIT_NV;
 
         if (vkCreateOpticalFlowSessionNV(c.device, &sci, nullptr, &f.session) != VK_SUCCESS) {
             f.session = VK_NULL_HANDLE;
@@ -1903,6 +2099,7 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
         }
         f.costEnabled = rung.cost;
         f.globalEnabled = rung.global;
+        f.backEnabled = rung.both;
         takenRung = rung.name;
         break;
     }
@@ -1925,6 +2122,12 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
                                   f.globalFlow)) {
         Log("[mvec] global-flow image creation failed; continuing without it");
         f.globalEnabled = false;
+    }
+    if (f.backEnabled &&
+        !CreateImage2DOpticalFlow(c, f.flowFormat, ow, oh, VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV,
+                                  f.back)) {
+        Log("[mvec] backward-flow image creation failed; continuing without it");
+        f.backEnabled = false;
     }
 
     GpuImage& refImg = f.currentToPrevious ? f.prev : f.curr;
@@ -1949,6 +2152,14 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
                 VK_IMAGE_LAYOUT_GENERAL) != VK_SUCCESS) {
             Log("[mvec] could not bind the global-flow image; continuing without it");
             f.globalEnabled = false;
+        }
+    }
+    if (f.backEnabled) {
+        if (vkBindOpticalFlowSessionImageNV(c.device, f.session,
+                VK_OPTICAL_FLOW_SESSION_BINDING_POINT_BACKWARD_FLOW_VECTOR_NV, f.back.view,
+                VK_IMAGE_LAYOUT_GENERAL) != VK_SUCCESS) {
+            Log("[mvec] could not bind the backward-flow image; continuing without it");
+            f.backEnabled = false;
         }
     }
     if (bindRef != VK_SUCCESS || bindIn != VK_SUCCESS || bindOut != VK_SUCCESS) {
@@ -2000,9 +2211,53 @@ static bool DebugMVecEnabled() {
     return v;
 }
 
+// Sample one NVOF output surface at the centre and report its magnitude statistics. Used for
+// the forward field and, when the bidirectional rung was taken, for the backward one -- the
+// round-trip gate is only as good as the field it compares against, and "the gate rejected
+// everything" and "the backward field is empty" look identical from the outside.
+static void LogFlowSurface(NeuralState& ns, GpuImage& img, const char* what) {
+    OpticalFlowState& f = ns.flow;
+    if (!img.image || !ns.vk.readMap || !ns.vk.readStaging) return;
+    const uint32_t rw = img.width < 16u ? img.width : 16u;
+    const uint32_t rh = img.height < 16u ? img.height : 16u;
+    if (!rw || !rh) return;
+    if (!BeginCmd(ns.vk.cmdScratch)) return;
+    VkBufferImageCopy region{};
+    region.imageSubresource = { img.aspect(), 0, 0, 1 };
+    region.imageOffset = { int32_t(img.width / 2 - rw / 2), int32_t(img.height / 2 - rh / 2), 0 };
+    region.imageExtent = { rw, rh, 1 };
+    vkCmdCopyImageToBuffer(ns.vk.cmdScratch, img.image, img.layout,
+                           ns.vk.readStaging, 1, &region);
+    if (!SubmitAndWait(ns.vk, ns.vk.cmdScratch)) return;
+    const size_t n = size_t(rw) * rh;
+    double mx = 0.0, sum = 0.0;
+    size_t nz = 0;
+    float sx = 0.0f, sy = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        float x, y;
+        if (f.flowFormat == VK_FORMAT_R16G16_SFIXED5_NV) {
+            const uint16_t* src = (const uint16_t*)ns.vk.readMap;
+            x = float(int16_t(src[i * 2 + 0])) / 32.0f;
+            y = float(int16_t(src[i * 2 + 1])) / 32.0f;
+        } else {
+            const uint16_t* src = (const uint16_t*)ns.vk.readMap;
+            x = HalfToFloat(src[i * 2 + 0]);
+            y = HalfToFloat(src[i * 2 + 1]);
+        }
+        if (i == 0) { sx = x; sy = y; }
+        const double mag = std::sqrt(double(x) * x + double(y) * y);
+        if (mag > mx) mx = mag;
+        sum += mag;
+        if (mag > 0.01) ++nz;
+    }
+    Log("[mvec] debug %s %ux%u max=%.3f mean=%.3f nonzero=%zu/%zu first=%.3f,%.3f", what, rw, rh,
+        mx, sum / double(n), nz, n, sx, sy);
+}
+
 static void LogFlowStats(NeuralState& ns) {
     OpticalFlowState& f = ns.flow;
     if (!f.enabled || !f.flowTransferSrc || !ns.vk.readMap || !ns.vk.readStaging) return;
+    if (f.backEnabled && f.back.image) LogFlowSurface(ns, f.back, "backward");
     const uint32_t rw = f.out.width < 16u ? f.out.width : 16u;
     const uint32_t rh = f.out.height < 16u ? f.out.height : 16u;
     if (!rw || !rh) return;
@@ -2343,6 +2598,17 @@ static bool RunOpticalFlow(NeuralState& ns) {
                      VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
                      VK_ACCESS_2_MEMORY_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+    // The extra surfaces the rung granted are written by the engine exactly as f.out is, so
+    // they need the same layout. A no-op after the first frame -- the transition helper
+    // tracks what it last set.
+    if (f.costEnabled && f.cost.image)
+        TransitionImage2(ns.vk, cb, f.cost, VK_IMAGE_LAYOUT_GENERAL, 0,
+                         VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
+    if (f.backEnabled && f.back.image)
+        TransitionImage2(ns.vk, cb, f.back, VK_IMAGE_LAYOUT_GENERAL, 0,
+                         VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT);
 
     WriteFlowTimestampBegin(ns.vk, cb);
     const int prepFence = SubmitAsync(ns.vk, cb, ns.vk.queue, 0, nullptr,
@@ -2400,9 +2666,42 @@ static bool RunOpticalFlow(NeuralState& ns) {
     TransitionImage2(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_GENERAL,
                      VK_ACCESS_2_SHADER_READ_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    if (f.costEnabled && f.cost.image)
+        TransitionImage2(ns.vk, cb, f.cost, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                         VK_ACCESS_2_SHADER_READ_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    if (f.backEnabled && f.back.image)
+        TransitionImage2(ns.vk, cb, f.back, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                         VK_ACCESS_2_SHADER_READ_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    // The stand-ins are never written and never read, but they ARE bound, and a bound
+    // storage image has to be in the layout its descriptor claims.
+    if (ns.vk.dummyCost.image)
+        TransitionImage2(ns.vk, cb, ns.vk.dummyCost, VK_IMAGE_LAYOUT_GENERAL, 0,
+                         VK_ACCESS_2_SHADER_READ_BIT, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+    if (ns.vk.dummyBack.image)
+        TransitionImage2(ns.vk, cb, ns.vk.dummyBack, VK_IMAGE_LAYOUT_GENERAL, 0,
+                         VK_ACCESS_2_SHADER_READ_BIT, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, f.mvPipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, ns.vk.mvPipeLayout,
-                            0, 1, &f.mvSet, 0, nullptr);
+    if (ns.vk.pushDescriptors) {
+        VkDescriptorImageInfo info[kMVecBindings];
+        MVecDescriptorImages(ns.vk, f, ns, info);
+        VkWriteDescriptorSet writes[kMVecBindings] = {};
+        for (uint32_t i = 0; i < kMVecBindings; ++i) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[i].pImageInfo = &info[i];
+        }
+        vkCmdPushDescriptorSetKHR(cb, VK_PIPELINE_BIND_POINT_COMPUTE, ns.vk.mvPipeLayout, 0,
+                                  kMVecBindings, writes);
+    } else {
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, ns.vk.mvPipeLayout,
+                                0, 1, &f.mvSet, 0, nullptr);
+    }
     vkCmdDispatch(cb, (ns.mv.width + 7) / 8, (ns.mv.height + 7) / 8, 1);
     TransitionImage2(ns.vk, cb, ns.mv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                      VK_ACCESS_2_SHADER_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT,
@@ -3681,6 +3980,8 @@ int main() {
                                                                    "vkDestroyDebugUtilsMessengerEXT");
         if (destroy) destroy(ns.vk.instance, ns.vk.debugMessenger, nullptr);
     }
+    DestroyImage2D(ns.vk, ns.vk.dummyCost);
+    DestroyImage2D(ns.vk, ns.vk.dummyBack);
     if (ns.vk.evalQuery) vkDestroyQueryPool(ns.vk.device, ns.vk.evalQuery, nullptr);
     if (ns.vk.evalStaging) vkDestroyBuffer(ns.vk.device, ns.vk.evalStaging, nullptr);
     if (ns.vk.evalMem) vkFreeMemory(ns.vk.device, ns.vk.evalMem, nullptr);
