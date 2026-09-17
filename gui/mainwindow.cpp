@@ -1258,7 +1258,27 @@ void MainWindow::updateStatus() {
         active ? QString("<span style=\"color:#43a047;\">&#9679; Active</span>")
                : idle ? QString("<span style=\"color:#fb8c00;\">&#9679; Idle</span>")
                       : QString("<span style=\"color:#9e9e9e;\">&#9675; Inactive</span>");
-    statusLabel->setText(QString("Helper: %1&nbsp;&nbsp;&nbsp;%2").arg(state.toHtmlEscaped(), dot));
+    // The model's own cost and how much video memory it is holding. Both have been in the
+    // header for a long time and shown nowhere, and between them they answer the two
+    // questions a screenshot cannot: is the model doing work, and what is it costing. A pass
+    // that evaluates and returns its input unchanged looks identical to a healthy one in
+    // every other number on this window.
+    QString detail;
+    if (active || idle) {
+        const double evalMs = double(BitsToFloat(hdr->helperEvalMsBits.load()));
+        const uint32_t vram = hdr->helperVramMB.load();
+        const uint32_t feats = hdr->helperFeatures.load();
+        if (evalMs > 0.0 || vram) {
+            detail = QString("&nbsp;&nbsp;&nbsp;<span style=\"color:#9e9e9e;\">"
+                             "%1 pass%2 &middot; %3 ms &middot; %4 MiB</span>")
+                         .arg(feats)
+                         .arg(feats == 1 ? "" : "es")
+                         .arg(evalMs, 0, 'f', 2)
+                         .arg(vram);
+        }
+    }
+    statusLabel->setText(
+        QString("Helper: %1&nbsp;&nbsp;&nbsp;%2%3").arg(state.toHtmlEscaped(), dot, detail));
 
     saveSettingsIfChanged();
 }

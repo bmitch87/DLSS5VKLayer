@@ -1487,6 +1487,7 @@ struct NeuralState {
     uint32_t lumaW = 0, lumaH = 0;
     uint32_t sceneCutStreak = 0;
     uint32_t passPriceMB = 0;       // measured cost of the last pass built, device-local MiB
+    uint32_t evalTooCheap = 0;      // consecutive frames below the per-megapixel GPU floor
     bool loggedDuplicate = false;   // say "identical frame" once per run, not per frame
     bool sceneCutPending = false;   // exactly one frame over the threshold so far
     bool sceneCutFired = false;     // this run of over-threshold frames has already fired
@@ -3591,6 +3592,10 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     }
 
     const double tUpload = time ? NowMs() : 0.0;
+    // Sampled unconditionally, unlike tUpload/tEval which exist only under DLSSNR_TIME: the
+    // published upload and readback figures should not depend on a debugging variable being
+    // set, which is exactly how helperEvalMsBits came to publish a constant zero.
+    const double tUploadEnd = NowMs();
     // Estimating flow between a frame and itself costs a full NVOF execute to produce a
     // field we already know is zero, so a repeat skips it and takes one of the plain upload
     // paths below instead -- the upload normally rides along inside the flow prep submit.
@@ -3694,6 +3699,7 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     ns.mvecResetPending = false;
     ns.firstFrame = false;
     const double tEval = time ? NowMs() : 0.0;
+    const double tEvalEnd = NowMs();  // unconditional twin, for the published figures
 
     if (!last) return false;
 
@@ -3786,6 +3792,13 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         if (!ns.vk.transportOut) std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
     }
     const double tDone = time ? NowMs() : 0.0;
+    // Always sampled, not only under DLSSNR_TIME. These two fields have existed, been saved
+    // and restored by ShmResetSettings, and been written by nothing at all -- and the way
+    // helperEvalMsBits came to publish a constant zero was exactly this: a figure derived
+    // from marks that only exist when a debugging variable is set.
+    const double tDoneUncond = NowMs();
+    const double uploadMs = tUploadEnd - t0;
+    const double readbackMs = tDoneUncond - tEvalEnd;
 
     ++ns.evaluates;
     if (shm.hdr) {
@@ -3810,6 +3823,49 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         const double reportedEvalMs =
             timedPasses > 0 ? evalGpuMs : (time ? tEval - tUpload : 0.0);
         shm.hdr->helperEvalMsBits.store(FloatToBits(float(reportedEvalMs)));
+        shm.hdr->helperUploadMsBits.store(FloatToBits(float(uploadMs)));
+        shm.hdr->helperReadbackMsBits.store(FloatToBits(float(readbackMs)));
+
+        // Did the model do any work?
+        //
+        // A pass that creates, evaluates, returns success and hands back its input unchanged
+        // is invisible to every other counter here: features built, frames delivered, no
+        // errors. What it cannot fake is GPU cost. The floor is per megapixel because the
+        // pass scales with pixels, and it is derived from THIS machine rather than borrowed:
+        // measured at 3.10 ms for one pass at 1080p, which is 1.50 ms/Mpx, so a floor at a
+        // third of that is far below anything healthy and far above zero.
+        //
+        // A missing measurement is never a verdict: with no GPU timer there are no samples
+        // and the check does not fire. And it only reports -- fail-open still applies, and a
+        // model that has stopped working is not a reason to stop presenting frames.
+        //
+        // The constant is derived from this machine, not borrowed, and it is deliberately
+        // well under the measured cost rather than near it:
+        //
+        //     1080p, 1 pass    3.10 ms   1.50 ms/Mpx
+        //     1080p, 4 passes 12.59 ms   1.52 ms/Mpx
+        //     4K,    3 passes 22.61 ms   0.91 ms/Mpx
+        //
+        // Cost per megapixel FALLS with raster -- the same sublinear shape the VRAM
+        // measurement showed -- so the floor has to clear the cheapest case, not the average.
+        // 0.30 leaves a factor of three at 4K and a factor of five at 1080p, which is far
+        // below anything healthy and far above the zero a model that is not running costs.
+        if (timedPasses > 0 && passes > 0) {
+            const double mpx = double(w) * double(h) / 1000000.0;
+            const double floorMs = 0.30 * mpx * double(passes);
+            if (evalGpuMs < floorMs) {
+                if (++ns.evalTooCheap == 60) {
+                    Log("[helper] the model is costing %.2f ms of GPU for %u pass(es) at %ux%u, "
+                        "below the %.2f ms floor. It is being evaluated and is not doing the "
+                        "work; the picture is probably its input unchanged.",
+                        evalGpuMs, passes, w, h, floorMs);
+                    ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
+                                   "the model is running far below its expected GPU cost");
+                }
+            } else if (ns.evalTooCheap) {
+                ns.evalTooCheap = 0;
+            }
+        }
         shm.hdr->helperFeatures.store(ns.livePasses);
         shm.hdr->modelUp.store(1);
     }
