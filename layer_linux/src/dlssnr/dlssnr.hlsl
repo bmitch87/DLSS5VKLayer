@@ -38,6 +38,7 @@ cbuffer Params : register(b0)
     float gShadowGain;     // how much of the model's DARKENING reaches the frame. 1 = all of it
     float gGlowGain;       // how much of its BRIGHTENING reaches the frame. 1 = all of it
     uint  gReconstruct;    // how the model's answer is enlarged when it ran small. See SampleRecon.
+    uint  gProxySwizzle;   // 1: the crossing surfaces carry BGRA rather than RGBA. See ProxyOut.
 
 
 };
@@ -351,6 +352,22 @@ float4 SampleCatmullRom(Texture2D<float4> tex, float2 uv, float2 texSize)
 
     return float4(max(r.rgb, 0.0), r.a);
 }
+
+// The channel order the crossing surfaces carry.
+//
+// Our proxy is R8G8B8A8_UNORM and we have always written RGB into it. Several builds of
+// nvngx_dlssnr.dll exist and they do not all agree about that: a user whose build reads BGRA gets
+// red and blue exchanged, and the only colour controls this project offers -- colour strength and
+// the colour bound -- make it WORSE, because both assume the model's hue means something.
+//
+// A swap on the way out and the same swap on the way back in. Applied to both crossing surfaces, so
+// the composition sees the same values either way and only the MODEL sees a different channel
+// order; that is what makes this a setting about the model rather than a colour control.
+//
+// Manual only. An automatic version would have to decide from the picture, once per raster change
+// and on the GPU, and nobody has hit this yet -- a detector for a problem no one has reported is a
+// second thing that can be wrong.
+float3 ProxySwizzle(float3 v) { return gProxySwizzle != 0 ? v.bgr : v; }
 
 float4 SampleRecon(Texture2D<float4> tex, float2 uv, float2 texSize)
 {
@@ -787,7 +804,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         if (gHdrProxy != 0)
         {
             float3 lin = gHdrTransfer != 0 ? PqToLinear(frame) : frame;
-            gTarget[id.xy] = float4(lin / NormScale(), source.a);
+            gTarget[id.xy] = float4(ProxySwizzle(lin / NormScale()), source.a);
             return;
         }
 
@@ -796,7 +813,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // damage, so it goes through untouched.
         if (gPassthrough != 0)
         {
-            gTarget[id.xy] = float4(frame, source.a);
+            gTarget[id.xy] = float4(ProxySwizzle(frame), source.a);
             return;
         }
 
@@ -829,7 +846,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
         // alpha, so the default stays byte-identical.
         float alpha = gReversibleMode != 0 ? 1.0 : source.a;
 
-        gTarget[id.xy] = float4(LinearToSrgb(display), alpha);
+        gTarget[id.xy] = float4(ProxySwizzle(LinearToSrgb(display)), alpha);
         return;
     }
 
@@ -885,16 +902,21 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
     // Nothing was encoded on the way in, so nothing is decoded here either. The float16 proxy is
     // linear light already -- the sRGB decode would fold the highlights flat.
+    // Swapped back on the way in, so everything below sees RGB whatever crossed. The proxy is our
+    // own encode and the answer is the model's, and both went out through the same swap.
+    const float3 proxyRaw = ProxySwizzle(proxySample.rgb);
+    const float3 modelRaw = ProxySwizzle(modelSample.rgb);
+
     float3 proxy, model;
     if (gHdrProxy != 0 || gPassthrough != 0)
     {
-        proxy = proxySample.rgb;
-        model = modelSample.rgb;
+        proxy = proxyRaw;
+        model = modelRaw;
     }
     else
     {
-        proxy = SrgbToLinear(proxySample.rgb);
-        model = SrgbToLinear(modelSample.rgb);
+        proxy = SrgbToLinear(proxyRaw);
+        model = SrgbToLinear(modelRaw);
     }
 
     // The model's own answer, kept before the matched-residual block below can rewrite `model`, so the
@@ -928,8 +950,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             // reconstructed centre and gainSmooth from these; reconstructing them differently
             // would make the two disagree about the same pixel for a reason that is not the
             // neighbourhood.
-            float3 pn = SampleRecon(gSource, uvn, reconSize).rgb;
-            float3 mn = SampleRecon(gModel, uvn, reconSize).rgb;
+            float3 pn = ProxySwizzle(SampleRecon(gSource, uvn, reconSize).rgb);
+            float3 mn = ProxySwizzle(SampleRecon(gModel, uvn, reconSize).rgb);
             if (gHdrProxy == 0 && gPassthrough == 0)
             {
                 pn = SrgbToLinear(pn);

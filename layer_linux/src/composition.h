@@ -82,6 +82,9 @@ struct FrameSettings {
     // How the model's answer is enlarged when it ran small. See ReconstructFilter.
     uint32_t reconstruct = kReconstructBilinear;
 
+    // The channel order the crossing surfaces carry. See ProxyChannelOrder.
+    uint32_t proxySwizzle = kProxyRgbaOrder;
+
 
     static FrameSettings Read(const ShmHeader* h);
 };

@@ -163,6 +163,7 @@ static const SettingEntry kSettingsTable[] = {
     {"set_scene_cut_threshold", &ShmHeader::sceneCutThreshold, false},
     {"set_shadow_gain", &ShmHeader::shadowGainBits, true},
     {"set_reconstruction_filter", &ShmHeader::reconstructFilter, false},
+    {"set_proxy_swizzle", &ShmHeader::proxySwizzle, false},
     {"set_glow_gain", &ShmHeader::glowGainBits, true},
     {"set_sharpness", &ShmHeader::sharpnessBits, true},
     {"set_motion_enabled", &ShmHeader::mvecEnabled, false},
@@ -1622,6 +1623,17 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                           "rather than a preference.\n"
                           "The model has the last word: if it refuses float input the pass falls back "
                           "to 8-bit on its own.");
+        binder->AddChoice(f, "Model channel order", &ShmHeader::proxySwizzle,
+                          { "RGBA", "BGRA" },
+                          "What channel order the model is handed, and expects back.\n"
+                          "RGBA is what every build of this project has sent. Builds of "
+                          "nvngx_dlssnr.dll do not all agree: if yours reads BGRA, the picture comes "
+                          "back with red and blue exchanged.\n"
+                          "Set this rather than reaching for the colour controls -- Color strength "
+                          "and Color bound both assume the model's hue means something, so on a "
+                          "swapped picture they make it worse.\n"
+                          "The swap is applied on the way out and undone on the way in, so only the "
+                          "model sees the difference.");
         binder->AddBool(f, "16-bit SDR intermediates", &ShmHeader::sdr16Multipass,
                         "Keep the images between SDR model passes at 16-bit. Disable to keep them "
                         "8-bit and reduce VRAM and GPU bandwidth use; HDR is always float16.",

@@ -37,7 +37,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 26;
+static constexpr uint32_t kShmVersion = 27;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -176,6 +176,12 @@ enum ProxyFormat : uint32_t {
 //
 // Only reachable below 100% model resolution: at the frame's own size every one of these lands on
 // texel centres and none of them is doing anything.
+// The channel order the model is handed, and expects back.
+enum ProxyChannelOrder : uint32_t {
+    kProxyRgbaOrder = 0,
+    kProxyBgraOrder = 1,
+};
+
 enum ReconstructFilter : uint32_t {
     // The sampler's own bilinear. What every build before this did, and the default.
     kReconstructBilinear = 0,
@@ -692,6 +698,18 @@ struct ShmHeader {
     // asked on real content without anyone rebuilding, and answered by capture rather than by
     // argument.
     std::atomic<uint32_t> reconstructFilter;
+
+    // What channel order the crossing surfaces carry: 0 RGBA (every build so far), 1 BGRA.
+    //
+    // Our proxy is R8G8B8A8_UNORM and we have always written RGB into it. Builds of
+    // nvngx_dlssnr.dll do not all agree about that, and a user whose build reads BGRA gets red and
+    // blue exchanged with no control that helps -- colour strength and the colour bound both make
+    // it worse, because both assume the model's hue means something.
+    //
+    // Manual, and manual only. An automatic version would have to decide from the picture, once per
+    // raster change and on the GPU; nobody has reported hitting this, and a detector for a problem
+    // no one has reported is a second thing that can be wrong.
+    std::atomic<uint32_t> proxySwizzle;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -707,7 +725,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 2128, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2132, "the header layout changed -- bump kShmVersion");
 
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
@@ -847,6 +865,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->shadowGainBits.store(FloatToBits(1.0f));
     h->glowGainBits.store(FloatToBits(1.0f));
     h->reconstructFilter.store(kReconstructBilinear);
+    h->proxySwizzle.store(kProxyRgbaOrder);
     h->intensityBits.store(FloatToBits(1.0f));
     h->localToneBits.store(FloatToBits(1.0f));
     h->localStructureBits.store(FloatToBits(1.0f));

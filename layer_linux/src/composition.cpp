@@ -126,6 +126,8 @@ FrameSettings FrameSettings::Read(const ShmHeader* h) {
         s.reconstruct = h->reconstructFilter.load();
         if (s.reconstruct > kReconstructCatmullRom) s.reconstruct = kReconstructBilinear;
 
+        s.proxySwizzle = h->proxySwizzle.load() != 0 ? kProxyBgraOrder : kProxyRgbaOrder;
+
         s.colourTrust = float(h->colourTrustPercent.load()) / 100.0f;
         static const int forcedCt = [] {
             const char* v = getenv("DLSSNR_COLOUR_TRUST");
@@ -1216,6 +1218,7 @@ DlssNrConstants Composition::BaseConstants(const FrameSettings& s) const {
     c.ShadowGain = s.shadowGain;
     c.GlowGain = s.glowGain;
     c.Reconstruct = s.reconstruct;
+    c.ProxySwizzle = s.proxySwizzle;
     return c;
 }
 

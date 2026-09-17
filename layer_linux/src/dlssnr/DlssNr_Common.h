@@ -208,6 +208,9 @@ struct alignas(256) DlssNrConstants
     // build before it did), 1 nearest, 2 Catmull-Rom. See SampleRecon in dlssnr.hlsl.
     uint32_t Reconstruct;
 
+    // 1: the crossing surfaces carry BGRA rather than RGBA. See ProxySwizzle in dlssnr.hlsl.
+    uint32_t ProxySwizzle;
+
 
 };
 
