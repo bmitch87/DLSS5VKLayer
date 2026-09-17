@@ -36,6 +36,14 @@ struct NgxSnippet {
     uint32_t featureW = 0, featureH = 0;
 
     bool ready = false;     // snippet init + CreateFeature(18) succeeded
+    // The MODULE is loaded, its exports are resolved and NVSDK_NGX_VULKAN_Init has succeeded.
+    //
+    // Separate from `ready`, which means "a feature exists" and is cleared by
+    // NgxReleaseAllPasses. Those are two different facts and conflating them is what made a raster
+    // change redo the whole process-level load and init; see the guard at the top of
+    // NgxLoadAndInit. Cleared only by the teardown, which is the one place the module really does
+    // go away.
+    bool initialised = false;
     bool disabled = false;  // latched failure -> pass-through forever
 
     // Captured from NVSDK_NGX_VULKAN_GetFeatureRequirements (bit 0 = HDR path).

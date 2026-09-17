@@ -257,6 +257,32 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
                     uint32_t width, uint32_t height, VkCommandBuffer recordingCmd,
                     const NgxTuning& tuning) {
     if (s.disabled) return false;
+
+    // Already loaded and initialised? Then a new raster needs a new FEATURE, not a new everything.
+    //
+    // This function is re-entered whenever the model's raster changes, and it used to redo the lot:
+    // LoadLibraryEx, seven GetProcAddress calls, the caller-identity spoof, VULKAN_Init_Ext -- on an
+    // NGX that is already initialised and a DLL that is already mapped. That intermittently WEDGES.
+    // The helper logs "nvngx_dlssnr.dll loaded at ..." and never reaches the exports line, the
+    // layer's round trips time out, and the pass is dead for the rest of the session. Seen on
+    // 1280x720 -> 500x500, 500x500 -> 250x250 and 250x250 -> 500x500, and not seen on other runs of
+    // the same changes, so it is a race and not a rule. It is not in DescribeSnippet -- making that
+    // once-per-process did not prevent it -- and the watchdog cannot catch it, because the hang is
+    // not inside a guarded NGX call it is timing.
+    //
+    // Merserk's finding, already recorded in ATTRIBUTION.md, is the same shape from the other end:
+    // NGX's shutdown and module unload wedge after a successful feature-18 evaluation. Re-running
+    // its init is the mirror of that, and the answer is the same -- do not ask this SDK to do
+    // lifecycle work twice when it does not need to.
+    //
+    // Nothing here depends on the raster: the path, the exports, the spoof and the init are all
+    // properties of the process. Only the feature is sized, and NgxCreatePass sizes it.
+    if (s.initialised && s.snippet && s.createFeature && !NgxFaulted()) {
+        Log("[ngx] already initialised; building the feature for %ux%u without reloading", width, height);
+        NgxSetCreateTuning(s, tuning);
+        return NgxCreatePass(s, 0, width, height, recordingCmd);
+    }
+
     s.binDir = ResolveBinDir();
     if (s.binDir.empty()) { Log("[ngx] nvngx_dlssnr.dll not found (set DLSSNR_BIN_DIR)"); s.disabled = true; return false; }
     Log("[ngx] bin dir: %ls", s.binDir.c_str());
@@ -522,6 +548,9 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
         s.disabled = true;
         return false;
     }
+    // Past here the module is loaded and NGX is initialised for this device. Neither depends on the
+    // raster, so neither has to be done again when the raster changes.
+    s.initialised = true;
 
     // The snippet exports GetScratchBufferSize and we have never called it -- it was the one
     // declared export nothing resolved. Another project listed "CreateFeature may need
@@ -981,6 +1010,8 @@ void NgxTeardown(NgxSnippet& s, VkDevice device) {
     if (s.core) { FreeLibrary(s.core); s.core = nullptr; }
     if (s.snippet) { FreeLibrary(s.snippet); s.snippet = nullptr; }
     s.ready = false;
+    // The one place the module really does go away, so the one place this is cleared.
+    s.initialised = false;
 }
 
 }  // namespace dlssnr
