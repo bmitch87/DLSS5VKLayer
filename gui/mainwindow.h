@@ -108,6 +108,7 @@ private:
     QPushButton* profileSaveBtn = nullptr;
     QPushButton* passBtn = nullptr;
     QDoubleSpinBox* skinStructureBox = nullptr;
+    QLabel* sceneCutLabel = nullptr;
     QCheckBox* autoMaskBox = nullptr;
     QPushButton* captureBtn = nullptr;
     QPushButton* browseRunnerBtn = nullptr;

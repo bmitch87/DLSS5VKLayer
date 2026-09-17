@@ -41,6 +41,8 @@ const Setting kSettings[] = {
     { "preset", &ShmHeader::preset, false, "model preset" },
     { "style", &ShmHeader::style, false, "0 default, 1 natural, 2 cinematic" },
     { "automask", &ShmHeader::autoMask, false, "0/1 automatic skin mask" },
+    { "scenecut", &ShmHeader::sceneCutThreshold, false,
+      "scene-cut threshold 0-255 (mean luma difference); 0 turns the detector off" },
     { "uicorrection", &ShmHeader::uiCorrection, false,
       "0/1 tell the model the frame already has the game's UI drawn on it" },
     { "intensity", &ShmHeader::intensityBits, true, "model intensity" },
@@ -240,6 +242,10 @@ void PrintStatus(const ShmHeader* h) {
                 h->hdrMode.load(), h->hdrDetected.load(), h->hdrActive.load(),
                 h->proxyFormat.load(), h->hdrEncode.load());
     std::printf("frame_repeat=%u\n", h->frameRepeat.load());
+    // The threshold next to what it is compared against: a scene-cut threshold reported on its own
+    // cannot be judged, which is why it was unusable as an environment variable.
+    std::printf("scene_cut_threshold=%u\nscene_cut_score=%u\nscene_cut_count=%u\n",
+                h->sceneCutThreshold.load(), h->sceneCutScore.load(), h->sceneCutCount.load());
     const std::string reason = ShmLoadString(h->helperReasonSeq, h->helperReason, kReasonBytes);
     if (!reason.empty()) std::printf("helper_reason=%s\n", reason.c_str());
 }

@@ -37,7 +37,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 23;
+static constexpr uint32_t kShmVersion = 24;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -54,6 +54,13 @@ static constexpr size_t kHeaderBytes = 65536;
 // The ceiling on how many times the model runs over one frame. It is OptiScaler's
 // DlssNr::kMaxPasses and sizes the per-pass arrays below.
 static constexpr uint32_t kMaxPasses = 30;
+
+// The scene-cut detector's default threshold: mean absolute luma difference over a 64x36 grid.
+//
+// 55 of 255 is what this detector has always used. It is reassuringly close to the 0.24 of full
+// scale -- about 61 -- that an independent implementation arrived at, which is the only outside
+// number available for it.
+static constexpr uint32_t kSceneCutThresholdDefault = 55;
 
 static constexpr size_t kReasonBytes = 192;
 static constexpr size_t kNameBytes = 128;
@@ -588,6 +595,20 @@ struct ShmHeader {
     // for us: their pass runs before the game composites its UI and ours runs after, so "is there
     // interface in this picture" has opposite answers.
     std::atomic<uint32_t> uiCorrection;
+
+    // The scene-cut detector's threshold, in mean absolute luma difference over a 64x36 grid,
+    // 0-255. 0 turns the detector off entirely.
+    //
+    // It was a compile-once environment variable and nothing else, so a user whose content trips
+    // false cuts -- a strobing light, a title sequence, a fast pan -- had no control and, worse, no
+    // readout: nothing said whether cuts were firing or what the frames were scoring. A threshold
+    // with no score beside it cannot be tuned by anybody.
+    std::atomic<uint32_t> sceneCutThreshold;
+    // What the last frame actually scored, published every frame by the helper. Read-only from
+    // outside; the point is to make the threshold above adjustable against something.
+    std::atomic<uint32_t> sceneCutScore;
+    // How many cuts this session has fired, so a run can be judged without watching the log.
+    std::atomic<uint32_t> sceneCutCount;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -603,7 +624,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 2104, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2116, "the header layout changed -- bump kShmVersion");
 
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
@@ -670,7 +691,7 @@ inline void ShmResetSettings(ShmHeader* h) {
         uint32_t answerExportSeq, answerPid, answerFd, answerGen;
         uint32_t layerProxySeq, layerAnswerSeq;
         uint32_t hdrDetected, hdrActive, proxyFormat, hdrEncode, frameRepeat;
-        uint32_t layerPresentsLo, layerPresentsHi;
+        uint32_t layerPresentsLo, layerPresentsHi, sceneCutScore, sceneCutCount;
     } v;
 #define DLSSNR_SAVE(f) v.f = h->f.load()
     DLSSNR_SAVE(seq_req); DLSSNR_SAVE(seq_resp); DLSSNR_SAVE(width); DLSSNR_SAVE(height);
@@ -690,6 +711,7 @@ inline void ShmResetSettings(ShmHeader* h) {
     DLSSNR_SAVE(answerGen); DLSSNR_SAVE(layerProxySeq); DLSSNR_SAVE(layerAnswerSeq);
     DLSSNR_SAVE(hdrDetected); DLSSNR_SAVE(hdrActive); DLSSNR_SAVE(proxyFormat); DLSSNR_SAVE(hdrEncode);
     DLSSNR_SAVE(frameRepeat); DLSSNR_SAVE(layerPresentsLo); DLSSNR_SAVE(layerPresentsHi);
+    DLSSNR_SAVE(sceneCutScore); DLSSNR_SAVE(sceneCutCount);
 #undef DLSSNR_SAVE
     char helperReason[kReasonBytes], layerReason[kReasonBytes], gameName[kNameBytes];
     std::memcpy(helperReason, h->helperReason, sizeof(helperReason));
@@ -715,6 +737,7 @@ inline void ShmResetSettings(ShmHeader* h) {
     DLSSNR_LOAD(answerGen); DLSSNR_LOAD(layerProxySeq); DLSSNR_LOAD(layerAnswerSeq);
     DLSSNR_LOAD(hdrDetected); DLSSNR_LOAD(hdrActive); DLSSNR_LOAD(proxyFormat); DLSSNR_LOAD(hdrEncode);
     DLSSNR_LOAD(frameRepeat); DLSSNR_LOAD(layerPresentsLo); DLSSNR_LOAD(layerPresentsHi);
+    DLSSNR_LOAD(sceneCutScore); DLSSNR_LOAD(sceneCutCount);
 #undef DLSSNR_LOAD
     std::memcpy(h->helperReason, helperReason, sizeof(helperReason));
     std::memcpy(h->layerReason, layerReason, sizeof(layerReason));
@@ -735,6 +758,9 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->enabled.store(1);
     h->autoMask.store(1);
     h->uiCorrection.store(0);
+    h->sceneCutThreshold.store(kSceneCutThresholdDefault);
+    h->sceneCutScore.store(0);
+    h->sceneCutCount.store(0);
     h->intensityBits.store(FloatToBits(1.0f));
     h->localToneBits.store(FloatToBits(1.0f));
     h->localStructureBits.store(FloatToBits(1.0f));

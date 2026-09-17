@@ -58,6 +58,33 @@ static bool SkipEvaluate() {
     return v;
 }
 
+// The scene-cut detector's threshold now lives in the header so it can be moved while a game is
+// running. The two environment variables it used to be are kept as a STARTUP SEED only -- they set
+// the header's value once and then stop mattering.
+//
+// That ordering is deliberate. A variable that kept winning would make the GUI's control silently
+// dead for anyone who had the variable exported, which is the failure this whole item exists to
+// remove; and dropping the variables outright would break every recipe already written down. So:
+// the environment chooses where the session starts, the header decides from then on, and the log
+// says when the environment did anything at all.
+static void SeedSceneCutFromEnv(ShmHeader* hdr) {
+    if (!hdr) return;
+    const char* off = getenv("DLSSNR_SCENE_CUT");
+    const char* thr = getenv("DLSSNR_SCENE_CUT_THRESHOLD");
+    if (off && off[0] == '0') {
+        hdr->sceneCutThreshold.store(0);
+        Log("[mvec] DLSSNR_SCENE_CUT=0: scene-cut detection off for this session (threshold 0). "
+            "Set it above zero to turn it back on without restarting.");
+        return;
+    }
+    if (thr && *thr) {
+        const long v = strtol(thr, nullptr, 10);
+        const uint32_t t = v > 0 && v < 256 ? uint32_t(v) : kSceneCutThresholdDefault;
+        hdr->sceneCutThreshold.store(t);
+        Log("[mvec] DLSSNR_SCENE_CUT_THRESHOLD=%s: seeding the scene-cut threshold at %u", thr, t);
+    }
+}
+
 // Breadcrumbs, this process's own. See common/breadcrumbs.h.
 //
 // From the shared-memory side a hung helper and a hung layer look identical -- seq_req ahead of
@@ -3015,19 +3042,14 @@ static int ReactivateMotionVectors(NeuralState& ns, uint32_t w, uint32_t h, uint
 // whole frame -- which is a duplicate or close enough to one that estimating flow between
 // the pair is a full NVOF execute spent producing a field we already know is zero. No
 // invented float threshold: the quantisation is the threshold.
-static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint32_t h, uint32_t fmt,
-                           bool* duplicate) {
+static bool DetectSceneCut(NeuralState& ns, ShmHeader* hdr, const uint8_t* in, uint32_t w, uint32_t h,
+                           uint32_t fmt, bool* duplicate) {
     if (duplicate) *duplicate = false;
-    static const bool enabled = [] {
-        const char* p = getenv("DLSSNR_SCENE_CUT");
-        return !p || p[0] != '0';
-    }();
-    static const int threshold = [] {
-        const char* p = getenv("DLSSNR_SCENE_CUT_THRESHOLD");
-        int v = p && *p ? atoi(p) : 55;
-        return v > 0 ? v : 55;
-    }();
-    if (!enabled || !in || !w || !h) return false;
+    // The header is the control; the environment only seeds it, once, at startup (see
+    // SeedSceneCutFromEnv). Read every frame rather than latched in a static, because the whole
+    // point of moving it into the header is that it can be moved while a game is running.
+    const int threshold = hdr ? int(hdr->sceneCutThreshold.load()) : int(kSceneCutThresholdDefault);
+    if (threshold <= 0 || !in || !w || !h) return false;
 
     const uint32_t gw = w < 64 ? w : 64;
     const uint32_t gh = h < 36 ? h : 36;
@@ -3059,6 +3081,9 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
     }
     if (sizeChanged) return false;
     int mean = int(sum / n);
+    // Published whether or not it crossed. A threshold with no score beside it cannot be tuned:
+    // this is the number the user is choosing against.
+    if (hdr) hdr->sceneCutScore.store(uint32_t(mean));
     if (mean == 0 && duplicate) *duplicate = true;
     // What the shape of the signal means, which the old "two consecutive frames over the
     // threshold" rule had backwards:
@@ -3092,9 +3117,11 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
     ns.sceneCutPending = (ns.sceneCutStreak == 1);
     if (!over) ns.sceneCutFired = false;
 
-    if (cut)
+    if (cut) {
+        if (hdr) hdr->sceneCutCount.fetch_add(1);
         Log("[mvec] scene cut detected (%s) mean=%d threshold=%d streak=%u", why, mean, threshold,
             ns.sceneCutStreak);
+    }
     if (duplicate && *duplicate && !ns.loggedDuplicate) {
         ns.loggedDuplicate = true;
         Log("[mvec] identical frame received; skipping the flow estimate while it repeats");
@@ -3689,7 +3716,7 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     // while the fd path is live -- one frame of stale flow across a cut is the price of the copy.
     bool duplicateFrame = false;
     const bool sceneCut = !ns.proxyActive && !hdrEncode &&
-                          DetectSceneCut(ns, shm.inPixels, w, h, 1, &duplicateFrame);
+                          DetectSceneCut(ns, shm.hdr, shm.inPixels, w, h, 1, &duplicateFrame);
     if (sceneCut && !ns.firstFrame) {
         // The model's own temporal history is the point. Clearing the flow field and
         // leaving DLSSNR.Reset alone told the model to keep reprojecting across the cut
@@ -4200,6 +4227,7 @@ int main() {
         }
     }
 
+    SeedSceneCutFromEnv(shm.hdr);
     shm.hdr->helperState.store(kHelperRunning);
     Log("[helper] context ready, waiting for frames");
 

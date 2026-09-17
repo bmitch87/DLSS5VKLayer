@@ -159,6 +159,7 @@ static const SettingEntry kSettingsTable[] = {
     {"set_skin_structure", &ShmHeader::skinStructureBits, true},
     {"set_auto_mask", &ShmHeader::autoMask, false},
     {"set_ui_correction", &ShmHeader::uiCorrection, false},
+    {"set_scene_cut_threshold", &ShmHeader::sceneCutThreshold, false},
     {"set_sharpness", &ShmHeader::sharpnessBits, true},
     {"set_motion_enabled", &ShmHeader::mvecEnabled, false},
     {"set_motion_quality", &ShmHeader::mvecQuality, false},
@@ -1193,6 +1194,15 @@ void MainWindow::updateStatus() {
     // Reload blocks signals while it writes, so the mask's toggled() does not fire and the skin row
     // would stay as the user last left it rather than as the header now reads.
     updateSkinStructureEnabled();
+    if (sceneCutLabel && hdr) {
+        const uint32_t score = hdr->sceneCutScore.load();
+        const uint32_t cuts = hdr->sceneCutCount.load();
+        const uint32_t thr = hdr->sceneCutThreshold.load();
+        sceneCutLabel->setText(
+            thr == 0 ? QString("detector off")
+                     : QString("%1 (threshold %2) - %3 cut%4 this session")
+                           .arg(score).arg(thr).arg(cuts).arg(cuts == 1 ? "" : "s"));
+    }
     // The menu spinbox is not a bound control, so the poll keeps it honest the same way the binder
     // keeps the bound ones honest -- unless the user is mid-edit on it, which is not the moment to
     // overwrite the number under their cursor.
@@ -1483,6 +1493,19 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                           "half the cost.\n\n"
                           "4 px is the default. Treat 1 px as a diagnostic rather than a "
                           "quality setting.");
+        binder->AddInt(f, "Scene-cut threshold", &ShmHeader::sceneCutThreshold, 0, 255,
+                       "How different one frame has to be from the last before the pass treats it "
+                       "as a new scene and throws its temporal history away.\n"
+                       "Mean absolute brightness difference over a 64x36 grid, 0-255. 55 is the "
+                       "default; 0 turns the detector off entirely.\n"
+                       "The live score below is what this is compared against, so lower it until "
+                       "cuts fire on your content's real cuts and raise it if they fire on a pan or "
+                       "a flashing light.");
+        sceneCutLabel = new QLabel("-", col->parentWidget());
+        sceneCutLabel->setToolTip(FormatTip(
+            "What the last frame actually scored, and how many cuts have fired this session. "
+            "Updates only while a game is presenting; a held or duplicate frame scores 0."));
+        f->addRow("Scene-cut score", sceneCutLabel);
     }
     {
         auto* f = group(col, "Input and precision");
