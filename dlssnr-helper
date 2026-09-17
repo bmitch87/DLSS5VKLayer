@@ -745,6 +745,13 @@ cmd_start() {
   if [ -n "$binaries" ]; then
     export DLSSNR_BIN_DIR="Z:$binaries"
   fi
+  # When the helper has been pinned to a specific card, point DXVK at the same one, so
+  # DXVK-NVAPI's view of the machine agrees with the device we actually render on. Reducing
+  # DXVK to one visible adapter also makes its ordinal trivially 0, which removes a class of
+  # enumeration-order bug rather than working around it.
+  if [ -n "${DLSSNR_GPU_UUID:-}" ]; then
+    export DXVK_FILTER_DEVICE_UUID="$DLSSNR_GPU_UUID"
+  fi
   if [ "$runner_type" = "proton" ]; then
     export PROTON_ENABLE_NVAPI=1
     # PROTON_ENABLE_NVAPI on its own is not enough: Proton still presents an AMD
@@ -933,6 +940,8 @@ env_wine_heap_zero_memory=${WINE_HEAP_ZERO_MEMORY:-1}
 env_dxvk_log_level=${DXVK_LOG_LEVEL:-none}
 env_ld_library_path_inherited=$([ -n "${LD_LIBRARY_PATH:-}" ] && echo "${LD_LIBRARY_PATH}" || echo "(none)")
 env_ld_library_path_kept=${DLSSNR_KEEP_LD_LIBRARY_PATH:-0}
+env_gpu_uuid=${DLSSNR_GPU_UUID:-(unset)}
+env_gpu_index=${DLSSNR_GPU_INDEX:-(unset)}
 EOF
   if [ "$runner_type" = "proton" ]; then
     cat <<EOF

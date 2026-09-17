@@ -242,6 +242,7 @@ struct VkCtx {
     void* queryMap = nullptr;
     bool flowQueryAvailable = false;
     bool fenceTimedOut = false;  // the GPU stopped retiring our work; stand down
+    bool pinMissed = false;      // DLSSNR_GPU_UUID/INDEX named a device that is not here
     // The model's own cost, on the graphics queue. Deliberately a separate pool from the
     // flow one: they are written from different queue families, and the whole GPU-timing
     // apparatus used to live inside the optical-flow capability check -- so a device
@@ -346,14 +347,66 @@ static bool CreateContext(VkCtx& c) {
     vkEnumeratePhysicalDevices(c.instance, &devCount, nullptr);
     std::vector<VkPhysicalDevice> phys(devCount);
     vkEnumeratePhysicalDevices(c.instance, &devCount, phys.data());
+
+    // Picking the FIRST qualifying device is right on the machine this was written for and
+    // is not a choice. On a host with two NVIDIA cards we take card 0 with no way to say
+    // otherwise, and CUDA_VISIBLE_DEVICES does not reach Vulkan any more than it reaches
+    // DXGI. So: an explicit UUID wins, then an ordinal among the qualifying devices, then
+    // the first as before.
+    //
+    // UUID rather than name, because two identical cards share a name and cannot be told
+    // apart by one. Vulkan hands it to us directly through VkPhysicalDeviceIDProperties,
+    // so there is no NVML or CUDA dependency to acquire for it.
+    const char* wantUuid = getenv("DLSSNR_GPU_UUID");
+    const char* wantIndexEnv = getenv("DLSSNR_GPU_INDEX");
+    const long wantIndex = wantIndexEnv && *wantIndexEnv ? strtol(wantIndexEnv, nullptr, 10) : -1;
+
+    const auto deviceUuid = [](VkPhysicalDevice p, char out[33]) {
+        out[0] = '\0';
+        if (!vkGetPhysicalDeviceProperties2) return false;
+        VkPhysicalDeviceIDProperties idp{};
+        idp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+        VkPhysicalDeviceProperties2 p2{};
+        p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        p2.pNext = &idp;
+        vkGetPhysicalDeviceProperties2(p, &p2);
+        for (uint32_t i = 0; i < VK_UUID_SIZE; ++i)
+            snprintf(out + i * 2, 3, "%02x", idp.deviceUUID[i]);
+        return true;
+    };
+
+    long qualifying = 0;
     for (auto p : phys) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(p, &props);
         if (props.vendorID != 0x10DE) continue;
         if (!HasDeviceExt(p, "VK_NVX_binary_import") || !HasDeviceExt(p, "VK_NVX_image_view_handle")) continue;
+
+        char uuid[33];
+        const bool haveUuid = deviceUuid(p, uuid);
+        // Logged for every candidate, not only the winner: a user who needs to pin one has
+        // to be able to find out what to pin it to, and this is the only place that knows.
+        Log("[helper] candidate %ld: %s uuid=%s", qualifying, props.deviceName,
+            haveUuid ? uuid : "(unavailable)");
+
+        bool take;
+        if (wantUuid && *wantUuid) take = haveUuid && _stricmp(uuid, wantUuid) == 0;
+        else if (wantIndex >= 0) take = qualifying == wantIndex;
+        else take = true;
+
+        ++qualifying;
+        if (!take || c.physical) continue;
         c.physical = p;
         Log("[helper] device: %s", props.deviceName);
-        break;
+        if (!wantUuid && wantIndex < 0) break;  // first-wins: nothing after this can change it
+    }
+    if (!c.physical && (wantUuid || wantIndex >= 0)) {
+        Log("[helper] DLSSNR_GPU_%s did not match any qualifying device; not falling back",
+            wantUuid && *wantUuid ? "UUID" : "INDEX");
+        // Refusing rather than falling back is the point: someone who pinned a GPU and
+        // silently got a different one is worse off than someone who gets told.
+        c.pinMissed = true;
+        return false;
     }
     if (!c.physical) { Log("[helper] no NVIDIA device with NVX exts"); return false; }
     c.opticalFlow = HasDeviceExt(c.physical, VK_NV_OPTICAL_FLOW_EXTENSION_NAME);
@@ -3078,7 +3131,9 @@ int main() {
     if (!CreateContext(ns.vk)) {
         shm.hdr->helperState.store(kHelperNoVulkan);
         ShmStoreString(shm.hdr->helperReasonSeq, shm.hdr->helperReason, kReasonBytes,
-                       "no NVIDIA device with the NVX extensions");
+                       ns.vk.pinMissed
+                           ? "DLSSNR_GPU_UUID/DLSSNR_GPU_INDEX named a device that is not present"
+                           : "no NVIDIA device with the NVX extensions");
         return 3;
     }
     // Best-effort: if the view landed aligned and the driver accepts the import, the frame carries
