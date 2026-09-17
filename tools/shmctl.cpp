@@ -44,7 +44,7 @@ const Setting kSettings[] = {
       "0 default, 1 natural, 2 cinematic; anything above 2 behaves as 2" },
     { "automask", &ShmHeader::autoMask, false, "0/1 automatic skin mask" },
     { "scenecut", &ShmHeader::sceneCutThreshold, false,
-      "scene-cut threshold 0-255 (mean luma difference); 0 turns the detector off" },
+      "scene-cut threshold 0-255 (mean luma difference); 0 is the default and turns it off, 55 to start" },
     { "uicorrection", &ShmHeader::uiCorrection, false,
       "0/1 tell the model the frame already has the game's UI drawn on it" },
     { "intensity", &ShmHeader::intensityBits, true, "model intensity" },

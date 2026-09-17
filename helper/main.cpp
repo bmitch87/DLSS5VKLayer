@@ -91,7 +91,7 @@ static void SeedSceneCutFromEnv(ShmHeader* hdr) {
     }
     if (thr && *thr) {
         const long v = strtol(thr, nullptr, 10);
-        const uint32_t t = v > 0 && v < 256 ? uint32_t(v) : kSceneCutThresholdDefault;
+        const uint32_t t = v > 0 && v < 256 ? uint32_t(v) : kSceneCutThresholdSuggested;
         hdr->sceneCutThreshold.store(t);
         Log("[mvec] DLSSNR_SCENE_CUT_THRESHOLD=%s: seeding the scene-cut threshold at %u", thr, t);
     }
@@ -3070,7 +3070,7 @@ static bool DetectSceneCut(NeuralState& ns, ShmHeader* hdr, const uint8_t* in, u
     // The header is the control; the environment only seeds it, once, at startup (see
     // SeedSceneCutFromEnv). Read every frame rather than latched in a static, because the whole
     // point of moving it into the header is that it can be moved while a game is running.
-    const int threshold = hdr ? int(hdr->sceneCutThreshold.load()) : int(kSceneCutThresholdDefault);
+    const int threshold = hdr ? int(hdr->sceneCutThreshold.load()) : 0;
     if (threshold <= 0 || !in || !w || !h) return false;
 
     const uint32_t gw = w < 64 ? w : 64;

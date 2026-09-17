@@ -345,26 +345,6 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     buttons->addWidget(profileSaveBtn);
     root->addLayout(buttons);
 
-    // Said once, here, where the decision to switch it on is made.
-    //
-    // This is an IMPLICIT Vulkan layer: the loader inserts it into every Vulkan process on the
-    // machine that has the enabling variable set, not only into the game the user was thinking of.
-    // It hooks vkQueuePresentKHR inside that process and reads the swapchain. That is
-    // indistinguishable, from the outside, from the thing anti-cheat systems exist to detect, and
-    // nothing in this tree said so anywhere -- not in the interface, not in the packaging.
-    //
-    // The sentence is neutral and factual because the honest answer is "we do not know what any
-    // particular anti-cheat will do". What we do know is the shape of the thing, and the user is
-    // entitled to that before they turn it on for an online game.
-    auto* warn = new QLabel(
-        "This is an implicit Vulkan layer: it loads into every Vulkan program started while it is "
-        "enabled, and hooks presentation inside it. Anti-cheat systems may treat that as injection. "
-        "Prefer enabling it per game rather than globally, and think twice about online games.",
-        this);
-    warn->setWordWrap(true);
-    warn->setStyleSheet("color:#fb8c00;");
-    root->addWidget(warn);
-
     connect(profileReloadBtn, &QToolButton::clicked, this, [this] {
         const int idx = profileCombo->currentIndex();
         if (idx > 0) loadSettingsFromFile(profileCombo->itemData(idx).toString());
@@ -1600,11 +1580,14 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
         binder->AddInt(f, "Scene-cut threshold", &ShmHeader::sceneCutThreshold, 0, 255,
                        "How different one frame has to be from the last before the pass treats it "
                        "as a new scene and throws its temporal history away.\n"
-                       "Mean absolute brightness difference over a 64x36 grid, 0-255. 55 is the "
-                       "default; 0 turns the detector off entirely.\n"
-                       "The live score below is what this is compared against, so lower it until "
-                       "cuts fire on your content's real cuts and raise it if they fire on a pan or "
-                       "a flashing light.");
+                       "Mean absolute brightness difference over a 64x36 grid, 0-255.\n"
+                       "0 is the default and turns the detector off entirely: it throws the model's "
+                       "history away, and a false positive costs every frame of the run that "
+                       "triggered it while a false negative costs one smeared cut.\n"
+                       "55 is the value to start from if you want it on. The live score below is "
+                       "what it is compared against, so raise the threshold if cuts fire on a pan "
+                       "or a flashing light and lower it until they fire on your content's real "
+                       "cuts.");
         sceneCutLabel = new QLabel("-", col->parentWidget());
         sceneCutLabel->setToolTip(FormatTip(
             "What the last frame actually scored, and how many cuts have fired this session. "

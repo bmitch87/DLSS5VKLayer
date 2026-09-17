@@ -57,10 +57,21 @@ static constexpr uint32_t kMaxPasses = 30;
 
 // The scene-cut detector's default threshold: mean absolute luma difference over a 64x36 grid.
 //
-// 55 of 255 is what this detector has always used. It is reassuringly close to the 0.24 of full
-// scale -- about 61 -- that an independent implementation arrived at, which is the only outside
-// number available for it.
-static constexpr uint32_t kSceneCutThresholdDefault = 55;
+// 0, which means the detector is OFF unless somebody turns it on. It is a control that throws the
+// model's temporal history away, and the cost of a false positive is paid on every frame of the run
+// that triggered it while the cost of a false negative is one smeared cut.
+//
+// 55 of 255 is the value the detector used when it was always on, and the value to put back if you
+// want it: it is close to the 0.24 of full scale -- about 61 -- that an independent implementation
+// arrived at, which is the only outside number available for it. The one measurement taken here had
+// a synthetic cut scoring 58 against that 55, which is a margin of three, and that is the other
+// reason this is off by default rather than on.
+static constexpr uint32_t kSceneCutThresholdDefault = 0;
+
+// What the detector uses when it IS switched on, and what an environment override falls back to
+// when it names a value out of range. Kept separate from the default above so "off by default" and
+// "this is the number that works" stay two different statements.
+static constexpr uint32_t kSceneCutThresholdSuggested = 55;
 
 static constexpr size_t kReasonBytes = 192;
 static constexpr size_t kNameBytes = 128;
