@@ -66,6 +66,20 @@ struct OwnParam final : NVSDK_NGX_Parameter {
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     }
 
+    // NGX's own container is loose about types: the snippet may Set as unsigned int and
+    // Get as int, or Get as unsigned long long, and a container that answers only in the
+    // type the value was written in cannot be read at all -- silently, because a Get that
+    // returns a wrong number still returns Success. So every numeric read converts from
+    // the representation actually stored rather than from one chosen field.
+    //
+    // Integral storage is returned exactly rather than through double: a pointer written
+    // with Set(u64) -- DLSSNRComputeScalingRatioCallback is one -- must come back bit for
+    // bit, and a round trip through double is not that promise.
+    // (Cross-type reads warned about by DXL, src/core/NgxParameterBag.h:65-67, AGPL-3.0.)
+    static double AsDouble(const ParamVal& x) {
+        return x.kind == 3 ? x.d : x.kind == 2 ? (double)x.f : (double)x.u;
+    }
+
     static const char* PhaseName(unsigned mask) {
         const bool c = (mask & kNgxPhaseCreate) != 0;
         const bool e = (mask & kNgxPhaseEvaluate) != 0;
@@ -104,15 +118,24 @@ struct OwnParam final : NVSDK_NGX_Parameter {
         if (!n) return;
         auto& x = m[n]; x = {}; x.kind = 1; x.u = v; x.f = (float)v; x.d = (double)v;
     }
+    // A float-to-unsigned conversion is undefined for a negative value, not -1, and
+    // DLSSNR.SkinStructureStrength ships as -1.0f. The integer mirror is only a
+    // convenience for a whole non-negative number; the getters below convert from the
+    // representation actually stored, so nothing reads this for a float any more.
+    static unsigned long long IntMirror(double v) {
+        if (!(v >= 0.0) || v > 18446744073709549568.0) return 0ull;  // NaN fails the first test
+        return (unsigned long long)v;
+    }
+
     // Slot 2 (0x10)
     void NVSDK_CONV Set(const char* n, float v) override {
         if (!n) return;
-        auto& x = m[n]; x = {}; x.kind = 2; x.f = v; x.d = (double)v; x.u = (unsigned long long)v;
+        auto& x = m[n]; x = {}; x.kind = 2; x.f = v; x.d = (double)v; x.u = IntMirror((double)v);
     }
     // Slot 3 (0x18)
     void NVSDK_CONV Set(const char* n, double v) override {
         if (!n) return;
-        auto& x = m[n]; x = {}; x.kind = 3; x.d = v; x.f = (float)v; x.u = (unsigned long long)v;
+        auto& x = m[n]; x = {}; x.kind = 3; x.d = v; x.f = (float)v; x.u = IntMirror(v);
     }
     // Slot 4 (0x20)
     void NVSDK_CONV Set(const char* n, unsigned int v) override {
@@ -130,7 +153,7 @@ struct OwnParam final : NVSDK_NGX_Parameter {
         if (!n || !v) return NVSDK_NGX_Result_FAIL_InvalidParameter;
         auto it = m.find(n); if (it == m.end()) return miss(n);
         it->second.readMask |= NgxCurrentPhase();
-        *v = (it->second.kind == 3) ? it->second.d : (it->second.kind == 2 ? (double)it->second.f : (double)it->second.u);
+        *v = AsDouble(it->second);
         if (Verbose()) Log("[param-get:double] '%s' -> %f", n, *v);
         return NVSDK_NGX_Result_Success;
     }
@@ -139,7 +162,9 @@ struct OwnParam final : NVSDK_NGX_Parameter {
         if (!n || !v) return NVSDK_NGX_Result_FAIL_InvalidParameter;
         auto it = m.find(n); if (it == m.end()) return miss(n);
         it->second.readMask |= NgxCurrentPhase();
-        *v = it->second.u;
+        *v = it->second.kind == 2 || it->second.kind == 3
+                 ? (unsigned long long)AsDouble(it->second)
+                 : it->second.u;
         if (Verbose()) Log("[param-get:ull] '%s' -> %llu", n, *v);
         return NVSDK_NGX_Result_Success;
     }
@@ -148,7 +173,19 @@ struct OwnParam final : NVSDK_NGX_Parameter {
         if (!n || !v) return NVSDK_NGX_Result_FAIL_InvalidParameter;
         auto it = m.find(n); if (it == m.end()) { *v = nullptr; return miss(n); }
         it->second.readMask |= NgxCurrentPhase();
-        *v = it->second.p ? it->second.p : (void*)(uintptr_t)it->second.u;
+        // An integer is a legitimate way to carry an address and we use it ourselves:
+        // DLSSNRComputeScalingRatioCallback is written with Set(u64), and the DLL does
+        // read that key. A FLOAT is not: reinterpreting one handed back a non-null
+        // garbage pointer where a miss was the honest answer, and a resource query that
+        // receives a plausible-looking address does not fail, it faults.
+        if (it->second.p) {
+            *v = it->second.p;
+        } else if (it->second.kind == 1) {
+            *v = (void*)(uintptr_t)it->second.u;
+        } else {
+            *v = nullptr;
+            return miss(n);
+        }
         if (Verbose()) Log("[param-get:void*] '%s' -> %p", n, *v);
         return NVSDK_NGX_Result_Success;
     }
@@ -165,7 +202,8 @@ struct OwnParam final : NVSDK_NGX_Parameter {
         if (!n || !v) return NVSDK_NGX_Result_FAIL_InvalidParameter;
         auto it = m.find(n); if (it == m.end()) return miss(n);
         it->second.readMask |= NgxCurrentPhase();
-        *v = (int)it->second.u;
+        *v = it->second.kind == 2 || it->second.kind == 3 ? (int)AsDouble(it->second)
+                                                             : (int)it->second.u;
         if (Verbose()) Log("[param-get:int] '%s' -> %d", n, *v);
         return NVSDK_NGX_Result_Success;
     }
@@ -174,7 +212,8 @@ struct OwnParam final : NVSDK_NGX_Parameter {
         if (!n || !v) return NVSDK_NGX_Result_FAIL_InvalidParameter;
         auto it = m.find(n); if (it == m.end()) return miss(n);
         it->second.readMask |= NgxCurrentPhase();
-        *v = (unsigned int)it->second.u;
+        *v = it->second.kind == 2 || it->second.kind == 3 ? (unsigned int)AsDouble(it->second)
+                                                             : (unsigned int)it->second.u;
         if (Verbose()) Log("[param-get:uint] '%s' -> %u", n, *v);
         return NVSDK_NGX_Result_Success;
     }
@@ -187,7 +226,7 @@ struct OwnParam final : NVSDK_NGX_Parameter {
         if (!n || !v) return NVSDK_NGX_Result_FAIL_InvalidParameter;
         auto it = m.find(n); if (it == m.end()) return miss(n);
         it->second.readMask |= NgxCurrentPhase();
-        *v = (it->second.kind == 2) ? it->second.f : (it->second.kind == 3 ? (float)it->second.d : (float)it->second.u);
+        *v = (float)AsDouble(it->second);
         if (Verbose()) Log("[param-get:float] '%s' -> %f", n, *v);
         return NVSDK_NGX_Result_Success;
     }

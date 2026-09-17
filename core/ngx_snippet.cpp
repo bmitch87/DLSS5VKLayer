@@ -356,6 +356,17 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
         bool ok = ParamSetUI(s.params, "__selftest", 0xC0FFEE, &seh2);
         unsigned int back = 0;
         ok = ok && ParamGetUI(s.params, "__selftest", &back, &seh2) && back == 0xC0FFEE;
+
+        // The same-type round trip above says nothing about a CROSS-type read, and NGX's
+        // own container is loose about types: the snippet may write as one and read as
+        // another. Two cases, both of which we ship values for -- a float read back as an
+        // integer, and the negative float DLSSNR.SkinStructureStrength defaults to.
+        ok = ok && ParamSetF(s.params, "__selftest_f", 2.0f, &seh2);
+        ok = ok && ParamGetUI(s.params, "__selftest_f", &back, &seh2) && back == 2u;
+        float backF = 0.0f;
+        ok = ok && ParamSetF(s.params, "__selftest_neg", -1.0f, &seh2);
+        ok = ok && ParamGetF(s.params, "__selftest_neg", &backF, &seh2) && backF == -1.0f;
+
         Log("[params] round-trip self-test: %s (seh=%#x)", ok ? "PASS" : "FAIL", seh2);
         if (!ok) { s.disabled = true; return false; }
     }
