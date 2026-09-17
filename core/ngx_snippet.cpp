@@ -776,6 +776,39 @@ bool NgxEvaluatePass(NgxSnippet& s, uint32_t pass, VkCommandBuffer recordingCmd)
 // -> restore IAT -> FreeLibrary.
 void NgxTeardown(NgxSnippet& s, VkDevice device) {
     DWORD seh = 0;
+    // After a fault inside NGX, do not go back in to tidy up.
+    //
+    // The sequence below -- ReleaseFeature per pass, Shutdown1, DestroyParameters,
+    // FreeLibrary -- is exactly the one another project's two crash dumps indict: a fault
+    // during shutdown left the SDK's critical section held, and the next initialisation
+    // deadlocked against it. And this function is reached precisely BECAUSE a guarded call
+    // faulted, since that is what latches `disabled` and breaks the main loop.
+    //
+    // We are in a much better position than a process the user is still using: the snippet
+    // lives in a helper that owns nothing the game needs, the layer already treats an
+    // absent helper as the ordinary case, and the OS unmaps a dying process correctly. So
+    // the honest answer is to stop rather than to unwind.
+    //
+    // The IAT hooks are restored either way, and first: they are in OUR address space, and
+    // leaving SpoofedGetModuleFileNameW installed over a dead original is worse than
+    // leaving a DLL loaded.
+    if (NgxFaulted()) {
+        Log("[ngx] teardown skipped: NGX faulted in this process. Releasing nothing and "
+            "unloading nothing; restoring our own hooks only.");
+        RemoveCallerSpoof(g_snippetSpoof);
+        RemoveCallerSpoof(g_coreSpoof);
+        s.ready = false;
+        return;
+    }
+    const char* fullEnv = getenv("DLSSNR_NGX_FULL_TEARDOWN");
+    const bool full = !fullEnv || fullEnv[0] != '0';
+    if (!full) {
+        Log("[ngx] teardown skipped by DLSSNR_NGX_FULL_TEARDOWN=0");
+        RemoveCallerSpoof(g_snippetSpoof);
+        RemoveCallerSpoof(g_coreSpoof);
+        s.ready = false;
+        return;
+    }
     for (uint32_t i = 0; i < kMaxPasses; ++i) {
         if (!s.features[i] || !s.releaseFeature) continue;
         NVSDK_NGX_Result r = CallReleaseSafely(s.releaseFeature, s.features[i], &seh);

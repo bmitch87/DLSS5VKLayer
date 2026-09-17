@@ -1,5 +1,6 @@
 // Ported from standalone_runner/main.cpp:38-129 (verified fail-closed guard).
 #include "guard.h"
+#include <atomic>
 #include "logging.h"
 #include <csetjmp>
 #include <cstdio>
@@ -33,6 +34,11 @@ static void DescribeRange(uintptr_t addr, const char** outName, unsigned long lo
     *outName = "exe/other"; *outOffset = addr;
 }
 
+static std::atomic<bool> g_ngxFaulted{false};
+
+bool NgxFaulted() { return g_ngxFaulted.load(std::memory_order_relaxed); }
+void NoteNgxFault() { g_ngxFaulted.store(true, std::memory_order_relaxed); }
+
 static LONG WINAPI GuardVeh(EXCEPTION_POINTERS* ep) {
     if (!g_guardActive) return EXCEPTION_CONTINUE_SEARCH;
     // OutputDebugStringA/W raises these under Wine; never treat as a fault.
@@ -41,6 +47,9 @@ static LONG WINAPI GuardVeh(EXCEPTION_POINTERS* ep) {
         return EXCEPTION_CONTINUE_SEARCH;
 
     g_guardCode = ep->ExceptionRecord->ExceptionCode;
+    // One-way and process-wide: this is the fact that outlives the call, the thread and the
+    // 24-hit disarm below. Set before anything else can go wrong on the way out.
+    NoteNgxFault();
     if (++g_guardHits >= 24) { g_guardActive = false; return EXCEPTION_CONTINUE_SEARCH; }
 
     auto* rec = ep->ExceptionRecord;
