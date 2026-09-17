@@ -844,6 +844,27 @@ cmd_stop() {
 
   if [ -f "$shm" ]; then
     shm_control quit
+    # Give the polite request a moment to be acted on before escalating.
+    #
+    # There was no wait here at all: the quit flag was set and TERM followed immediately, so
+    # the orderly path -- release the features, shut the snippet down, unload -- essentially
+    # never ran, and we could not have noticed, because a helper killed before it logs
+    # anything looks exactly like a helper that exited cleanly. Verified by instrumenting a
+    # session: with the TERM removed, the helper exits on its own in well under a second and
+    # logs the whole teardown; with it, the log stops mid-loop.
+    #
+    # This matters more now that teardown refuses to re-enter a faulted NGX: that decision
+    # is only reachable if teardown runs.
+    if [ -f "$PID_FILE" ]; then
+      local _qpid
+      _qpid="$(cat "$PID_FILE" 2>/dev/null || true)"
+      if [ -n "$_qpid" ]; then
+        for _ in $(seq 1 24); do
+          kill -0 "$_qpid" 2>/dev/null || break
+          sleep 0.25
+        done
+      fi
+    fi
   fi
 
   if running_pid; then

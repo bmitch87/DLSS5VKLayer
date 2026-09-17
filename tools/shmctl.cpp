@@ -136,6 +136,32 @@ bool Initialised(const ShmHeader* h) {
     return h->magic.load() == kShmMagic && h->version.load() == kShmVersion;
 }
 
+// Weaker than Initialised on purpose, for the two commands that must keep working across a
+// version mismatch: quit and resume.
+//
+// The strict check turns a cosmetic mismatch into "you cannot ask the helper to stop". That
+// is not hypothetical -- it was hit here the moment the protocol went to 21 with a version
+// 20 tool still installed: dlssnr-helper stop set no flag, said nothing, and escalated
+// straight to SIGTERM, so the helper never ran its own teardown and there was no way to
+// tell from the outside.
+//
+// Safe because of what the magic means. kShmMagic was deliberately bumped when the v1
+// layout was abandoned, precisely so a stale mapping would be re-created rather than
+// half-read -- so a magic match implies the v2-and-later prefix, in which magic, version,
+// the sequence numbers, width, height and quit have not moved. Those are the only fields
+// these two commands touch.
+bool MagicOk(const ShmHeader* h) { return h->magic.load() == kShmMagic; }
+
+void WarnVersion(const ShmHeader* h, const char* what) {
+    const uint32_t v = h->version.load();
+    if (v == kShmVersion) return;
+    std::fprintf(stderr,
+                 "warning: header is version %u and this tool is version %u; doing '%s' anyway "
+                 "because the fields it touches have not moved. Reinstall the layer, helper, "
+                 "GUI and tools together.\n",
+                 v, kShmVersion, what);
+}
+
 void PrintSettings(ShmHeader* h) {
     for (const auto& s : kSettings) {
         const uint32_t raw = (h->*s.field).load();
@@ -226,12 +252,17 @@ int main(int argc, char** argv) {
     if (std::strcmp(cmd, "status") == 0) {
         PrintStatus(h);
     } else if (std::strcmp(cmd, "quit") == 0) {
-        if (Initialised(h)) {
+        if (MagicOk(h)) {
+            WarnVersion(h, "quit");
             h->quit.store(1);
             h->controlSeq.fetch_add(1);
         }
     } else if (std::strcmp(cmd, "resume") == 0) {
-        if (!Initialised(h)) ShmInitDefaults(h);
+        // Same reasoning as quit: clearing the flag must keep working across a version
+        // mismatch. Re-initialise only when the MAGIC is wrong -- a version mismatch alone
+        // is not a reason to overwrite a header a newer process is using.
+        if (!MagicOk(h)) ShmInitDefaults(h);
+        else WarnVersion(h, "resume");
         h->quit.store(0);
         h->controlSeq.fetch_add(1);
     } else if (std::strcmp(cmd, "reset") == 0) {
