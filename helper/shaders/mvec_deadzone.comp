@@ -30,7 +30,13 @@ layout(constant_id = 6) const float cDeadzone = 0.5;   // px, full-res units
 layout(constant_id = 7) const uint  cBilinear = 1u;    // 1 = bilinear upscale, 0 = nearest
 
 layout(rg16ui,   binding = 0) uniform readonly  highp uimage2D srcFlow;
-layout(rgba16f,  binding = 1) uniform writeonly highp image2D  dstMVec;
+// rg16f, matching VK_FORMAT_R16G16_SFLOAT exactly. This declared rgba16f, and a storage
+// image whose declared format does not match its view's is undefined for the WHOLE image,
+// not merely for the components that do not exist -- validation says so in those words, and
+// the image in question is the motion field the model reprojects with. Unlike the
+// composition shader's deliberate Rgba32f-over-UNORM mismatch, which is inherited from
+// upstream and measured, this one was simply wrong.
+layout(rg16f,    binding = 1) uniform writeonly highp image2D  dstMVec;
 
 #ifndef FLOW_FIXED5
 #error "compile with -D FLOW_FIXED5=1 (R16G16_SFIXED5_NV) or -D FLOW_FIXED5=0 (R16G16_SFLOAT)"

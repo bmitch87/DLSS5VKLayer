@@ -15,7 +15,9 @@ cd "$(dirname "$0")/.."
 
 GLSLANG="${GLSLANG:-$(command -v glslang || command -v glslangValidator || true)}"
 if [ -n "$GLSLANG" ]; then
-    compile() { "$GLSLANG" "$1" -V -D "$2" -o "$3"; }
+    # -D<name>, not -D <name>: a bare -D puts glslang into HLSL mode, so the spaced form
+    # silently compiled the wrong thing and printed its usage instead of a module.
+    compile() { "$GLSLANG" "$1" -V "-D$2" -o "$3"; }
 elif [ -x build/glsl2spv ]; then
     compile() { build/glsl2spv "$1" "$3" -D "$2"; }
 else
