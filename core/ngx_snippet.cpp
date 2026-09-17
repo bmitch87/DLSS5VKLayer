@@ -131,25 +131,30 @@ static bool ParamGetF(NVSDK_NGX_Parameter* p, const char* n, float* v, DWORD* se
 static NVSDK_NGX_Result CallInitExtSafely(FnVkInitExt fn, unsigned long long appId,
     const wchar_t* path, VkInstance instance, VkPhysicalDevice pd, VkDevice device,
     NVSDK_NGX_Version version, DWORD* seh) noexcept {
+    NgxCallScope watch("Init_Ext");
     return Guarded([&] { return fn(appId, path, instance, pd, device, version, nullptr); },
                    NVSDK_NGX_Result_FAIL_SEH, seh);
 }
 static NVSDK_NGX_Result CallCreateSafely(FnVkCreateFeature fn, VkCommandBuffer cmd, int feature,
     NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** handle, DWORD* seh) noexcept {
+    NgxCallScope watch("CreateFeature");
     NgxPhaseScope phase(kNgxPhaseCreate);
     return Guarded([&] { return fn(cmd, feature, params, handle); },
                    NVSDK_NGX_Result_FAIL_SEH, seh);
 }
 static NVSDK_NGX_Result CallEvaluateSafely(FnVkEvaluateFeature fn, VkCommandBuffer cmd,
     const NVSDK_NGX_Handle* handle, const NVSDK_NGX_Parameter* params, DWORD* seh) noexcept {
+    NgxCallScope watch("EvaluateFeature");
     NgxPhaseScope phase(kNgxPhaseEvaluate);
     return Guarded([&] { return fn(cmd, handle, params, nullptr); },
                    NVSDK_NGX_Result_FAIL_SEH, seh);
 }
 static NVSDK_NGX_Result CallReleaseSafely(FnVkReleaseFeature fn, NVSDK_NGX_Handle* handle, DWORD* seh) noexcept {
+    NgxCallScope watch("ReleaseFeature");
     return Guarded([&] { return fn(handle); }, NVSDK_NGX_Result_FAIL_SEH, seh);
 }
 static NVSDK_NGX_Result CallShutdownSafely(FnVkShutdown1 fn, VkDevice device, DWORD* seh) noexcept {
+    NgxCallScope watch("Shutdown1");
     return Guarded([&] { return fn(device); }, NVSDK_NGX_Result_FAIL_SEH, seh);
 }
 

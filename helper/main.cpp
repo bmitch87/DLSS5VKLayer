@@ -3158,6 +3158,44 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     return true;
 }
 
+// The hang watchdog. Guarded() catches a fault and returns; it cannot catch a call that
+// never comes back, and a wedged NGX call looks from the outside exactly like a helper that
+// is merely busy -- the layer times out, marks the channel dead, retries every five seconds,
+// and the game runs on with nobody able to say why the model stopped.
+//
+// This thread only watches. It does not try to cancel anything: the stuck thread is inside
+// the driver holding state we cannot take back, so there is no recovery to attempt, only a
+// diagnosis to publish and a process to end. _exit rather than a clean return for the same
+// reason the faulted teardown path exists -- do not ask code that has stopped answering to
+// help you shut down.
+static ShmMap* g_watchdogShm = nullptr;
+static unsigned long long g_watchdogBudgetMs = 0;
+
+static DWORD WINAPI NgxWatchdogThread(LPVOID) {
+    for (;;) {
+        Sleep(250);
+        ShmMap* shm = g_watchdogShm;
+        if (shm && shm->hdr && shm->hdr->quit.load()) return 0;
+        const unsigned long long ms = NgxCallOutstandingMs();
+        if (ms < g_watchdogBudgetMs) continue;
+        Log("[watchdog] NGX %s has not returned after %llu ms; the model has stopped "
+            "answering. Ending the helper -- restart it to try again.",
+            NgxCallName(), ms);
+        if (shm && shm->hdr) {
+            ShmStoreString(shm->hdr->helperReasonSeq, shm->hdr->helperReason, kReasonBytes,
+                           "the model stopped responding; restart the helper");
+            shm->hdr->helperState.store(kHelperModelFailed);
+            shm->hdr->modelUp.store(0);
+            shm->hdr->seq_ok.store(0);
+            // Answer the outstanding request, so the layer stops waiting on a frame that is
+            // never coming rather than spending its whole budget on it.
+            std::atomic_thread_fence(std::memory_order_release);
+            shm->hdr->seq_resp.store(shm->hdr->seq_req.load());
+        }
+        _exit(4);
+    }
+}
+
 int main() {
     // Wine delivers OutputDebugString through a debug-print exception. Install the
     // filter before the first log call so that exception can never reach an older or
@@ -3224,6 +3262,33 @@ int main() {
             }
         }
     }
+    // The hang watchdog. Guarded() catches a fault and returns; it cannot catch a call that
+    // never comes back, and a wedged NGX call looks from the outside exactly like a helper
+    // that is merely busy -- the layer times out, marks the channel dead, retries every five
+    // seconds, and the game runs on with nobody able to say why the model stopped.
+    //
+    // This thread only watches. It does not try to cancel anything: the stuck thread is
+    // inside the driver holding state we cannot take back, so there is no recovery to
+    // attempt, only a diagnosis to publish and a process to end. _exit rather than a clean
+    // return for the same reason the faulted teardown path exists -- do not ask code that
+    // has stopped answering to help you shut down.
+    {
+        const char* env = getenv("DLSSNR_NGX_WATCHDOG_MS");
+        g_watchdogBudgetMs = env ? strtoull(env, nullptr, 10) : 30000ull;
+        g_watchdogShm = &shm;
+        if (g_watchdogBudgetMs) {
+            // A Win32 thread rather than std::thread: this target links libstdc++
+            // statically with -nostdlib++, and pulling in std::thread's machinery made the
+            // linker report a duplicate section of a different size. The helper is a PE and
+            // already speaks Win32 everywhere else.
+            HANDLE h = CreateThread(nullptr, 0, NgxWatchdogThread, nullptr, 0, nullptr);
+            if (h) CloseHandle(h);
+            else Log("[watchdog] could not start; NGX hangs will not be detected");
+        } else {
+            Log("[watchdog] disabled by DLSSNR_NGX_WATCHDOG_MS=0");
+        }
+    }
+
     shm.hdr->helperState.store(kHelperRunning);
     Log("[helper] context ready, waiting for frames");
 
