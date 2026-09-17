@@ -241,8 +241,19 @@ struct VkCtx {
     VkDeviceMemory queryMem = nullptr;
     void* queryMap = nullptr;
     bool flowQueryAvailable = false;
+    // The model's own cost, on the graphics queue. Deliberately a separate pool from the
+    // flow one: they are written from different queue families, and the whole GPU-timing
+    // apparatus used to live inside the optical-flow capability check -- so a device
+    // without VK_NV_optical_flow, or a user who turned estimated vectors off, lost the
+    // ability to time the model, which is the one thing here worth timing.
+    VkQueryPool evalQuery = nullptr;
+    VkBuffer evalStaging = nullptr;
+    VkDeviceMemory evalMem = nullptr;
+    void* evalMap = nullptr;
+    bool evalQueryAvailable = false;
     float timestampPeriod = 1.0f;
     uint32_t flowTimestampBits = 0;
+    uint32_t gfxTimestampBits = 0;
     // Persistent MVec post pass (pipeline itself is per-size). The deadzone shader comes in two
     // compile-time variants -- one per flow format -- because a spec-constant branch on this driver
     // mispredicted and wrote NaN into MVec; the pipeline picks the module that matches the session.
@@ -424,6 +435,7 @@ static bool CreateContext(VkCtx& c) {
         const uint32_t queryFamily = (c.opticalFlow && c.opticalQueueFamily != UINT32_MAX)
             ? c.opticalQueueFamily : c.queueFamily;
         if (queryFamily < famCount) c.flowTimestampBits = fams[queryFamily].timestampValidBits;
+        if (c.queueFamily < famCount) c.gfxTimestampBits = fams[c.queueFamily].timestampValidBits;
     }
 
     VkCommandPoolCreateInfo cpci{};
@@ -482,43 +494,56 @@ static bool CreateContext(VkCtx& c) {
     }
     Log("[helper] mvec gpu compute supported=%d", int(c.mvComputeSupported));
 
-    if (c.opticalFlow && c.flowTimestampBits && vkCreateQueryPool && vkCmdResetQueryPool &&
-        vkCmdCopyQueryPoolResults && (vkCmdWriteTimestamp2 || vkCmdWriteTimestamp)) {
+    // One builder, two pools. What decides whether timing exists is the queue family's
+    // timestampValidBits and the entry points, and nothing else: which pass gets timed is
+    // a separate question from whether timing is possible at all.
+    const auto makeTimestampPool = [&](VkQueryPool* pool, VkBuffer* staging, VkDeviceMemory* mem,
+                                       void** map) -> bool {
         VkQueryPoolCreateInfo qpi{};
         qpi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
         qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
         qpi.queryCount = 2;
-        if (vkCreateQueryPool(c.device, &qpi, nullptr, &c.flowQuery) == VK_SUCCESS) {
-            VkBufferCreateInfo bci{};
-            bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-            bci.size = 16;
-            bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            if (vkCreateBuffer(c.device, &bci, nullptr, &c.queryStaging) == VK_SUCCESS) {
-                VkMemoryRequirements req{};
-                vkGetBufferMemoryRequirements(c.device, c.queryStaging, &req);
-                VkMemoryAllocateInfo mai{};
-                mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-                mai.allocationSize = req.size;
-                mai.memoryTypeIndex = FindHostMemoryType(c, req.memoryTypeBits, true);
-                if (mai.memoryTypeIndex != UINT32_MAX &&
-                    vkAllocateMemory(c.device, &mai, nullptr, &c.queryMem) == VK_SUCCESS &&
-                    vkBindBufferMemory(c.device, c.queryStaging, c.queryMem, 0) == VK_SUCCESS &&
-                    vkMapMemory(c.device, c.queryMem, 0, VK_WHOLE_SIZE, 0, &c.queryMap) == VK_SUCCESS) {
-                    c.flowQueryAvailable = true;
-                } else {
-                    if (c.queryMem) vkFreeMemory(c.device, c.queryMem, nullptr);
-                    if (c.queryStaging) vkDestroyBuffer(c.device, c.queryStaging, nullptr);
-                    if (c.flowQuery) vkDestroyQueryPool(c.device, c.flowQuery, nullptr);
-                    c.queryMem = nullptr; c.queryStaging = nullptr; c.flowQuery = nullptr; c.queryMap = nullptr;
-                }
-            } else if (c.flowQuery) {
-                vkDestroyQueryPool(c.device, c.flowQuery, nullptr);
-                c.flowQuery = nullptr;
-            }
+        if (vkCreateQueryPool(c.device, &qpi, nullptr, pool) != VK_SUCCESS) return false;
+        VkBufferCreateInfo bci{};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = 16;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vkCreateBuffer(c.device, &bci, nullptr, staging) != VK_SUCCESS) {
+            vkDestroyQueryPool(c.device, *pool, nullptr); *pool = nullptr;
+            return false;
         }
-    }
-    Log("[helper] flow timestamp query=%d bits=%u period=%.3f",
-        int(c.flowQueryAvailable), c.flowTimestampBits, c.timestampPeriod);
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(c.device, *staging, &req);
+        VkMemoryAllocateInfo mai{};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = FindHostMemoryType(c, req.memoryTypeBits, true);
+        if (mai.memoryTypeIndex != UINT32_MAX &&
+            vkAllocateMemory(c.device, &mai, nullptr, mem) == VK_SUCCESS &&
+            vkBindBufferMemory(c.device, *staging, *mem, 0) == VK_SUCCESS &&
+            vkMapMemory(c.device, *mem, 0, VK_WHOLE_SIZE, 0, map) == VK_SUCCESS) {
+            return true;
+        }
+        if (*mem) vkFreeMemory(c.device, *mem, nullptr);
+        vkDestroyBuffer(c.device, *staging, nullptr);
+        vkDestroyQueryPool(c.device, *pool, nullptr);
+        *mem = nullptr; *staging = nullptr; *pool = nullptr; *map = nullptr;
+        return false;
+    };
+
+    const bool timestampCalls = vkCreateQueryPool && vkCmdResetQueryPool &&
+                                vkCmdCopyQueryPoolResults &&
+                                (vkCmdWriteTimestamp2 || vkCmdWriteTimestamp);
+    if (timestampCalls && c.opticalFlow && c.flowTimestampBits)
+        c.flowQueryAvailable = makeTimestampPool(&c.flowQuery, &c.queryStaging, &c.queryMem, &c.queryMap);
+    if (timestampCalls && c.gfxTimestampBits)
+        c.evalQueryAvailable = makeTimestampPool(&c.evalQuery, &c.evalStaging, &c.evalMem, &c.evalMap);
+
+    Log("[helper] timestamp queries flow=%d eval=%d flow_bits=%u gfx_bits=%u period=%.3f",
+        int(c.flowQueryAvailable), int(c.evalQueryAvailable), c.flowTimestampBits,
+        c.gfxTimestampBits, c.timestampPeriod);
+    if (!c.evalQueryAvailable)
+        Log("[helper] no GPU timing for the model; helperEvalMs will be CPU wall clock");
 
     // Staging is allocated on the first frame, at that frame's size, rather than at the largest frame
     // the protocol can carry. Every path that needs it grows it on demand already. Reserving the
@@ -1813,6 +1838,40 @@ static void CopyFlowTimestampResults(VkCtx& c, VkCommandBuffer cb) {
                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
 }
 
+// The model's own GPU cost. No ticket ring and no non-blocking read here, deliberately:
+// each pass already ends in SubmitAndWait, so the CPU has finished waiting by the time
+// these are read and the measurement adds no stall of its own. A ring would be the right
+// answer only if reading forced a wait that did not already exist.
+static void ResetEvalTimestampQueries(VkCtx& c, VkCommandBuffer cb) {
+    if (c.evalQueryAvailable && vkCmdResetQueryPool) vkCmdResetQueryPool(cb, c.evalQuery, 0, 2);
+}
+
+static void WriteEvalTimestamp(VkCtx& c, VkCommandBuffer cb, uint32_t index) {
+    if (!c.evalQueryAvailable) return;
+    if (vkCmdWriteTimestamp) {
+        vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, c.evalQuery, index);
+    } else if (c.sync2 && vkCmdWriteTimestamp2) {
+        vkCmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, c.evalQuery, index);
+    }
+}
+
+static void CopyEvalTimestampResults(VkCtx& c, VkCommandBuffer cb) {
+    if (!c.evalQueryAvailable) return;
+    vkCmdCopyQueryPoolResults(cb, c.evalQuery, 0, 2, c.evalStaging, 0, 8,
+                              VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+}
+
+// Milliseconds, or -1 when the pair is not a usable measurement. The scope is what this
+// brackets -- our barriers plus whatever the snippet recorded into our command buffer --
+// and not necessarily only the model's work: if the snippet submits to another queue,
+// these timestamps do not see it.
+static double ReadEvalTimestampMs(VkCtx& c) {
+    if (!c.evalQueryAvailable || !c.evalMap) return -1.0;
+    const uint64_t* q = (const uint64_t*)c.evalMap;
+    if (q[0] == 0 || q[1] == 0 || q[1] < q[0]) return -1.0;
+    return double(q[1] - q[0]) * double(c.timestampPeriod) / 1000000.0;
+}
+
 static double ReadFlowTimestampMs(VkCtx& c) {
     if (!c.flowQueryAvailable || !c.queryMap) return -1.0;
     const uint64_t* q = (const uint64_t*)c.queryMap;
@@ -2765,6 +2824,8 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
 
     const uint32_t passes = std::min(wanted, ns.livePasses);
     GpuImage* last = nullptr;
+    double evalGpuMs = 0.0;   // summed over the chain; -1 readings are not counted
+    uint32_t timedPasses = 0;
 
     for (uint32_t pass = 0; pass < passes; ++pass) {
         // A failed rebuild leaves a hole; the chain runs without that pass rather than losing the
@@ -2786,6 +2847,7 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         NgxSetSharpness(ns.ngx, ClampF(ps.sharpness, 0.0f, 1.0f));
 
         if (!BeginCmd(ns.vk.cmdEval)) return false;
+        ResetEvalTimestampQueries(ns.vk, ns.vk.cmdEval);
         TransitionImage(ns.vk, ns.vk.cmdEval, *in, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -2801,11 +2863,16 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         if (reset) ns.lastResetLogged = ns.mvecScaleMode;
         ns.passNeedsReset[pass] = false;
 
+        WriteEvalTimestamp(ns.vk, ns.vk.cmdEval, 0);
         if (!NgxEvaluatePass(ns.ngx, pass, ns.vk.cmdEval)) {
             vkEndCommandBuffer(ns.vk.cmdEval);
             return false;
         }
+        WriteEvalTimestamp(ns.vk, ns.vk.cmdEval, 1);
+        CopyEvalTimestampResults(ns.vk, ns.vk.cmdEval);
         if (!SubmitAndWait(ns.vk, ns.vk.cmdEval)) return false;
+        const double passGpuMs = ReadEvalTimestampMs(ns.vk);
+        if (passGpuMs >= 0.0) { evalGpuMs += passGpuMs; ++timedPasses; }
         last = out;
     }
     ns.mvecResetPending = false;
@@ -2907,7 +2974,17 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     ++ns.evaluates;
     if (shm.hdr) {
         ShmStore64(shm.hdr->helperFramesLo, shm.hdr->helperFramesHi, ns.evaluates);
-        shm.hdr->helperEvalMsBits.store(FloatToBits(float(tEval - tUpload)));
+        // GPU time for the model where the device can measure it, CPU wall clock around
+        // the submit-and-fence otherwise. The two are not the same number -- the CPU one
+        // includes our own barriers and the queue wait -- so anything comparing this
+        // against a threshold has to know which it got; the startup log says which.
+        //
+        // The fallback is worth naming: tUpload and tEval are only sampled under
+        // DLSSNR_TIME, so before the GPU path existed this field published a constant
+        // zero for everybody who had not set that variable.
+        const double reportedEvalMs =
+            timedPasses > 0 ? evalGpuMs : (time ? tEval - tUpload : 0.0);
+        shm.hdr->helperEvalMsBits.store(FloatToBits(float(reportedEvalMs)));
         shm.hdr->helperFeatures.store(ns.livePasses);
         shm.hdr->modelUp.store(1);
     }
@@ -2915,9 +2992,10 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     if (time) {
         static int frameNo = 0;
         if (++frameNo % TimeInterval() == 0) {
-            Log("[time] passes=%u/%u flow=%s upload=%.2f eval=%.2f readback=%.2f total=%.2f ms",
+            Log("[time] passes=%u/%u flow=%s upload=%.2f eval=%.2f (gpu %.2f over %u) "
+                "readback=%.2f total=%.2f ms",
                 passes, wanted, ns.flow.enabled ? "on" : "off",
-                tUpload - t0, tEval - tUpload, tDone - tEval, tDone - t0);
+                tUpload - t0, tEval - tUpload, evalGpuMs, timedPasses, tDone - tEval, tDone - t0);
         }
     }
     return true;
@@ -3087,6 +3165,9 @@ int main() {
     if (ns.vk.flowQuery) vkDestroyQueryPool(ns.vk.device, ns.vk.flowQuery, nullptr);
     if (ns.vk.queryStaging) vkDestroyBuffer(ns.vk.device, ns.vk.queryStaging, nullptr);
     if (ns.vk.queryMem) vkFreeMemory(ns.vk.device, ns.vk.queryMem, nullptr);
+    if (ns.vk.evalQuery) vkDestroyQueryPool(ns.vk.device, ns.vk.evalQuery, nullptr);
+    if (ns.vk.evalStaging) vkDestroyBuffer(ns.vk.device, ns.vk.evalStaging, nullptr);
+    if (ns.vk.evalMem) vkFreeMemory(ns.vk.device, ns.vk.evalMem, nullptr);
     if (ns.vk.uploadStaging) vkDestroyBuffer(ns.vk.device, ns.vk.uploadStaging, nullptr);
     if (ns.vk.readStaging) vkDestroyBuffer(ns.vk.device, ns.vk.readStaging, nullptr);
     if (ns.vk.uploadMem) vkFreeMemory(ns.vk.device, ns.vk.uploadMem, nullptr);
