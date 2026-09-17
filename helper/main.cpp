@@ -1175,6 +1175,10 @@ struct OpticalFlowState {
     uint32_t attemptedPixelSize = kMVecPixels4;
     bool userDisabled = false;
     bool hasPrev = false;
+    // The session keeps temporal hints of its own, and they are not ours to see or clear.
+    // Set whenever the pair this engine is about to compare does not follow from the pair
+    // it last saw, and consumed by the next execute.
+    bool hintsStale = true;
     bool currentToPrevious = true;
     bool flowTransferSrc = false;
     bool gpuConvertChecked = false;
@@ -1506,6 +1510,7 @@ static void DestroyOpticalFlow(VkCtx& c, OpticalFlowState& f) {
     f.attemptedPixelSize = kMVecPixels4;
     f.userDisabled = false;
     f.hasPrev = false;
+    f.hintsStale = true;
     f.currentToPrevious = true;
     f.flowTransferSrc = false;
     f.gpuConvertChecked = false;
@@ -1642,7 +1647,10 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
     Log("[mvec] NV optical flow enabled size=%ux%u grid=%u quality=%u input=%d flow=%d dir=%d xfer=%d",
         w, h, f.grid, quality, (int)f.inputFormat, (int)f.flowFormat,
         int(f.currentToPrevious), int(f.flowTransferSrc));
-    Log("[mvec] session grid=%u perf=%u cost=off hints=off flags=%u",
+    // "external_hints" rather than "hints": this field is sci.hintGridSize, an external
+    // hint GRID that we genuinely do not supply. It is not the session's own temporal
+    // hints, which are per-execute and were on unconditionally until they were named here.
+    Log("[mvec] session grid=%u perf=%u cost=off external_hints=off flags=%u",
         f.grid, (unsigned)sci.performanceLevel, (unsigned)sci.flags);
     return true;
 }
@@ -1962,7 +1970,16 @@ static bool RunOpticalFlow(NeuralState& ns) {
     VkCommandBuffer fcb = ns.vk.cmdFlow;
     VkOpticalFlowExecuteInfoNV exec{};
     exec.sType = VK_STRUCTURE_TYPE_OPTICAL_FLOW_EXECUTE_INFO_NV;
+    // The flag is negative, so a zeroed flags word means hints ENABLED -- which is what
+    // this was, always. The engine carries temporal hints from its previous execute, and
+    // across a scene cut, a session rebuild or a raster change those hints describe a
+    // scene that is no longer on screen. We already go to the trouble of dropping our own
+    // flow history and clearing MVec on a cut; the one piece of state we cannot see is the
+    // one piece we never cleared.
+    const bool discardHints = f.hintsStale || ns.mvecResetPending;
+    if (discardHints) exec.flags = VK_OPTICAL_FLOW_EXECUTE_DISABLE_TEMPORAL_HINTS_BIT_NV;
     vkCmdOpticalFlowExecuteNV(fcb, f.session, &exec);
+    f.hintsStale = false;
     // TOP_OF_PIPE: the wait must cover every command in this buffer (the NVOF
     // session reads its inputs through driver-private stages). ALL_COMMANDS is
     // invalid in pWaitDstStageMask on the optical-flow-only queue (VUID-00066)
@@ -2678,6 +2695,7 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
                           DetectSceneCut(ns, shm.inPixels, w, h, 1);
     if (sceneCut && !ns.firstFrame && ns.flow.enabled) {
         ns.flow.hasPrev = false;
+        ns.flow.hintsStale = true;  // and the engine's own hints, which we cannot see
         ns.pendingMvClear = true;  // zeroed inside the flow prep submit, GPU-side
     }
 
