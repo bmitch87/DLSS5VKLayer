@@ -47,6 +47,7 @@ that prompted a change.
 | [2600th/dlss5-video-player](https://github.com/2600th/dlss5-video-player) | MIT | That a scene-cut detector needs a strong arm that fires immediately and a debounced weak arm, and that a detected cut must raise the model's own history reset and not only clear the motion field (`src/TemporalGuides.cpp:72-116`). The §3.13 reasoning is NVIDIA's documentation. |
 | [MagicalPrincessUnicorn/NeuRotic-an-OptiScaler-DLSSNR-fork](https://github.com/MagicalPrincessUnicorn/NeuRotic-an-OptiScaler-DLSSNR-fork) | GPL-3.0 | That a Present-time neural pass has no reset signal from the game, so its own continuity is the only one it can observe and every interruption must start the next frame fresh (`OptiScaler/dlssnr/DlssNr_PresentHistory.h:9-11`). |
 | [onestep00/OptiScaler-Glass-Motion](https://github.com/onestep00/OptiScaler-Glass-Motion) | GPL-3.0 | That requiring a particular queue type for a timestamp query silently disables the measurement instead of failing the thing being measured, and that a GPU timer should state the scope of what it brackets (`OptiScaler/framegen/glass/GlassGpuTimer.h:11-14`, `:85-86`, `:132-135`). |
+| [Blueforcer/ComfyUI-DLSS5-Enhancer](https://github.com/Blueforcer/ComfyUI-DLSS5-Enhancer) | MIT | The `NVSDK_NGX_PerfQuality_Value` mapping, which is what showed that our `PerfQualityValue = 3` was commented "Balanced" when 3 is UltraPerformance (`dlss5/settings.py:28-35`). |
 
 ## What Is Derived From RenoDX
 

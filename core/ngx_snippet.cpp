@@ -390,10 +390,18 @@ bool NgxLoadAndInit(NgxSnippet& s, VkInstance instance, VkPhysicalDevice pd, VkD
     ps &= ParamSetUI(s.params, "DLSSNR.Hint.Render.Preset", 0u, &seh);
     ps &= ParamSetUI(s.params, "Width", width, &seh);
     ps &= ParamSetUI(s.params, "Height", height, &seh);
-    ps &= ParamSetUI(s.params, "PerfQualityValue", 3u, &seh);  // Balanced
+    // Was 3u with "// Balanced" beside it. 3 is UltraPerformance -- a three-times upscale
+    // from a third-resolution render -- and this pass upscales nothing. The value is
+    // unchanged here on purpose: it is what every session so far has run with, the key is
+    // read and validated by the DLL, and changing it is a measurement rather than a
+    // rename. extracted_pipeline_notes.md records the verified reference as passing
+    // Balanced, so the note and the code have disagreed for some time.
+    ps &= ParamSetUI(s.params, "PerfQualityValue",
+                     (unsigned)NVSDK_NGX_PerfQuality_Value_UltraPerformance, &seh);
     ps &= ParamSetUI(s.params, "CreationNodeMask", 1u, &seh);
     ps &= ParamSetUI(s.params, "VisibilityNodeMask", 1u, &seh);
-    ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_PerfQualityValue", 3u, &seh);
+    ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_PerfQualityValue",
+                     (unsigned)NVSDK_NGX_PerfQuality_Value_UltraPerformance, &seh);
     ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_CreationNodeMask", 1u, &seh);
     ps &= ParamSetUI(s.params, "NVSDK_NGX_Parameter_VisibilityNodeMask", 1u, &seh);
 

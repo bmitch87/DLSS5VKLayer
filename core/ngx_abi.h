@@ -128,6 +128,28 @@ typedef NVSDK_NGX_Result (NVSDK_CONV* PFN_NVSDK_NGX_ProgressCallback)(float prog
 #define FEATURE_DLSSNR 18
 #define DLSSNR_SIGNED_SNIPPET_APPLICATION_ID 0x0876232Cull
 
+// NVSDK_NGX_PerfQuality_Value (public SDK values). Spelled out because the value was
+// being passed as a bare integer with a comment beside it, and the comment said
+// "Balanced" next to a 3. 3 is UltraPerformance; Balanced is 1. A named constant cannot
+// disagree with itself that way.
+//
+// Which value is right for this pass is a separate question and is not settled here. The
+// pass does no upscaling -- DLSSNR.ScalingRatio is pinned to 1.0 and the ratio callback
+// answers 1.0 -- so the mode that MEANS "native resolution" is DLAA. What is established
+// is that the key is live: nvngx_dlssnr.dll carries the strings
+//   "Error: missing PerfQualityValue for DLSSNR scaling ratio computation"
+//   "Error: unsupported PerfQualityValue %u for DLSSNR scaling ratio computation"
+// so it is read, it is validated, and some values are refused. Sweep it with a held frame
+// and watch for the second string before changing the shipped value.
+enum NVSDK_NGX_PerfQuality_Value {
+    NVSDK_NGX_PerfQuality_Value_MaxPerf          = 0,
+    NVSDK_NGX_PerfQuality_Value_Balanced         = 1,
+    NVSDK_NGX_PerfQuality_Value_MaxQuality       = 2,
+    NVSDK_NGX_PerfQuality_Value_UltraPerformance = 3,
+    NVSDK_NGX_PerfQuality_Value_UltraQuality     = 4,
+    NVSDK_NGX_PerfQuality_Value_DLAA             = 5,
+};
+
 // NVSDK_NGX_DLSS_Feature_Flags (public SDK values; "Feature_Flags" create param).
 enum NVSDK_NGX_DLSS_Feature_Flags {
     NVSDK_NGX_DLSS_Feature_Flags_IsHDR              = 0x1,
