@@ -2668,6 +2668,10 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
     // the frames it takes to switch, and every copy below sizes itself by hdrEncode, never by hope.
     const uint32_t hdrActive = shm.hdr->hdrActive.load() ? 1u : 0u;
     const uint32_t hdrEncode = shm.hdr->hdrEncode.load() ? 1u : 0u;
+    // The same picture as last time: the layer's idle repaint re-asking about a frame it is
+    // holding. A repeat is not a new sample of a moving scene, and treating it as one made
+    // the answer for a held frame depend on how many times it had been re-asked.
+    const bool frameRepeat = shm.hdr->frameRepeat.load() != 0;
     const bool wantHdr = hdrActive && !ns.hdrRejected &&
                          (!ns.ngx.snippet || ns.ngx.hdrCapable);
     const size_t bytes = px * (hdrEncode ? 8 : 4);
@@ -2825,8 +2829,20 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         }
     }
 
+    if (frameRepeat && !ns.firstFrame) {
+        // Reset every pass, so a held frame gets the same answer however many times it is
+        // re-asked and a slider drag becomes a sequence of independent answers to one
+        // picture rather than a walk. Without this, every measurement taken on a held frame
+        // is unreproducible by construction, which is most of the measurements worth taking.
+        ns.mvecResetPending = true;
+        ns.flow.hintsStale = true;
+    }
+
     const double tUpload = time ? NowMs() : 0.0;
-    if (ns.flow.enabled) {
+    // Estimating flow between a frame and itself costs a full NVOF execute to produce a
+    // field we already know is zero, so a repeat skips it and takes one of the plain upload
+    // paths below instead -- the upload normally rides along inside the flow prep submit.
+    if (ns.flow.enabled && !frameRepeat) {
         // The colorIn upload is merged into the flow prep command buffer.
         if (!RunOpticalFlow(ns)) {
             Log("[mvec] disabling estimated motion vectors after a flow failure");

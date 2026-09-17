@@ -37,7 +37,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 20;
+static constexpr uint32_t kShmVersion = 21;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -533,6 +533,20 @@ struct ShmHeader {
     std::atomic<uint32_t> sdr16Multipass;
     std::atomic<uint32_t> mvecPixelSize;
 
+    // Whether this request carries the SAME picture as the last one, written by the layer
+    // immediately before seq_req, next to hdrEncode and for the same reason: it describes
+    // the bytes, so it has to be published by the statement that announces them.
+    //
+    // The idle repaint re-runs the whole chain over a frame that is deliberately held, so
+    // the helper receives the same picture several times and, until now, could not tell.
+    // Each repaint was another frame of a perfectly static scene to the model: its temporal
+    // state advanced, the flow engine was handed prev == curr, and nothing raised a reset --
+    // so the answer for a held frame depended on how many repaints had happened to it,
+    // which makes every measurement taken on a held frame unreproducible by construction.
+    //
+    // holdFrame is not a substitute. It is a setting, it says what the LAYER is doing, and
+    // it is not written next to the pixels; this is a property of one request.
+    std::atomic<uint32_t> frameRepeat;
 };
 
 static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region");
@@ -548,7 +562,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1968, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 1972, "the header layout changed -- bump kShmVersion");
 
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
@@ -614,7 +628,7 @@ inline void ShmResetSettings(ShmHeader* h) {
         uint32_t proxyExportSeq, proxyPid, proxyFd, proxyGen;
         uint32_t answerExportSeq, answerPid, answerFd, answerGen;
         uint32_t layerProxySeq, layerAnswerSeq;
-        uint32_t hdrDetected, hdrActive, proxyFormat, hdrEncode;
+        uint32_t hdrDetected, hdrActive, proxyFormat, hdrEncode, frameRepeat;
     } v;
 #define DLSSNR_SAVE(f) v.f = h->f.load()
     DLSSNR_SAVE(seq_req); DLSSNR_SAVE(seq_resp); DLSSNR_SAVE(width); DLSSNR_SAVE(height);
@@ -633,6 +647,7 @@ inline void ShmResetSettings(ShmHeader* h) {
     DLSSNR_SAVE(answerExportSeq); DLSSNR_SAVE(answerPid); DLSSNR_SAVE(answerFd);
     DLSSNR_SAVE(answerGen); DLSSNR_SAVE(layerProxySeq); DLSSNR_SAVE(layerAnswerSeq);
     DLSSNR_SAVE(hdrDetected); DLSSNR_SAVE(hdrActive); DLSSNR_SAVE(proxyFormat); DLSSNR_SAVE(hdrEncode);
+    DLSSNR_SAVE(frameRepeat);
 #undef DLSSNR_SAVE
     char helperReason[kReasonBytes], layerReason[kReasonBytes], gameName[kNameBytes];
     std::memcpy(helperReason, h->helperReason, sizeof(helperReason));
@@ -657,6 +672,7 @@ inline void ShmResetSettings(ShmHeader* h) {
     DLSSNR_LOAD(answerExportSeq); DLSSNR_LOAD(answerPid); DLSSNR_LOAD(answerFd);
     DLSSNR_LOAD(answerGen); DLSSNR_LOAD(layerProxySeq); DLSSNR_LOAD(layerAnswerSeq);
     DLSSNR_LOAD(hdrDetected); DLSSNR_LOAD(hdrActive); DLSSNR_LOAD(proxyFormat); DLSSNR_LOAD(hdrEncode);
+    DLSSNR_LOAD(frameRepeat);
 #undef DLSSNR_LOAD
     std::memcpy(h->helperReason, helperReason, sizeof(helperReason));
     std::memcpy(h->layerReason, layerReason, sizeof(layerReason));

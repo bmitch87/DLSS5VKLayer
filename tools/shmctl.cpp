@@ -195,6 +195,7 @@ void PrintStatus(const ShmHeader* h) {
     std::printf("hdr_mode=%u\nhdr_detected=%u\nhdr_active=%u\nproxy_format=%u\nhdr_encode=%u\n",
                 h->hdrMode.load(), h->hdrDetected.load(), h->hdrActive.load(),
                 h->proxyFormat.load(), h->hdrEncode.load());
+    std::printf("frame_repeat=%u\n", h->frameRepeat.load());
     const std::string reason = ShmLoadString(h->helperReasonSeq, h->helperReason, kReasonBytes);
     if (!reason.empty()) std::printf("helper_reason=%s\n", reason.c_str());
 }

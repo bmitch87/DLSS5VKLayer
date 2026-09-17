@@ -333,7 +333,8 @@ static bool DmaBufEnabled() {
 }
 
 static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, const void* proxy,
-                          void* modelOut, bool proxyInRegion, bool answerFromFd, bool hdrEncode) {
+                          void* modelOut, bool proxyInRegion, bool answerFromFd, bool hdrEncode,
+                          bool frameRepeat) {
     if (s.dead) return false;
     if (!ShmOpen(s)) { s.dead = true; return false; }
     if (w > kMaxW || h > kMaxH || w < kMinW || h < kMinH) return false;
@@ -354,6 +355,9 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
     // Say what the bytes ARE before announcing them: the helper sizes its read by this, never by
     // what it hopes the layer has switched to. The release fence below covers it like the pixels.
     s.hdr->hdrEncode.store(hdrEncode ? 1u : 0u);
+    // And whether these are the same pixels as last time. Same placement and the same
+    // reason: it describes the bytes, so it is published by the statement announcing them.
+    s.hdr->frameRepeat.store(frameRepeat ? 1u : 0u);
     uint32_t req = s.hdr->seq_req.load() + 1;
     // The release pairs with the helper's acquire on seq_resp: everything this process wrote --
     // the proxy, whether by the GPU into the imported region or by the memcpy above -- is visible
@@ -1617,7 +1621,8 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     // ---- the round trip ----
     if (!ShmProcessFrame(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ModelBytes(),
                          sc.comp->ProxyPixels(), sc.comp->ModelPixels(), sc.comp->ProxyActive(),
-                         answerViaFd, sc.comp->HdrProxyActive())) {
+                         answerViaFd, sc.comp->HdrProxyActive(),
+                         /*frameRepeat=*/repaint || fs.holdFrame != 0)) {
         // Fail-open. Leg 1 already put the image back in PRESENT_SRC_KHR, so the original frame is
         // what gets presented and nothing else is owed.
         return false;
