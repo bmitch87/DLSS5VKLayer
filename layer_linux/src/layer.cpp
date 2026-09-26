@@ -53,7 +53,19 @@
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
+static bool LayerRequestedForLogging() {
+    static const bool enabled = [] {
+        const char* mixed = getenv("VKLayer_DLSS5");
+        const char* upper = getenv("VKLAYER_DLSS5");
+        const char* legacy = getenv("DLSSNR_ENABLE");
+        return (mixed && mixed[0] == '1') || (upper && upper[0] == '1') ||
+               (legacy && legacy[0] == '1');
+    }();
+    return enabled;
+}
+
 static void Log(const char* fmt, ...) {
+    if (!LayerRequestedForLogging()) return;
     static FILE* f = [] {
         const char* p = getenv("DLSSNR_LOG");
         return p && *p ? fopen(p, "a") : stderr;
@@ -663,7 +675,8 @@ static bool LayerEnabled() {
     static const bool e = [] {
         if (DuplicateLayerCopy()) return false;
         const char* v = getenv("VKLayer_DLSS5");
-        if (v && v[0] == '1') return true;
+        const char* upper = getenv("VKLAYER_DLSS5");
+        if ((v && v[0] == '1') || (upper && upper[0] == '1')) return true;
         const char* o = getenv("DLSSNR_ENABLE");
         return o && o[0] == '1';
     }();
@@ -1837,9 +1850,11 @@ vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* v) {
     // business, but announcing it each time turned one line into 627 in the user's log. Every other
     // layer stays quiet because none of them log from here.
     static std::once_flag announced;
-    std::call_once(announced, [] {
-        const char* v = getenv("VKLayer_DLSS5");
-        Log("=== %s loaded (VKLayer_DLSS5=%s) ===", VK_LAYER_NAME, v ? v : "(unset)");
+    if (LayerEnabled()) std::call_once(announced, [] {
+        const char* mixed = getenv("VKLayer_DLSS5");
+        const char* upper = getenv("VKLAYER_DLSS5");
+        const char* value = mixed ? mixed : upper;
+        Log("=== %s loaded (VKLayer_DLSS5=%s) ===", VK_LAYER_NAME, value ? value : "(unset)");
     });
     return VK_SUCCESS;
 }

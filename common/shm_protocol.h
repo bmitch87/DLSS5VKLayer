@@ -711,7 +711,7 @@ inline void ShmInitDefaults(ShmHeader* h) {
     h->mvecPixelSize.store(kMVecPixels4);
     h->seq_ok.store(0);
     h->compositionBypass.store(1);
-    h->rebuildSettleMs.store(250);
+    h->rebuildSettleMs.store(100);
     h->colourTrustPercent.store(200);
 
     h->ratioSmoothPercent.store(100);

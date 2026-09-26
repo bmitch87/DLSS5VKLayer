@@ -25,7 +25,19 @@ inline FILE* LogSink() {
     return f ? f : stderr;
 }
 
+inline bool LayerRequested() {
+    static const bool enabled = [] {
+        const char* mixed = getenv("VKLayer_DLSS5");
+        const char* upper = getenv("VKLAYER_DLSS5");
+        const char* legacy = getenv("DLSSNR_ENABLE");
+        return (mixed && mixed[0] == '1') || (upper && upper[0] == '1') ||
+               (legacy && legacy[0] == '1');
+    }();
+    return enabled;
+}
+
 inline void Log(const char* fmt, ...) {
+    if (!LayerRequested()) return;
     char buf[2048];
     va_list args;
     va_start(args, fmt);
