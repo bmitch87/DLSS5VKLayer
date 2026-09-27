@@ -39,8 +39,11 @@ ln -sf ../lib/dlssnr/bin/runner_probe "$BINDIR/dlssnr-runner-probe"
 ln -sf ../lib/dlssnr/bin/dlssnr-shmctl "$BINDIR/dlssnr-shmctl"
 
 sed -e "s#./libVkLayer_NV_dlssnr.so#$LIBDIR/layer/libVkLayer_NV_dlssnr.so#" \
+    -e 's#"implementation_version"#"library_arch": "64",\n    "implementation_version"#' \
     layer_linux/manifest/VK_LAYER_NV_dlssnr.json > "$MANIFEST_DIR/VK_LAYER_NV_dlssnr.x86_64.json"
 sed -e "s#./libVkLayer_NV_dlssnr.so#$LIBDIR/layer32/libVkLayer_NV_dlssnr.so#" \
+    -e 's#"VK_LAYER_NV_dlssnr"#"VK_LAYER_NV_dlssnr_32"#' \
+    -e 's#"implementation_version"#"library_arch": "32",\n    "implementation_version"#' \
     layer_linux/manifest/VK_LAYER_NV_dlssnr.json > "$MANIFEST_DIR/VK_LAYER_NV_dlssnr.i686.json"
 
 chmod 755 "$BINDIR/dlssnr-helper" "$BINDIR/dlssnr-gui" "$LIBDIR/bin/runner_probe" "$LIBDIR/bin/dlssnr-shmctl"
