@@ -1,8 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=DLSS5VKLayer Helper
+Name[zh_CN]=DLSS5VKLayer 助手
 GenericName=DLSS5 helper
+GenericName[zh_CN]=DLSS5 助手
 Comment=Start, stop, and tune the DLSS5 neural rendering helper
+Comment[zh_CN]=启动、停止并调节 DLSS5 神经渲染助手
 Exec=dlssnr-gui
 Terminal=false
 Categories=System;Settings;

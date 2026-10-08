@@ -13,13 +13,13 @@
 #include <QVBoxLayout>
 
 PassDialog::PassDialog(ShmHeader* header, QWidget* parent) : QDialog(parent), hdr(header) {
-    setWindowTitle("Per-pass model settings");
+    setWindowTitle(tr("Per-pass model settings"));
     resize(460, 460);
 
     auto* root = new QVBoxLayout(this);
     auto* note = new QLabel(
-        "A pass follows the global settings for anything it does not tick. These are read when that "
-        "pass's feature is built, so a change takes a moment to appear.",
+        tr("A pass follows the global settings for anything it does not tick. These are read when that "
+        "pass's feature is built, so a change takes a moment to appear."),
         this);
     note->setWordWrap(true);
     root->addWidget(note);
@@ -30,7 +30,7 @@ PassDialog::PassDialog(ShmHeader* header, QWidget* parent) : QDialog(parent), hd
     for (uint32_t i = 0; i < shown; ++i) {
         auto* page = new QWidget(tabs);
         buildPage(i, page);
-        tabs->addTab(page, QString("Pass %1").arg(i + 1));
+        tabs->addTab(page, QString(tr("Pass %1")).arg(i + 1));
     }
     root->addWidget(tabs);
 
@@ -77,43 +77,43 @@ void PassDialog::buildPage(uint32_t pass, QWidget* page) {
     };
 
     auto* intensity = makeFloat(0.0, 4.0, 0.05, pc.intensityBits.load());
-    addRow("Intensity", kOverrideIntensity, intensity,
+    addRow(tr("Intensity"), kOverrideIntensity, intensity,
            [intensity] { return FloatToBits(float(intensity->value())); }, {});
 
     auto* structure = makeFloat(0.0, 4.0, 0.05, pc.localStructureBits.load());
-    addRow("Local structure", kOverrideLocalStructure, structure,
+    addRow(tr("Local structure"), kOverrideLocalStructure, structure,
            [structure] { return FloatToBits(float(structure->value())); }, {});
 
     auto* tone = makeFloat(0.0, 4.0, 0.05, pc.localToneBits.load());
-    addRow("Local tone", kOverrideLocalTone, tone,
+    addRow(tr("Local tone"), kOverrideLocalTone, tone,
            [tone] { return FloatToBits(float(tone->value())); }, {});
 
     auto* skin = makeFloat(-1.0, 4.0, 0.05, pc.skinStructureBits.load());
-    addRow("Skin structure", kOverrideSkinStructure, skin,
+    addRow(tr("Skin structure"), kOverrideSkinStructure, skin,
            [skin] { return FloatToBits(float(skin->value())); }, {});
 
     auto* sharp = makeFloat(0.0, 1.0, 0.05, pc.sharpnessBits.load());
-    addRow("Sharpness", kOverrideSharpness, sharp,
+    addRow(tr("Sharpness"), kOverrideSharpness, sharp,
            [sharp] { return FloatToBits(float(sharp->value())); }, {});
 
     auto* style = new QComboBox(page);
-    style->addItems({ "Default", "Natural", "Cinematic" });
+    style->addItems({ tr("Default"), tr("Natural"), tr("Cinematic") });
     style->setCurrentIndex(int(pc.style.load()));
     connect(style, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
             [this, pass](int) { writePass(pass); });
-    addRow("Style", kOverrideStyle, style, [style] { return uint32_t(style->currentIndex()); }, {});
+    addRow(tr("Style"), kOverrideStyle, style, [style] { return uint32_t(style->currentIndex()); }, {});
 
     auto* preset = new QSpinBox(page);
     preset->setRange(0, 15);
     preset->setValue(int(pc.preset.load()));
     connect(preset, QOverload<int>::of(&QSpinBox::valueChanged), this,
             [this, pass](int) { writePass(pass); });
-    addRow("Preset", kOverridePreset, preset, [preset] { return uint32_t(preset->value()); }, {});
+    addRow(tr("Preset"), kOverridePreset, preset, [preset] { return uint32_t(preset->value()); }, {});
 
-    auto* automask = new QCheckBox("on", page);
+    auto* automask = new QCheckBox(tr("on"), page);
     automask->setChecked(pc.autoMask.load() != 0);
     connect(automask, &QCheckBox::toggled, this, [this, pass](bool) { writePass(pass); });
-    addRow("Auto skin mask", kOverrideAutoMask, automask,
+    addRow(tr("Auto skin mask"), kOverrideAutoMask, automask,
            [automask] { return automask->isChecked() ? 1u : 0u; }, {});
 }
 

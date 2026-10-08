@@ -34,6 +34,7 @@ if [ "$MODE" = "system" ]; then
   rm -f /usr/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.*.json
   rm -f /usr/share/applications/dlssnr.desktop
   rm -rf /usr/share/doc/dlssnr
+  rm -rf /usr/share/dlssnr/translations
   rm -f /etc/environment.d/dlssnr.conf
 else
   user_manifest_dir="$HOME/.local/share/vulkan/implicit_layer.d"
@@ -42,6 +43,7 @@ else
   rm -f "$user_manifest_dir"/VK_LAYER_NV_dlssnr.json "$user_manifest_dir"/VK_LAYER_NV_dlssnr.*.json
   rm -f "$HOME/.local/share/applications/dlssnr.desktop"
   rm -rf "$HOME/.local/share/doc/dlssnr"
+  rm -rf "$HOME/.local/share/dlssnr/translations"
   rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/dlssnr.conf" "$HOME/.config/environment.d/dlssnr.conf"
 fi
 

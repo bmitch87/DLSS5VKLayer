@@ -66,6 +66,11 @@ cp -a "$root/usr/lib64/dlssnr/." "$LIBDIR/"
 cp -a "$root/usr/bin/dlssnr-helper" "$BINDIR/dlssnr-helper"
 cp -a "$root/usr/bin/dlssnr-gui" "$BINDIR/dlssnr-gui"
 cp -a "$root/usr/share/applications/dlssnr.desktop" "$APP_DIR/dlssnr.desktop"
+# UI translations are optional: a package without them simply stays in English.
+if [ -d "$root/usr/share/dlssnr/translations" ]; then
+  mkdir -p "$DATADIR/dlssnr/translations"
+  cp -a "$root/usr/share/dlssnr/translations/." "$DATADIR/dlssnr/translations/"
+fi
 [ -f "$root/usr/share/doc/dlssnr/dxvk-license.txt" ] && cp -a "$root/usr/share/doc/dlssnr/dxvk-license.txt" "$DOCDIR/dxvk-license.txt"
 
 if [ "$MODE" = "system" ]; then

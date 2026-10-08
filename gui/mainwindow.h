@@ -77,6 +77,7 @@ private:
     QString settingsBlob() const;
     void populateRunners();
     void applyRunnerSelection(int index);
+    void chooseLanguage(const QString& locale);
     bool ensureShm();
     QWidget* buildSettings();
     void updateCompositionVisibility();
@@ -91,6 +92,8 @@ private:
     QString dxvkVendor;
     QString dxvkDevice;
     QString shmPath;
+    // What the configuration holds: a locale name, or empty for "follow the system language".
+    QString language;
     int windowW = 620;
     int windowH = 680;
     QVector<QPair<QString, QString>> pendingSettings;
@@ -118,6 +121,9 @@ private:
     QVector<QWidget*> compositionRows;
     bool helperRunning = false;
     bool firstPoll = true;
+    // Set while the window reopens itself into a new language, so it does not stop the helper on the
+    // way out.
+    bool relaunching = false;
     quint64 lastFrames = 0;
     QSpinBox* rebuildSpin = nullptr;
 

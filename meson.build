@@ -22,6 +22,7 @@ host_cpu = host_machine.cpu_family()
 if host_system == 'linux' and host_cpu == 'x86_64'
   subdir('layer_linux')
   subdir('tools')
+  subdir('translations')
   subdir('gui')
   subdir('test_gui')
 elif host_system == 'linux' and host_cpu in ['x86', 'i686']

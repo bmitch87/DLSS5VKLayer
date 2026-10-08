@@ -4,6 +4,7 @@
 #include "passdialog.h"
 #include "../common/runner_discovery.h"
 #include "shm_binder.h"
+#include "translations.h"
 #include "../layer_linux/src/hotkey.h"
 
 #include <QAbstractItemView>
@@ -29,6 +30,7 @@
 #include <QLabel>
 #include <QIcon>
 #include <QLineEdit>
+#include <QLocale>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPainter>
@@ -258,7 +260,7 @@ void ProfileDelegate::paint(QPainter* painter, const QStyleOptionViewItem& optio
 }
 
 MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
-    setWindowTitle("DLSS5VKLayer Helper");
+    setWindowTitle(tr("DLSS5VKLayer Helper"));
 
     projectDir = findProjectDir();
     helperCliPath = findHelperCli();
@@ -301,7 +303,7 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     auto* runnerForm = new QFormLayout;
     runnerCombo = new QComboBox(this);
     runnerPathEdit = new QLineEdit(this);
-    browseRunnerBtn = new QPushButton("Browse...", this);
+    browseRunnerBtn = new QPushButton(tr("Browse..."), this);
     auto* runnerPathRow = new QHBoxLayout;
     runnerPathRow->addWidget(runnerPathEdit);
     runnerPathRow->addWidget(browseRunnerBtn);
@@ -310,24 +312,24 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     // model is a Windows DLL -- so it needs Proton or Wine whatever the game is. A native Linux game
     // is unaffected by this setting; the layer inside it is a native library either way.
     runnerCombo->setToolTip(FormatTip(
-        "Proton or Wine for the helper process, which is a Windows executable\n"
+        tr("Proton or Wine for the helper process, which is a Windows executable\n"
         "because the model is a Windows DLL.\n"
-        "This is not what the game runs under -- native Linux games work with this set too."));
+        "This is not what the game runs under -- native Linux games work with this set too.")));
     runnerPathEdit->setToolTip(runnerCombo->toolTip());
-    runnerForm->addRow("Runner", runnerCombo);
-    runnerForm->addRow("Path", runnerPathRow);
+    runnerForm->addRow(tr("Runner"), runnerCombo);
+    runnerForm->addRow(tr("Path"), runnerPathRow);
     root->addLayout(runnerForm);
 
     auto* buttons = new QHBoxLayout;
-    startBtn = new QPushButton("Start helper", this);
-    stopBtn = new QPushButton("Stop helper", this);
+    startBtn = new QPushButton(tr("Start helper"), this);
+    stopBtn = new QPushButton(tr("Stop helper"), this);
     profileCombo = new QComboBox(this);
-    profileCombo->setToolTip("Select a saved profile to load, or choose '(default)' to reset.");
+    profileCombo->setToolTip(tr("Select a saved profile to load, or choose '(default)' to reset."));
     profileReloadBtn = new QToolButton(this);
     profileReloadBtn->setText(QString::fromUtf8("\xe2\x86\xbb"));  // "clockwise open circle arrow"
-    profileReloadBtn->setToolTip("Settings changed since this selection was loaded. Click to reload it.");
-    profileSaveBtn = new QPushButton("Save", this);
-    profileSaveBtn->setToolTip("Save current settings to the selected profile.");
+    profileReloadBtn->setToolTip(tr("Settings changed since this selection was loaded. Click to reload it."));
+    profileSaveBtn = new QPushButton(tr("Save"), this);
+    profileSaveBtn->setToolTip(tr("Save current settings to the selected profile."));
     profileReloadBtn->setVisible(false);
     buttons->addWidget(startBtn);
     buttons->addWidget(stopBtn);
@@ -369,7 +371,7 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     // a menu bar, not at the cursor like a context menu.
     gearBtn = new QToolButton(this);
     gearBtn->setIcon(gearIcon(this));
-    gearBtn->setToolTip("Settings");
+    gearBtn->setToolTip(tr("Settings"));
     gearBtn->setPopupMode(QToolButton::InstantPopup);
     auto* gearMenu = new QMenu(gearBtn);
 
@@ -380,16 +382,16 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     auto* rebuildRow = new QWidget(gearBtn);
     auto* rebuildLay = new QHBoxLayout(rebuildRow);
     rebuildLay->setContentsMargins(8, 4, 8, 4);
-    auto* rebuildLabel = new QLabel("Rebuild spacing (ms)", rebuildRow);
+    auto* rebuildLabel = new QLabel(tr("Rebuild spacing (ms)"), rebuildRow);
     rebuildSpin = new QSpinBox(rebuildRow);
     rebuildSpin->setRange(0, 5000);
     rebuildSpin->setToolTip(FormatTip(
-        "How long the helper waits after a model setting changes before it rebuilds the pass,\n"
+        tr("How long the helper waits after a model setting changes before it rebuilds the pass,\n"
         "and between one rebuild and the next.\n"
         "Rebuilding is expensive, and back-to-back rebuilds have been seen to wedge the model\n"
         "on some drivers.\n"
         "Lower is snappier; 0 rebuilds immediately and chains the rest back to back.\n"
-        "Raise it if the model ever stops answering after changing settings."));
+        "Raise it if the model ever stops answering after changing settings.")));
     rebuildLabel->setToolTip(rebuildSpin->toolTip());
     if (hdr) rebuildSpin->setValue(int(hdr->rebuildSettleMs.load()));
     rebuildLay->addWidget(rebuildLabel);
@@ -397,10 +399,53 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     rebuildAction->setDefaultWidget(rebuildRow);
     gearMenu->addAction(rebuildAction);
     gearMenu->addSeparator();
-    gearMenu->addAction("Reset all settings...", this, &MainWindow::resetAllSettings);
+    gearMenu->addAction(tr("Reset all settings..."), this, &MainWindow::resetAllSettings);
     gearMenu->addSeparator();
-    gearMenu->addAction("Open helper log", this, [this] {
+    gearMenu->addAction(tr("Open helper log"), this, [this] {
         QDesktopServices::openUrl(QUrl::fromLocalFile(logPath));
+    });
+
+    // The interface language. What is offered is whatever .qm files are installed plus English, whose
+    // words are the built-in ones, so a translation added later appears here without a code change.
+    // A switch cannot re-text the window in place -- every row and menu entry took its words from
+    // tr() when it was built -- so the choice is stored and the window offers to reopen itself.
+    gearMenu->addSeparator();
+    auto* languageMenu = gearMenu->addMenu(tr("Language"));
+    auto* languageGroup = new QActionGroup(languageMenu);
+    const auto addLanguage = [&](const QString& label, const QString& locale, const QString& tip) {
+        auto* action = languageMenu->addAction(label);
+        action->setCheckable(true);
+        action->setChecked(locale == language);
+        action->setData(locale);
+        if (!tip.isEmpty()) action->setToolTip(FormatTip(tip));
+        languageGroup->addAction(action);
+    };
+    addLanguage(tr("Follow the system language"), QString(),
+                tr("Use whichever language the session runs in."));
+    // Not translated on purpose, like the endonyms below: a language is named in its own language.
+    addLanguage(QStringLiteral("English"), QStringLiteral("en"), QString());
+    QStringList offered;
+    for (const QString& locale : dlssnr::AvailableTranslationLocales()) {
+        const QString native = QLocale(locale).nativeLanguageName();
+        addLanguage(native.isEmpty() ? locale : QStringLiteral("%1 (%2)").arg(native, locale),
+                    locale, QString());
+        offered << locale;
+    }
+    // A configuration that names a language whose .qm is gone -- uninstalled by hand, or a config
+    // carried over from another machine -- still gets a tick, so the menu never opens with nothing
+    // selected.
+    if (!language.isEmpty() && language != QLatin1String("en") && !offered.contains(language))
+        addLanguage(tr("%1 (translation not installed)").arg(language), language, QString());
+    if (!qEnvironmentVariable("DLSSNR_LANG").isEmpty()) {
+        // The environment wins over the stored setting, the order DLSSNR_SHM and DLSSNR_LOG use, so
+        // say it rather than let the tick above look like the last word.
+        auto* note = languageMenu->addAction(
+            tr("Overridden by DLSSNR_LANG=%1 for this session")
+                .arg(qEnvironmentVariable("DLSSNR_LANG")));
+        note->setEnabled(false);
+    }
+    connect(languageGroup, &QActionGroup::triggered, this, [this](QAction* action) {
+        chooseLanguage(action->data().toString());
     });
 
     // The NVIDIA NGX DLLs, tucked into the settings menu rather than crowding the top of the window.
@@ -409,20 +454,20 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
     // ones the user already owns into that folder -- exactly as `dlssnr-helper import-binaries` does --
     // and the helper has to be restarted afterwards to load them.
     gearMenu->addSeparator();
-    auto* binariesMenu = gearMenu->addMenu("NGX binaries");
+    auto* binariesMenu = gearMenu->addMenu(tr("NGX binaries"));
     binariesPathAction = binariesMenu->addAction(effectiveBinariesDir());
     binariesPathAction->setEnabled(false);
     binariesPathAction->setToolTip(FormatTip(
-        "Where the NVIDIA NGX DLLs live. The helper loads nvngx_dlssnr.dll from here.\n"
-        "These are NVIDIA's proprietary files and are not shipped with this package -- import your own."));
-    auto* importAction = binariesMenu->addAction("Import binaries...", this, &MainWindow::importBinaries);
+        tr("Where the NVIDIA NGX DLLs live. The helper loads nvngx_dlssnr.dll from here.\n"
+        "These are NVIDIA's proprietary files and are not shipped with this package -- import your own.")));
+    auto* importAction = binariesMenu->addAction(tr("Import binaries..."), this, &MainWindow::importBinaries);
     importAction->setToolTip(FormatTip(
-        "Copy the NVIDIA NGX DLLs from a folder you choose into the binaries folder.\n"
+        tr("Copy the NVIDIA NGX DLLs from a folder you choose into the binaries folder.\n"
         "Pick the folder that holds nvngx_dlssnr.dll (and nvngx.dll, nvapi64.dll, sl.*.dll if you have "
         "them).\n"
-        "Restart the helper afterwards so it loads the new files."));
-    auto* openBinariesAction = binariesMenu->addAction("Open binaries folder", this, &MainWindow::openBinariesFolder);
-    openBinariesAction->setToolTip("Open the folder the helper loads the NGX DLLs from.");
+        "Restart the helper afterwards so it loads the new files.")));
+    auto* openBinariesAction = binariesMenu->addAction(tr("Open binaries folder"), this, &MainWindow::openBinariesFolder);
+    openBinariesAction->setToolTip(tr("Open the folder the helper loads the NGX DLLs from."));
     gearBtn->setMenu(gearMenu);
     connect(rebuildSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
         if (!hdr) return;
@@ -453,7 +498,7 @@ MainWindow::MainWindow(QWidget* parent) : QWidget(parent) {
         }
     });
     connect(browseRunnerBtn, &QPushButton::clicked, this, [this] {
-        const QString path = QFileDialog::getOpenFileName(this, "Select runner", QDir::homePath());
+        const QString path = QFileDialog::getOpenFileName(this, tr("Select runner"), QDir::homePath());
         if (path.isEmpty()) return;
         runnerPath = path;
         runnerType = runnerPath.contains("proton", Qt::CaseInsensitive) ? "proton" : "wine";
@@ -486,7 +531,8 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     windowH = height();
     saveConfig();
     if (helperCliPath.isEmpty()) helperCliPath = findHelperCli();
-    if (!helperCliPath.isEmpty()) QProcess::startDetached(helperCliPath, {"stop"});
+    // Reopening into another language must not take the helper down with it.
+    if (!relaunching && !helperCliPath.isEmpty()) QProcess::startDetached(helperCliPath, {"stop"});
     QWidget::closeEvent(event);
 }
 
@@ -515,14 +561,14 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event) {
             if (path.isEmpty()) return false;
 
             const int ret = QMessageBox::question(
-                this, "Delete profile",
-                QString("Delete profile \"%1\"?").arg(name),
+                this, tr("Delete profile"),
+                QString(tr("Delete profile \"%1\"?")).arg(name),
                 QMessageBox::Yes | QMessageBox::No);
             if (ret != QMessageBox::Yes) return false;
 
             if (!QFile::remove(path)) {
-                QMessageBox::warning(this, "DLSS5VKLayer",
-                                     "Could not delete:\\n" + path);
+                QMessageBox::warning(this, tr("DLSS5VKLayer"),
+                                     tr("Could not delete:\\n") + path);
                 return false;
             }
             if (lastProfilePath == path) {
@@ -569,8 +615,9 @@ QString MainWindow::findHelperCli() const {
 }
 
 QString MainWindow::configPath() const {
-    const QString base = qEnvironmentVariable("XDG_CONFIG_HOME", QDir::homePath() + "/.config");
-    return base + "/dlssnr/config.ini";
+    // The one place this path is worked out; dlssnr::StartupLocale() reads the same file to pick the
+    // language before this window exists.
+    return dlssnr::ConfigFilePath();
 }
 
 // Returns ~/.config/dlssnr/profiles/ for saving/loading setting profiles.
@@ -670,6 +717,7 @@ void MainWindow::loadConfig() {
         else if (key == "window_width") windowW = value.toInt();
         else if (key == "window_height") windowH = value.toInt();
         else if (key == "profile") lastProfilePath = value;
+        else if (key == "language") language = value;
         else if (key.startsWith("set_")) pendingSettings.append({key, value});
     }
 }
@@ -692,11 +740,36 @@ void MainWindow::saveConfig() {
     out << "window_width=" << (isVisible() ? width() : windowW) << "\n";
     out << "window_height=" << (isVisible() ? height() : windowH) << "\n";
     out << "profile=" << lastProfilePath << "\n";
+    out << "language=" << language << "\n";
     if (hdr) {
         for (const SettingEntry& e : kSettingsTable)
             out << e.key << "=" << settingText(e, (hdr->*e.field).load()) << "\n";
         writePassSettings(out, hdr);
     }
+}
+
+// Storing the choice is all this can do: every row and menu entry already carries the words it was
+// built with, so a new language only shows up in a window that is built again. Reopening is offered
+// right here because closing the window normally stops the helper, which a language change has no
+// business doing.
+void MainWindow::chooseLanguage(const QString& locale) {
+    if (locale == language) return;
+    language = locale;
+    saveConfig();
+
+    QMessageBox box(QMessageBox::Question, tr("Language"),
+                    tr("The interface language changes the next time the window opens."),
+                    QMessageBox::NoButton, this);
+    QPushButton* restart = box.addButton(tr("Restart now"), QMessageBox::AcceptRole);
+    box.addButton(tr("Later"), QMessageBox::RejectRole);
+    box.exec();
+    if (box.clickedButton() != restart) return;
+
+    // Reopen before closing, so the new window is already up when this one goes; the configuration
+    // was written above, so it starts in the language just chosen.
+    relaunching = true;
+    QProcess::startDetached(QCoreApplication::applicationFilePath(), {});
+    close();
 }
 
 // Put the saved settings into the header before any widget reads it, so the interface opens on what
@@ -764,9 +837,9 @@ void MainWindow::updateReloadBtn() {
 }
 
 void MainWindow::resetAllSettings() {
-    if (QMessageBox::question(this, "DLSS5VKLayer",
-                              "Reset every setting to its default? The helper will rebuild its "
-                              "features from the defaults.") != QMessageBox::Yes)
+    if (QMessageBox::question(this, tr("DLSS5VKLayer"),
+                              tr("Reset every setting to its default? The helper will rebuild its "
+                              "features from the defaults.")) != QMessageBox::Yes)
         return;
     applyDefaults();
 }
@@ -797,7 +870,7 @@ void MainWindow::applyDefaults() {
 void MainWindow::refreshProfileList() {
     const QSignalBlocker blocker(profileCombo);
     profileCombo->clear();
-    profileCombo->addItem("(default)", QVariant());
+    profileCombo->addItem(tr("(default)"), QVariant());
 
     const QDir dir(profilesDir());
     const QStringList files = dir.entryList(QDir::Files | QDir::NoDotAndDotDot, QDir::Name);
@@ -823,7 +896,7 @@ void MainWindow::refreshProfileList() {
 // Save settings: always prompt for a profile name, pre-populated with the selected profile.
 void MainWindow::saveSettingsToFile() {
     if (!hdr) {
-        QMessageBox::warning(this, "DLSS5VKLayer", "Shared memory not attached yet.");
+        QMessageBox::warning(this, tr("DLSS5VKLayer"), tr("Shared memory not attached yet."));
         return;
     }
 
@@ -832,8 +905,8 @@ void MainWindow::saveSettingsToFile() {
                            ? "" : profileCombo->currentText();
 
     QInputDialog dlg(this);
-    dlg.setWindowTitle("Save profile");
-    dlg.setLabelText("Profile name:");
+    dlg.setWindowTitle(tr("Save profile"));
+    dlg.setLabelText(tr("Profile name:"));
     dlg.setInputMode(QInputDialog::TextInput);
     dlg.setTextValue(prompt);
     if (auto* edit = dlg.findChild<QLineEdit*>()) {
@@ -866,8 +939,8 @@ void MainWindow::saveSettingsToFile() {
 
     QFile f(path);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
-        QMessageBox::warning(this, "DLSS5VKLayer",
-                             "Could not write to:\n" + path);
+        QMessageBox::warning(this, tr("DLSS5VKLayer"),
+                             tr("Could not write to:\n") + path);
         return;
     }
     QTextStream out(&f);
@@ -898,14 +971,14 @@ void MainWindow::saveSettingsToFile() {
 // Load settings from a specific file path and apply them immediately.
 void MainWindow::loadSettingsFromFile(const QString& path) {
     if (!hdr) {
-        QMessageBox::warning(this, "DLSS5VKLayer", "Shared memory not attached yet.");
+        QMessageBox::warning(this, tr("DLSS5VKLayer"), tr("Shared memory not attached yet."));
         return;
     }
 
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        QMessageBox::warning(this, "DLSS5VKLayer",
-                             "Could not read:\n" + path);
+        QMessageBox::warning(this, tr("DLSS5VKLayer"),
+                             tr("Could not read:\n") + path);
         return;
     }
 
@@ -961,7 +1034,7 @@ void MainWindow::populateRunners() {
         QVariantMap data;
         data["type"] = "wine";
         data["path"] = wine;
-        runnerCombo->addItem("System Wine", data);
+        runnerCombo->addItem(tr("System Wine"), data);
     }
 
     bool selected = false;
@@ -976,7 +1049,7 @@ void MainWindow::populateRunners() {
         QVariantMap data;
         data["type"] = runnerPath.contains("proton", Qt::CaseInsensitive) ? "proton" : "wine";
         data["path"] = runnerPath;
-        runnerCombo->addItem("Custom: " + runnerPath, data);
+        runnerCombo->addItem(tr("Custom: ") + runnerPath, data);
         runnerCombo->setCurrentIndex(runnerCombo->count() - 1);
         selected = true;
     }
@@ -1028,11 +1101,11 @@ bool MainWindow::ensureShm() {
 void MainWindow::startHelper() {
     if (helperCliPath.isEmpty()) helperCliPath = findHelperCli();
     if (helperCliPath.isEmpty()) {
-        QMessageBox::warning(this, "DLSS5VKLayer", "dlssnr-helper CLI not found.");
+        QMessageBox::warning(this, tr("DLSS5VKLayer"), tr("dlssnr-helper CLI not found."));
         return;
     }
     if (!ensureShm()) {
-        QMessageBox::warning(this, "DLSS5VKLayer", "Could not open shared memory file.");
+        QMessageBox::warning(this, tr("DLSS5VKLayer"), tr("Could not open shared memory file."));
         return;
     }
     if (hdr) hdr->quit.store(0);
@@ -1063,13 +1136,13 @@ void MainWindow::importBinaries() {
     const QString current = effectiveBinariesDir();
     const QString startDir = QDir(current).exists() ? current : QDir::homePath();
     const QString src = QFileDialog::getExistingDirectory(
-        this, "Select the folder holding the NVIDIA NGX DLLs", startDir);
+        this, tr("Select the folder holding the NVIDIA NGX DLLs"), startDir);
     if (src.isEmpty()) return;
 
     const QString dest = defaultBinariesDir();
     if (!QDir().mkpath(dest)) {
-        QMessageBox::warning(this, "DLSS5VKLayer",
-                             FormatTip("Could not create the binaries folder:\n" + dest));
+        QMessageBox::warning(this, tr("DLSS5VKLayer"),
+                             FormatTip(tr("Could not create the binaries folder:\n") + dest));
         return;
     }
 
@@ -1092,9 +1165,9 @@ void MainWindow::importBinaries() {
     }
 
     if (copied.isEmpty()) {
-        QMessageBox::warning(this, "DLSS5VKLayer",
-                             FormatTip("No NVIDIA NGX DLLs were found in:\n" + src +
-                                       "\n\nPick the folder that actually contains nvngx_dlssnr.dll."));
+        QMessageBox::warning(this, tr("DLSS5VKLayer"),
+                             FormatTip(tr("No NVIDIA NGX DLLs were found in:\n") + src +
+                                       tr("\n\nPick the folder that actually contains nvngx_dlssnr.dll.")));
         return;
     }
 
@@ -1103,19 +1176,19 @@ void MainWindow::importBinaries() {
     saveConfig();
 
     const bool hasSnippet = QFile::exists(dest + "/nvngx_dlssnr.dll");
-    QString detail = "Imported into:\n" + dest + "\n\n" + copied.join("\n");
-    if (!failed.isEmpty()) detail += "\n\nCould not copy:\n" + failed.join("\n");
+    QString detail = tr("Imported into:\n") + dest + "\n\n" + copied.join("\n");
+    if (!failed.isEmpty()) detail += tr("\n\nCould not copy:\n") + failed.join("\n");
     if (!hasSnippet)
-        detail += "\n\nnvngx_dlssnr.dll was not among them -- neural processing stays disabled.";
+        detail += tr("\n\nnvngx_dlssnr.dll was not among them -- neural processing stays disabled.");
     else if (helperRunning)
-        detail += "\n\nThe helper is running; restart it to load the new files.";
+        detail += tr("\n\nThe helper is running; restart it to load the new files.");
     else
-        detail += "\n\nStart the helper to use them.";
+        detail += tr("\n\nStart the helper to use them.");
 
     if (failed.isEmpty() && hasSnippet)
-        QMessageBox::information(this, "DLSS5VKLayer", FormatTip(detail));
+        QMessageBox::information(this, tr("DLSS5VKLayer"), FormatTip(detail));
     else
-        QMessageBox::warning(this, "DLSS5VKLayer", FormatTip(detail));
+        QMessageBox::warning(this, tr("DLSS5VKLayer"), FormatTip(detail));
 }
 
 void MainWindow::openBinariesFolder() {
@@ -1138,7 +1211,7 @@ void MainWindow::maybePromptImport() {
     // the primary one (Import) as the default focus on the far right -- and lets "Open folder" leave the
     // window up while "Import" and "Later" close it.
     QDialog dlg(this);
-    dlg.setWindowTitle("NVIDIA NGX binaries not found");
+    dlg.setWindowTitle(tr("NVIDIA NGX binaries not found"));
     dlg.resize(520, 230);  // a comfortable default; the wrapped text and buttons sit inside this
 
     auto* root = new QVBoxLayout(&dlg);
@@ -1149,12 +1222,12 @@ void MainWindow::maybePromptImport() {
     top->addWidget(icon, 0, Qt::AlignTop);
     auto* textCol = new QVBoxLayout;
     auto* headline = new QLabel(
-        "The neural model's DLL (nvngx_dlssnr.dll) is not in the binaries folder, so neural processing "
-        "stays off and games present their own frames.", &dlg);
+        tr("The neural model's DLL (nvngx_dlssnr.dll) is not in the binaries folder, so neural processing "
+        "stays off and games present their own frames."), &dlg);
     headline->setWordWrap(true);
     auto* detail = new QLabel(FormatTip(
-        "Import it from a folder you own, or open the folder to place the files yourself:\n" + dir +
-        "\n\nThese are NVIDIA's proprietary files and are not shipped with this package."), &dlg);
+        tr("Import it from a folder you own, or open the folder to place the files yourself:\n") + dir +
+        tr("\n\nThese are NVIDIA's proprietary files and are not shipped with this package.")), &dlg);
     detail->setWordWrap(true);
     detail->setTextFormat(Qt::RichText);
     textCol->addWidget(headline);
@@ -1163,9 +1236,9 @@ void MainWindow::maybePromptImport() {
     root->addLayout(top);
 
     auto* btnRow = new QHBoxLayout;
-    auto* importBtn = new QPushButton("Import...", &dlg);
-    auto* openBtn = new QPushButton("Open folder", &dlg);
-    auto* laterBtn = new QPushButton("Later", &dlg);
+    auto* importBtn = new QPushButton(tr("Import..."), &dlg);
+    auto* openBtn = new QPushButton(tr("Open folder"), &dlg);
+    auto* laterBtn = new QPushButton(tr("Later"), &dlg);
     // [ Later ]                [ Open folder ] [ Import... ]
     btnRow->addWidget(laterBtn);   // dismiss, alone on the far side
     btnRow->addStretch(1);
@@ -1207,14 +1280,14 @@ void MainWindow::updateStatus() {
     // every poll and say it plainly.
     const bool mismatch = hdr && (hdr->magic.load() != kShmMagic || hdr->version.load() != kShmVersion);
 
-    QString state = "shared memory not attached";
+    QString state = tr("shared memory not attached");
     bool active = false;
     bool idle = false;
     if (hdr && !mismatch) {
-        static const char* kStates[] = { "starting", "no Vulkan device", "no NGX binaries",
-                                         "the model would not start", "running", "stopped" };
+        static const char* kStates[] = { QT_TR_NOOP("starting"), QT_TR_NOOP("no Vulkan device"), QT_TR_NOOP("no NGX binaries"),
+                                         QT_TR_NOOP("the model would not start"), QT_TR_NOOP("running"), QT_TR_NOOP("stopped") };
         const uint32_t hs = hdr->helperState.load();
-        state = hs < 6 ? kStates[hs] : "unknown";
+        state = hs < 6 ? tr(kStates[hs]) : tr("unknown");
         const QString why = QString::fromStdString(
             ShmLoadString(hdr->helperReasonSeq, hdr->helperReason, kReasonBytes));
         if (!why.isEmpty()) state += " -- " + why;
@@ -1247,18 +1320,18 @@ void MainWindow::updateStatus() {
     }
 
     if (mismatch) {
-        statusLabel->setText(QString("<span style=\"color:#e53935;\">Shared memory is v%1, this "
+        statusLabel->setText(QString(tr("<span style=\"color:#e53935;\">Shared memory is v%1, this "
                                      "build is v%2 -- the layer or helper is out of date. Update "
-                                     "them together.</span>")
+                                     "them together.</span>"))
                                  .arg(hdr->version.load()).arg(kShmVersion));
         return;  // do not save into a mapping the other side keeps resetting
     }
 
     const QString dot =
-        active ? QString("<span style=\"color:#43a047;\">&#9679; Active</span>")
-               : idle ? QString("<span style=\"color:#fb8c00;\">&#9679; Idle</span>")
-                      : QString("<span style=\"color:#9e9e9e;\">&#9675; Inactive</span>");
-    statusLabel->setText(QString("Helper: %1&nbsp;&nbsp;&nbsp;%2").arg(state.toHtmlEscaped(), dot));
+        active ? QString(tr("<span style=\"color:#43a047;\">&#9679; Active</span>"))
+               : idle ? QString(tr("<span style=\"color:#fb8c00;\">&#9679; Idle</span>"))
+                      : QString(tr("<span style=\"color:#9e9e9e;\">&#9675; Inactive</span>"));
+    statusLabel->setText(QString(tr("Helper: %1&nbsp;&nbsp;&nbsp;%2")).arg(state.toHtmlEscaped(), dot));
 
     saveSettingsIfChanged();
 }
@@ -1307,82 +1380,82 @@ QWidget* MainWindow::buildSettings() {
     };
 
     QVBoxLayout* col = nullptr;
-    scrollTab("Rendering", &col);
+    scrollTab(tr("Rendering"), &col);
     {
         // Enabling the pass and telling the model what to do are one decision, so they share a
         // group. Style leads Preset because the profile matters more than the number.
-        auto* f = group(col, "Neural rendering");
-        binder->AddBool(f, "Enabled", &ShmHeader::enabled,
-                        "Run the model at all. Off leaves the game's own frame untouched.");
-        binder->AddChoice(f, "Style", &ShmHeader::style, { "Default", "Natural", "Cinematic" },
-                          "The model's own processing profiles.", ShmBinder::AtCreate);
-        binder->AddInt(f, "Preset", &ShmHeader::preset, 0, 15, "The model's own render preset.",
+        auto* f = group(col, tr("Neural rendering"));
+        binder->AddBool(f, tr("Enabled"), &ShmHeader::enabled,
+                        tr("Run the model at all. Off leaves the game's own frame untouched."));
+        binder->AddChoice(f, tr("Style"), &ShmHeader::style, { tr("Default"), tr("Natural"), tr("Cinematic") },
+                          tr("The model's own processing profiles."), ShmBinder::AtCreate);
+        binder->AddInt(f, tr("Preset"), &ShmHeader::preset, 0, 15, tr("The model's own render preset."),
                        ShmBinder::AtCreate);
-        binder->AddFloat(f, "Intensity", &ShmHeader::intensityBits, 0.0, 4.0, 0.05,
-                         "How hard the model works.", ShmBinder::AtCreate);
-        binder->AddFloat(f, "Local structure", &ShmHeader::localStructureBits, 0.0, 4.0, 0.05, "",
+        binder->AddFloat(f, tr("Intensity"), &ShmHeader::intensityBits, 0.0, 4.0, 0.05,
+                         tr("How hard the model works."), ShmBinder::AtCreate);
+        binder->AddFloat(f, tr("Local structure"), &ShmHeader::localStructureBits, 0.0, 4.0, 0.05, "",
                          ShmBinder::AtCreate);
-        binder->AddFloat(f, "Local tone", &ShmHeader::localToneBits, 0.0, 4.0, 0.05, "",
+        binder->AddFloat(f, tr("Local tone"), &ShmHeader::localToneBits, 0.0, 4.0, 0.05, "",
                          ShmBinder::AtCreate);
-        binder->AddFloat(f, "Skin structure", &ShmHeader::skinStructureBits, -1.0, 4.0, 0.05,
-                         "-1 follows local structure, which is the model's own default. It is not a "
-                         "strength of zero.",
+        binder->AddFloat(f, tr("Skin structure"), &ShmHeader::skinStructureBits, -1.0, 4.0, 0.05,
+                         tr("-1 follows local structure, which is the model's own default. It is not a "
+                         "strength of zero."),
                          ShmBinder::AtCreate);
-        binder->AddBool(f, "Auto skin mask", &ShmHeader::autoMask, "The model's automatic skin mask.",
+        binder->AddBool(f, tr("Auto skin mask"), &ShmHeader::autoMask, tr("The model's automatic skin mask."),
                         ShmBinder::AtCreate);
-        binder->AddFloat(f, "Sharpness", &ShmHeader::sharpnessBits, 0.0, 1.0, 0.05,
-                         "The one strength the model reads every frame, so it takes effect at once.");
+        binder->AddFloat(f, tr("Sharpness"), &ShmHeader::sharpnessBits, 0.0, 1.0, 0.05,
+                         tr("The one strength the model reads every frame, so it takes effect at once."));
     }
     {
-        auto* f = group(col, "Cost");
-binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
-                       "How many times the model runs over one frame, each pass shown the last one's "
+        auto* f = group(col, tr("Cost"));
+binder->AddInt(f, tr("Passes"), &ShmHeader::passes, 1, int(kMaxPasses),
+                       tr("How many times the model runs over one frame, each pass shown the last one's "
                        "answer.\n"
                        "Every pass is another full run of the model and another feature holding its "
-                       "own history, so the cost is close to linear.",
+                       "own history, so the cost is close to linear."),
                        ShmBinder::AtCreate);
-        binder->AddPercent(f, "Model resolution", &ShmHeader::workingScaleBits, 25, 200,
-                           "What fraction of the frame the model works at. The frame itself is never "
+        binder->AddPercent(f, tr("Model resolution"), &ShmHeader::workingScaleBits, 25, 200,
+                           tr("What fraction of the frame the model works at. The frame itself is never "
                            "reduced.\n"
                            "Below 100% also cuts what crosses shared memory, quadratically.\n"
                            "Above 100% the model supersamples, which on this transport is expensive: "
-                           "at 200% on a 4K frame it is 132 MB each way, every frame.");
-        binder->AddChoice(f, "Down-leg filter", &ShmHeader::scalingDownscaler,
-                          { "(fsr1, unsupported)", "Bicubic", "Catmull-Rom", "Lanczos2", "Lanczos3",
-                            "Kaiser2", "Kaiser3", "Magic" },
-                          "How a supersampled answer is averaged back to the frame's size. Only used "
-                          "above 100%.");
-        passBtn = new QPushButton("Per-pass settings...", col->parentWidget());
+                           "at 200% on a 4K frame it is 132 MB each way, every frame."));
+        binder->AddChoice(f, tr("Down-leg filter"), &ShmHeader::scalingDownscaler,
+                          { tr("(fsr1, unsupported)"), tr("Bicubic"), tr("Catmull-Rom"), tr("Lanczos2"), tr("Lanczos3"),
+                            tr("Kaiser2"), tr("Kaiser3"), tr("Magic") },
+                          tr("How a supersampled answer is averaged back to the frame's size. Only used "
+                          "above 100%."));
+        passBtn = new QPushButton(tr("Per-pass settings..."), col->parentWidget());
         f->addRow(passBtn);
     }
 
-    scrollTab("Quality", &col);
+    scrollTab(tr("Quality"), &col);
     {
-        auto* f = group(col, "Motion");
-        binder->AddBool(f, "Estimate motion vectors", &ShmHeader::mvecEnabled,
-                        "The model reasons about what moved between frames.\n"
+        auto* f = group(col, tr("Motion"));
+        binder->AddBool(f, tr("Estimate motion vectors"), &ShmHeader::mvecEnabled,
+                        tr("The model reasons about what moved between frames.\n"
                         "A layer at present time has no motion vectors from the engine, so they are "
                         "estimated on the GPU's optical-flow engine from the two frames the helper "
                         "already has.\n"
-                        "Off hands the model a zero field, which is what it used to get.");
-        binder->AddChoice(f, "Motion quality", &ShmHeader::mvecQuality,
-                          { "Fast", "Balanced", "Quality" },
-                          "How much of the frame's budget the flow estimate may take.");
-        binder->AddChoice(f, "Motion units", &ShmHeader::mvecScaleMode,
-                          { "Normalised", "Pixels", "UV 0..1" },
-                          "What the numbers in the field mean to the model.\n"
+                        "Off hands the model a zero field, which is what it used to get."));
+        binder->AddChoice(f, tr("Motion quality"), &ShmHeader::mvecQuality,
+                          { tr("Fast"), tr("Balanced"), tr("Quality") },
+                          tr("How much of the frame's budget the flow estimate may take."));
+        binder->AddChoice(f, tr("Motion units"), &ShmHeader::mvecScaleMode,
+                          { tr("Normalised"), tr("Pixels"), tr("UV 0..1") },
+                          tr("What the numbers in the field mean to the model.\n"
                           "Pixels is what the estimate produces; the others are for matching a model "
-                          "that expects them.");
-        binder->AddChoice(f, "Motion pixel size", &ShmHeader::mvecPixelSize,
-                          { "1 px", "2 px", "4 px", "8 px" },
-                          "The optical-flow grid spacing in source-image pixels. Unsupported grids "
-                          "fall back to the nearest grid the GPU can use.");
+                          "that expects them."));
+        binder->AddChoice(f, tr("Motion pixel size"), &ShmHeader::mvecPixelSize,
+                          { tr("1 px"), tr("2 px"), tr("4 px"), tr("8 px") },
+                          tr("The optical-flow grid spacing in source-image pixels. Unsupported grids "
+                          "fall back to the nearest grid the GPU can use."));
     }
     {
-        auto* f = group(col, "Input and precision");
-        binder->AddChoice(f, "HDR input", &ShmHeader::hdrMode,
-                          { "Auto", "Off", "Force float16" },
-                          "Let the model see the frame's real light instead of a tone-mapped copy.\n"
+        auto* f = group(col, tr("Input and precision"));
+        binder->AddChoice(f, tr("HDR input"), &ShmHeader::hdrMode,
+                          { tr("Auto"), tr("Off"), tr("Force float16") },
+                          tr("Let the model see the frame's real light instead of a tone-mapped copy.\n"
                           "Auto turns it on when the swapchain is HDR -- a float swapchain, or 10-bit "
                           "with a PQ colour space -- and the proxy then crosses as float16 carrying "
                           "linear light, PQ-decoded first when the swapchain carries PQ.\n"
@@ -1390,39 +1463,39 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                           "Force feeds the float proxy to an SDR swapchain too, which is an A/B tool "
                           "rather than a preference.\n"
                           "The model has the last word: if it refuses float input the pass falls back "
-                          "to 8-bit on its own.");
-        binder->AddBool(f, "16-bit SDR intermediates", &ShmHeader::sdr16Multipass,
-                        "Keep the images between SDR model passes at 16-bit. Disable to keep them "
-                        "8-bit and reduce VRAM and GPU bandwidth use; HDR is always float16.",
+                          "to 8-bit on its own."));
+        binder->AddBool(f, tr("16-bit SDR intermediates"), &ShmHeader::sdr16Multipass,
+                        tr("Keep the images between SDR model passes at 16-bit. Disable to keep them "
+                        "8-bit and reduce VRAM and GPU bandwidth use; HDR is always float16."),
                         ShmBinder::AtCreate);
     }
 
-    scrollTab("Composition", &col);
+    scrollTab(tr("Composition"), &col);
     {
         // What the model decided is one thing and how much of it lands is another; the answer is
         // presented raw until this is switched on. The color group sits under it because the color
         // the composition works in -- the white point it normalises by, how much of the model's hue
         // arrives -- is part of the same decision, and means nothing while the answer is raw.
-        auto* f = group(col, "Composition");
+        auto* f = group(col, tr("Composition"));
         compositionForm = f;
         bypassCheck = binder->AddBool(
-            f, "Enabled", &ShmHeader::compositionBypass,
-            "Off: the model's raw answer is presented as the frame.\n"
+            f, tr("Enabled"), &ShmHeader::compositionBypass,
+            tr("Off: the model's raw answer is presented as the frame.\n"
             "On: the answer is blended onto the frame under the limits below, which are hidden while "
-            "this is off.",
+            "this is off."),
             ShmBinder::Live, /*invert=*/true);
         connect(bypassCheck, &QCheckBox::toggled, this, [this] { updateCompositionVisibility(); });
-        compositionRows << binder->AddFloat(f, "Detail strength", &ShmHeader::transferStrengthBits,
+        compositionRows << binder->AddFloat(f, tr("Detail strength"), &ShmHeader::transferStrengthBits,
                                             0.0, 4.0, 0.05,
-                                            "How much of the model's edit reaches the frame.\n"
-                                            "At zero the frame is bit-identical to the game's own.");
-        compositionRows << binder->AddFloat(f, "Color strength", &ShmHeader::colourStrengthBits,
+                                            tr("How much of the model's edit reaches the frame.\n"
+                                            "At zero the frame is bit-identical to the game's own."));
+        compositionRows << binder->AddFloat(f, tr("Color strength"), &ShmHeader::colourStrengthBits,
                                             0.0, 4.0, 0.05,
-                                            "How much of the model's color comes with its light. At "
-                                            "zero the frame keeps the game's hue exactly.");
-        compositionRows << binder->AddInt(f, "Color bound (%)", &ShmHeader::colourTrustPercent,
+                                            tr("How much of the model's color comes with its light. At "
+                                            "zero the frame keeps the game's hue exactly."));
+        compositionRows << binder->AddInt(f, tr("Color bound (%)"), &ShmHeader::colourTrustPercent,
                        0, 800,
-                       "How far the model may move a pixel's color away from the game's own.\n\n"
+                       tr("How far the model may move a pixel's color away from the game's own.\n\n"
                        "The model disagrees about color most at edges, and taking its hue whole "
                        "there can put one color on one side of an edge and its complement on the "
                        "other. But a large disagreement is also what a real correction looks like -- "
@@ -1433,11 +1506,11 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                        "capped, keeping its direction and losing only its length, so it can never "
                        "invert.\n\n200 is the default. Lower it if colored fringes appear along "
                        "high-contrast edges; 0 keeps the game's hue exactly, which is the same as "
-                       "setting Color strength to 0.",
+                       "setting Color strength to 0."),
                        ShmBinder::Live);
-        compositionRows << binder->AddInt(f, "Smooth the relighting (%)", &ShmHeader::ratioSmoothPercent,
+        compositionRows << binder->AddInt(f, tr("Smooth the relighting (%)"), &ShmHeader::ratioSmoothPercent,
                        0, 100,
-                       "What lets the Highlight guard be raised without the picture going patchy.\n\n"
+                       tr("What lets the Highlight guard be raised without the picture going patchy.\n\n"
                        "Classic and Matched residual rebuild the frame as its own pixel times one "
                        "number. Where the model and the frame agree that number is 1 and nothing "
                        "happens, which is why flat surfaces are always clean. On detailed content the "
@@ -1450,12 +1523,12 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                        "its neighbour -- the frame already knows that, and is what gets "
                        "multiplied.\n\n0 is the old per-pixel behaviour. Raise it toward 100 if you "
                        "want a high guard: the relighting keeps its full range and stops "
-                       "speckling.",
+                       "speckling."),
                        ShmBinder::Live);
 
-        compositionRows << binder->AddFloat(f, "Highlight guard", &ShmHeader::maxRatioBits, 1.0, 30.0,
+        compositionRows << binder->AddFloat(f, tr("Highlight guard"), &ShmHeader::maxRatioBits, 1.0, 30.0,
                                             0.5,
-                                            "How far the pass may move the light. A detail pass has "
+                                            tr("How far the pass may move the light. A detail pass has "
                                             "no business restyling a light source, whatever the "
                                             "model returns.\n\nThis sets how far the light over a "
                                             "pixel's neighbourhood may move, which is the relighting "
@@ -1468,10 +1541,10 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                                             "which is what put blown and black pixels on detailed "
                                             "surfaces.\n\nDetail is a pixel differing from its "
                                             "neighbours by tens of percent. A blowout is one "
-                                            "differing by multiples. Only the second is refused.");
-        compositionRows << binder->AddChoice(f, "How the answer is applied", &ShmHeader::transfer,
-                                             { "Classic", "Matched residual", "Native + edit" },
-                                             "How a model that worked at a different size from the "
+                                            "differing by multiples. Only the second is refused."));
+        compositionRows << binder->AddChoice(f, tr("How the answer is applied"), &ShmHeader::transfer,
+                                             { tr("Classic"), tr("Matched residual"), tr("Native + edit") },
+                                             tr("How a model that worked at a different size from the "
                                              "frame is brought back. Active at any working scale "
                                              "other than 1 -- above it as well as below, since what "
                                              "matters is only that the model's raster differs from "
@@ -1493,71 +1566,71 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
                                              "them, so geometry, text and edges the model left alone "
                                              "stay at native sharpness -- and there is no per-pixel "
                                              "division to blow up. Use this one if raising the "
-                                             "Highlight guard makes detailed surfaces go patchy.");
+                                             "Highlight guard makes detailed surfaces go patchy."));
 
     }
     {
-        auto* f = group(col, "Color");
-        binder->AddChoice(f, "Frame holds", &ShmHeader::colourMode,
-                          { "Auto", "A finished picture", "Linear light" },
-                          "Whether the swapchain carries a frame the game already tone mapped or "
+        auto* f = group(col, tr("Color"));
+        binder->AddChoice(f, tr("Frame holds"), &ShmHeader::colourMode,
+                          { tr("Auto"), tr("A finished picture"), tr("Linear light") },
+                          tr("Whether the swapchain carries a frame the game already tone mapped or "
                           "open-ended light.\n"
-                          "Auto decides from the format and is right for almost every game.");
-        binder->AddChoice(f, "White point from", &ShmHeader::whitePointSource,
-                          { "The slider below", "Measured off the frame" },
-                          "Only meaningful on a linear frame; a finished picture has no white point "
-                          "to find.");
-        binder->AddFloat(f, "Paper white", &ShmHeader::whitePointBits, 0.01, 2000.0, 0.1,
-                         "What the model should treat as white, when it is not being measured.");
-        binder->AddFloat(f, "White point scale", &ShmHeader::whitePointScaleBits, 0.01, 100.0, 0.05,
-                         "Multiplies whichever white point is in use. Higher means highlights sit "
-                         "lower on the curve.");
-        binder->AddFloat(f, "Trim (measured)", &ShmHeader::whitePointTrimBits, 0.01, 100.0, 0.05,
-                         "Multiplies a measured white point only. Kept apart from the slider because "
-                         "a value found against one is meaningless against the other.");
+                          "Auto decides from the format and is right for almost every game."));
+        binder->AddChoice(f, tr("White point from"), &ShmHeader::whitePointSource,
+                          { tr("The slider below"), tr("Measured off the frame") },
+                          tr("Only meaningful on a linear frame; a finished picture has no white point "
+                          "to find."));
+        binder->AddFloat(f, tr("Paper white"), &ShmHeader::whitePointBits, 0.01, 2000.0, 0.1,
+                         tr("What the model should treat as white, when it is not being measured."));
+        binder->AddFloat(f, tr("White point scale"), &ShmHeader::whitePointScaleBits, 0.01, 100.0, 0.05,
+                         tr("Multiplies whichever white point is in use. Higher means highlights sit "
+                         "lower on the curve."));
+        binder->AddFloat(f, tr("Trim (measured)"), &ShmHeader::whitePointTrimBits, 0.01, 100.0, 0.05,
+                         tr("Multiplies a measured white point only. Kept apart from the slider because "
+                         "a value found against one is meaningless against the other."));
     }
 
-    scrollTab("Inspect", &col);
+    scrollTab(tr("Inspect"), &col);
     {
-        auto* f = group(col, "Inspect");
-        binder->AddBool(f, "Apply the model's edit", &ShmHeader::applyModel,
-                        "Off keeps the whole pass running and shows the clean frame, so the cost is "
-                        "unchanged and only the picture differs.");
-        binder->AddBool(f, "Hold frame", &ShmHeader::holdFrame,
-                        "Freeze the frame the pass works on, so changing a setting re-runs the model "
+        auto* f = group(col, tr("Inspect"));
+        binder->AddBool(f, tr("Apply the model's edit"), &ShmHeader::applyModel,
+                        tr("Off keeps the whole pass running and shows the clean frame, so the cost is "
+                        "unchanged and only the picture differs."));
+        binder->AddBool(f, tr("Hold frame"), &ShmHeader::holdFrame,
+                        tr("Freeze the frame the pass works on, so changing a setting re-runs the model "
                         "and the composition on the same picture.\n"
-                        "The only clean way to compare two settings.");
-        binder->AddChoice(f, "Proxy", &ShmHeader::reversibleMode,
-                          { "Soft knee", "Neutwo", "Neutwo, replace", "Hybrid", "Hybrid, replace" },
-                          "Which picture the model is shown, and whether its answer is composed onto "
+                        "The only clean way to compare two settings."));
+        binder->AddChoice(f, tr("Proxy"), &ShmHeader::reversibleMode,
+                          { tr("Soft knee"), tr("Neutwo"), tr("Neutwo, replace"), tr("Hybrid"), tr("Hybrid, replace") },
+                          tr("Which picture the model is shown, and whether its answer is composed onto "
                           "the frame or substituted for it.\n"
                           "Soft knee is the default and the two replace modes are known to flash on "
-                          "bright lights.");
-        binder->AddChoice(f, "Debug view", &ShmHeader::debugView,
-                          { "Off", "The picture the model saw", "Its raw answer", "What it changed",
-                            "Where the color bound engages", "The color before the bound" },
-                          "\"What it changed\" is amplified and centred on grey, so both directions "
+                          "bright lights."));
+        binder->AddChoice(f, tr("Debug view"), &ShmHeader::debugView,
+                          { tr("Off"), tr("The picture the model saw"), tr("Its raw answer"), tr("What it changed"),
+                            tr("Where the color bound engages"), tr("The color before the bound") },
+                          tr("\"What it changed\" is amplified and centred on grey, so both directions "
                           "of the edit are visible at once.\n\n\"Where the color bound engages\" is "
                           "green where the model's color passes whole and red where it is held back. "
                           "It puts a wrong color on one side or the other of that line: green means "
                           "the bound is not engaging and the fault is upstream; red means the bound "
                           "is working and the color is coming from the frame's own hue times one "
-                          "scalar, which makes it a brightness problem rather than a color one.");
-        binder->AddFloat(f, "Debug scale", &ShmHeader::debugScaleBits, 0.01, 100.0, 0.1,
-                         "What the debug views are multiplied by on their way out.");
-        binder->AddChoice(f, "Compare", &ShmHeader::compareMode, { "Off", "Side by side", "Wipe" },
-                          "Shows the pass against itself.\n"
+                          "scalar, which makes it a brightness problem rather than a color one."));
+        binder->AddFloat(f, tr("Debug scale"), &ShmHeader::debugScaleBits, 0.01, 100.0, 0.1,
+                         tr("What the debug views are multiplied by on their way out."));
+        binder->AddChoice(f, tr("Compare"), &ShmHeader::compareMode, { tr("Off"), tr("Side by side"), tr("Wipe") },
+                          tr("Shows the pass against itself.\n"
                           "The wipe cuts one frame and resamples nothing, so it is the one to play "
                           "with.\n"
                           "Works with composition off too: the model's raw answer is then shown "
-                          "against the frame.");
-        binder->AddFloat(f, "Split", &ShmHeader::compareSplitBits, 0.0, 1.0, 0.01, "");
-        binder->AddFloat(f, "Zoom", &ShmHeader::compareZoomBits, 1.0, 2.0, 0.05,
-                         "Side by side only. 1 fits the whole frame and accepts the bars; 2 fills the "
-                         "half and crops.");
-        binder->AddBool(f, "Swap sides", &ShmHeader::compareSwap,
-                        "Which side the edited frame sits on. Worth having because the eye is not "
-                        "even-handed about left and right.");
+                          "against the frame."));
+        binder->AddFloat(f, tr("Split"), &ShmHeader::compareSplitBits, 0.0, 1.0, 0.01, "");
+        binder->AddFloat(f, tr("Zoom"), &ShmHeader::compareZoomBits, 1.0, 2.0, 0.05,
+                         tr("Side by side only. 1 fits the whole frame and accepts the bars; 2 fills the "
+                         "half and crops."));
+        binder->AddBool(f, tr("Swap sides"), &ShmHeader::compareSwap,
+                        tr("Which side the edited frame sits on. Worth having because the eye is not "
+                        "even-handed about left and right."));
 
         // The in-game key, and an honest account of when it can work.
         //
@@ -1567,7 +1640,7 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
         // that would let any program keylog. Where the layer cannot read a key the desktop still can,
         // so the command below is offered as the way that always works.
         keyCombo = new QComboBox(col->parentWidget());
-        keyCombo->addItem("None", 0u);
+        keyCombo->addItem(tr("None"), 0u);
         for (const char* name : { "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11",
                                   "F12", "HOME", "END", "INSERT", "DELETE", "PAGEUP", "PAGEDOWN",
                                   "PAUSE", "SCROLLLOCK", "GRAVE" })
@@ -1577,10 +1650,10 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
             keyCombo->setCurrentIndex(idx >= 0 ? idx : 0);
         }
         keyCombo->setToolTip(FormatTip(
-            "Toggles the pass in game. Read by the layer, which works on an X11 or XWayland\n"
+            tr("Toggles the pass in game. Read by the layer, which works on an X11 or XWayland\n"
             "session and anywhere you are in the 'input' group.\n"
-            "It cannot work for a game presenting through winewayland."));
-        f->addRow("Toggle key", keyCombo);
+            "It cannot work for a game presenting through winewayland.")));
+        f->addRow(tr("Toggle key"), keyCombo);
         connect(keyCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
             if (!hdr) return;
             hdr->toggleKey.store(keyCombo->currentData().toUInt());
@@ -1588,9 +1661,9 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
         });
 
         auto* keyNote = new QLabel(
-            QString("If that key does nothing -- a Wayland game, or not in the 'input' group -- bind "
+            QString(tr("If that key does nothing -- a Wayland game, or not in the 'input' group -- bind "
                     "this to a shortcut in your desktop's own settings instead. That works over a "
-                    "fullscreen game and needs no permissions:\n\n    dlssnr-shmctl %1 toggle enabled")
+                    "fullscreen game and needs no permissions:\n\n    dlssnr-shmctl %1 toggle enabled"))
                 .arg(shmPath),
             col->parentWidget());
         keyNote->setWordWrap(true);
@@ -1601,10 +1674,10 @@ binder->AddInt(f, "Passes", &ShmHeader::passes, 1, int(kMaxPasses),
         captureFrames = new QSpinBox(col->parentWidget());
         captureFrames->setRange(1, 64);
         captureFrames->setValue(8);
-        captureBtn = new QPushButton("Capture frames", col->parentWidget());
+        captureBtn = new QPushButton(tr("Capture frames"), col->parentWidget());
         captureBtn->setToolTip(FormatTip(
-            "Writes that many matched before/after pairs to the state directory.\n"
-            "Same frames, same run, one variable."));
+            tr("Writes that many matched before/after pairs to the state directory.\n"
+            "Same frames, same run, one variable.")));
         capRow->addWidget(captureFrames);
         capRow->addWidget(captureBtn);
         f->addRow(capRow);
