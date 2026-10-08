@@ -1,5 +1,7 @@
 # DLSS5VKLayer
 
+**English** · [简体中文](README.zh-CN.md)
+
 DLSS5VKLayer is a Linux Vulkan layer plus helper service that forwards presented frames to a Windows NGX neural-rendering helper running under Wine or a custom Proton compatibility tool.
 
 This project is experimental. It is intended for local testing and research.
