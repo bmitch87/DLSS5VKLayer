@@ -335,6 +335,9 @@ Install build dependencies:
 - `meson` and `ninja`
 - `mingw64-gcc-c++` (MinGW headers, libraries, and runtime sysroot for the Clang Windows target)
 - `qt6-qtbase-devel` for the GUI
+- `qt6-linguist` (Fedora), `qt6-l10n-tools` (Debian/Ubuntu) or `qt6-tools` (Arch) for the compiled UI
+  translations -- optional; without `lrelease` the build just skips them and the interface keeps its
+  built-in English strings
 - `rpm-build` if you want the RPMs
 - `glibc-devel.i686`, `libstdc++-devel.i686`, `libgcc.i686`, and `libatomic.i686` for the
   required 32-bit layer

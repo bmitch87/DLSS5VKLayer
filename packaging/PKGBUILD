@@ -11,7 +11,7 @@ arch=('x86_64')
 url='https://github.com/bmitch87/DLSS5VKLayer'
 license=('MIT')
 depends=('bash' 'vulkan-icd-loader' 'qt6-base' 'pciutils')
-makedepends=('clang' 'llvm' 'meson' 'ninja' 'gcc-multilib' 'mingw-w64-gcc')
+makedepends=('clang' 'llvm' 'meson' 'ninja' 'gcc-multilib' 'mingw-w64-gcc' 'qt6-tools')
 optdepends=('wine: fallback Windows NGX runner')
 source=("${pkgname}-${pkgver}-${pkgrel}::git+https://github.com/bmitch87/DLSS5VKLayer.git#tag=${pkgver}-${pkgrel}")
 sha256sums=('SKIP')

@@ -335,6 +335,8 @@ $XDG_STATE_HOME/dlssnr/helper.log
 - `meson` 和 `ninja`
 - `mingw64-gcc-c++`（供 Clang Windows 目标使用的 MinGW 头文件、库与运行时 sysroot）
 - GUI 所需的 `qt6-qtbase-devel`
+- 编译界面翻译所需的 `qt6-linguist` (Fedora)、`qt6-l10n-tools` (Debian/Ubuntu) 或 `qt6-tools` (Arch)
+  ——可选；没有 `lrelease` 时构建会直接跳过翻译，界面保持内置的英文字符串
 - 如果需要 RPM，则需 `rpm-build`
 - `glibc-devel.i686`、`libstdc++-devel.i686`、`libgcc.i686` 和 `libatomic.i686`，用于
   必需的 32 位层

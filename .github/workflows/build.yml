@@ -81,7 +81,7 @@ jobs:
           sudo apt-get install -y \
             clang llvm meson ninja-build g++-multilib \
             g++-mingw-w64-x86-64 \
-            qt6-base-dev qt6-base-dev-tools \
+            qt6-base-dev qt6-base-dev-tools qt6-l10n-tools \
             libx11-dev libxi-dev libxext-dev libxrandr-dev \
             pciutils pkg-config \
             git bash tar gzip
@@ -129,7 +129,7 @@ jobs:
             mingw64-gcc-c++ \
             glibc-static glibc-static.i686\
             libstdc++-static libstdc++-static.i686\
-            qt6-qtbase-devel \
+            qt6-qtbase-devel qt6-linguist \
             rpm-build \
             pciutils \
             pkgconf-pkg-config \
@@ -179,7 +179,7 @@ jobs:
           sudo apt-get install -y \
             clang llvm meson ninja-build g++-multilib \
             g++-mingw-w64-x86-64 \
-            qt6-base-dev qt6-base-dev-tools \
+            qt6-base-dev qt6-base-dev-tools qt6-l10n-tools \
             libx11-dev libxi-dev libxext-dev libxrandr-dev \
             pciutils \
             pkg-config \
@@ -233,7 +233,7 @@ jobs:
           apt-get install -y \
             clang llvm meson ninja-build g++-multilib \
             g++-mingw-w64-x86-64 \
-            qt6-base-dev qt6-base-dev-tools \
+            qt6-base-dev qt6-base-dev-tools qt6-l10n-tools \
             libx11-dev libxi-dev libxext-dev libxrandr-dev \
             pciutils \
             pkg-config \
