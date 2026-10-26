@@ -7,6 +7,7 @@ gui_sources = files(
   'mainwindow.cpp',
   'passdialog.cpp',
   'shm_binder.cpp',
+  'translations.cpp',
   '../layer_linux/src/hotkey.cpp',
   '../common/runner_discovery.cpp',
 )

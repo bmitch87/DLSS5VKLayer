@@ -58,7 +58,8 @@ stage_variant() {
     "$root/usr/bin" \
     "$root/usr/share/vulkan/implicit_layer.d" \
     "$root/usr/share/applications" \
-    "$root/usr/share/doc/dlssnr"
+    "$root/usr/share/doc/dlssnr" \
+    "$root/usr/share/dlssnr/translations"
 
   cp "$NATIVE_BUILD/layer_linux/libVkLayer_NV_dlssnr.so" "$root/usr/lib64/dlssnr/layer/"
   # The 32-bit layer is optional: it only exists when a multilib toolchain was present at build time.
@@ -75,6 +76,10 @@ stage_variant() {
   cp third_party/dxvk/2.7.1/x64/vulkan-1.dll "$root/usr/lib64/dlssnr/dxvk/2.7.1/"
   cp third_party/dxvk/2.7.1/LICENSE.txt "$root/usr/share/doc/dlssnr/dxvk-license.txt"
   cp packaging/dlssnr.desktop "$root/usr/share/applications/"
+  # Compiled UI translations; the GUI looks for them under <prefix>/share/dlssnr/translations.
+  for qm in "$NATIVE_BUILD/translations/"*.qm; do
+    if [ -e "$qm" ]; then cp "$qm" "$root/usr/share/dlssnr/translations/"; fi
+  done
   cp packaging/install.sh packaging/uninstall.sh "$pkg_dir/"
 
   # One manifest per architecture, each naming its own library and its own layer name. The loader
