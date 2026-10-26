@@ -32,6 +32,7 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <sys/auxv.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -627,18 +628,31 @@ static std::string LayerObjectPath() {
 // everything through, which turns a corrupted picture or a hang into one warning line.
 //
 // The claim is the object's own path rather than a bare flag, so a second call into the same copy --
-// which is legal, the loader may negotiate more than once -- is told apart from a second copy.
+// which is legal, the loader may negotiate more than once -- is told apart from a second copy. It is
+// prefixed with the id of this process image because the environment is inherited: a 64-bit launcher
+// with the layer that starts a 32-bit game would otherwise hand its claim to the game's own copy and
+// turn it inert. The kernel places fresh random bytes (AT_RANDOM) at every exec, so the id changes for
+// a child process and for a program exec'd in place, and stays equal for both copies of one image.
 static bool DuplicateLayerCopy() {
     static const bool dup = [] {
         const std::string self = LayerObjectPath();
+        std::string image;
+        const auto* random = reinterpret_cast<const unsigned char*>(getauxval(AT_RANDOM));
+        for (int i = 0; random && i < 16; i++) {
+            char hex[3];
+            snprintf(hex, sizeof(hex), "%02x", random[i]);
+            image += hex;
+        }
+        image += ":";
         const char* claimed = getenv("DLSSNR_LAYER_OBJECT");
-        if (claimed && *claimed) {
-            if (self.empty() || self == claimed) return false;
+        if (claimed && strncmp(claimed, image.c_str(), image.size()) == 0) {
+            const char* other = claimed + image.size();
+            if (self.empty() || self == other) return false;
             Log("[layer] another copy is already loaded from %s; this copy (%s) stays inert. "
-                "Remove one of the implicit-layer manifests.", claimed, self.c_str());
+                "Remove one of the implicit-layer manifests.", other, self.c_str());
             return true;
         }
-        if (!self.empty()) setenv("DLSSNR_LAYER_OBJECT", self.c_str(), 0);
+        if (!self.empty()) setenv("DLSSNR_LAYER_OBJECT", (image + self).c_str(), 1);
         return false;
     }();
     return dup;
