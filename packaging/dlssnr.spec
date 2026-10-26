@@ -47,6 +47,9 @@ cp -a root/usr %{buildroot}/usr
 %{_bindir}/dlssnr-shmctl
 %{_datadir}/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.*.json
 %{_datadir}/applications/dlssnr.desktop
+# Compiled UI translations, staged by make-dist.sh. A glob: when the build ran
+# without lrelease there are no .qm files and nothing is claimed here.
+%{_datadir}/dlssnr/translations/*.qm
 %doc %{_datadir}/doc/dlssnr/dxvk-license.txt
 
 %post
