@@ -446,14 +446,29 @@ detect_wine() {
   return 1
 }
 
+# Whether a directory is a real Steam install root rather than a leftover. Mere existence
+# is not enough: a distribution that only touches the XDG path leaves an empty
+# "$HOME/.local/share/Steam", and that used to win the scan below, handing Proton a
+# STEAM_COMPAT_CLIENT_INSTALL_PATH with no Steam in it (and an empty runner list). Require
+# one of the things Steam itself puts in its root.
+is_steam_root() {
+  local d="$1"
+  [ -d "$d" ] || return 1
+  [ -d "$d/steamapps/common" ] || [ -f "$d/config/config.vdf" ] ||
+    [ -f "$d/ubuntu12_32/steam" ] || [ -f "$d/ubuntu12_64/steam" ] ||
+    [ -f "$d/steam.sh" ]
+}
+
 detect_steam_root() {
   local d
   for d in \
     "${XDG_DATA_HOME:-$HOME/.local/share}/Steam" \
     "$HOME/.steam/steam" \
     "$HOME/.steam/root" \
+    "$HOME/.steam/debian-installation" \
+    "$HOME/snap/steam/common/.local/share/Steam" \
     "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
-    if [ -d "$d" ]; then
+    if is_steam_root "$d"; then
       printf '%s' "$d"
       return 0
     fi
@@ -612,6 +627,41 @@ running_pid() {
   return 0
 }
 
+# Whether a helper is actually working, read from the shared-memory header. A live pid alone
+# proves nothing: the setsid wrapper and the `proton run` script survive around a helper that
+# died at load, their cmdlines name dlssnr_helper.exe and their exported environ carries
+# DLSSNR_SHM, so the pid checks report "running" for what is only a survivor. The header is
+# the truth: helper_state says what the helper last published, and while its loop lives a
+# counter moves -- the heartbeat ticks while it waits for frames, seq_resp climbs while it
+# answers them. Prints: alive | silent | dead | unknown.
+shm_liveness() {
+  local tool h ini st hb hb2 sr sr2
+  tool="$(detect_shmctl || true)"
+  if [ -z "$tool" ] || [ ! -f "$shm" ]; then
+    echo unknown
+    return 0
+  fi
+  h="$("$tool" "$shm" status 2>/dev/null)" || { echo dead; return 0; }
+  ini="$(printf '%s\n' "$h" | sed -n 's/^initialised=//p')"
+  [ "$ini" = "1" ] || { echo dead; return 0; }
+  st="$(printf '%s\n' "$h" | sed -n 's/^helper_state=//p')"
+  case "$st" in
+    0|4) ;;                         # starting, or running: possible
+    *)   echo dead; return 0 ;;     # never came up, or published an exit state
+  esac
+  hb="$(printf '%s\n' "$h" | sed -n 's/^heartbeat=//p')"
+  sr="$(printf '%s\n' "$h" | sed -n 's/^seq_resp=//p')"
+  sleep 1
+  h="$("$tool" "$shm" status 2>/dev/null)" || { echo dead; return 0; }
+  hb2="$(printf '%s\n' "$h" | sed -n 's/^heartbeat=//p')"
+  sr2="$(printf '%s\n' "$h" | sed -n 's/^seq_resp=//p')"
+  if { [ -n "$hb2" ] && [ "$hb2" != "$hb" ]; } || { [ -n "$sr2" ] && [ "$sr2" != "$sr" ]; }; then
+    echo alive
+  else
+    echo silent
+  fi
+}
+
 cmd_start() {
   ensure_dirs
   if [ ! -f "$CONFIG_FILE" ]; then
@@ -748,6 +798,28 @@ cmd_start() {
     echo "  prefix: $PREFIX_DIR"
     echo "  shm: $shm"
     echo "  log: $log"
+    # The pid checks also match the setsid wrapper and the `proton run` script, which survive
+    # a helper that died during load -- a failed start used to report success anyway. The
+    # header settles it, with grace for a helper that is genuinely still coming up.
+    local liveness i
+    liveness=""
+    for i in 1 2 3 4 5 6 7 8; do
+      liveness="$(shm_liveness)"
+      [ "$liveness" = alive ] && break
+      sleep 1
+    done
+    case "$liveness" in
+      dead)
+        echo "error: no helper attached the shared memory; it most likely died during load" >&2
+        echo "        the runner output is in $log" >&2
+        echo "        for runner-side detail retry once with: WINEDEBUG=err+all $PROG start" >&2
+        return 1
+        ;;
+      silent)
+        echo "  note: the helper has not ticked yet -- still loading, or its loop died;"
+        echo "        watch $log and: dlssnr-shmctl \"$shm\" status" >&2
+        ;;
+    esac
   else
     echo "helper failed to start; check $log" >&2
     return 1
@@ -804,18 +876,46 @@ cmd_stop() {
 cmd_status() {
   load_config
   set_prefix_dirs
-  local pids
+  local pids liveness proc
   pids="$(helper_pids)"
-  if running_pid || [ -n "$pids" ]; then
-    echo "helper running"
+  liveness="$(shm_liveness)"
+  proc=0
+  if running_pid || [ -n "$pids" ]; then proc=1; fi
+  case "$liveness" in
+    alive)
+      echo "helper running"
+      ;;
+    silent)
+      if [ "$proc" = 1 ]; then
+        echo "helper present but not answering: no heartbeat, no answers in the shared memory"
+        echo "  still starting up, or the loop died after publishing its state; frames pass through"
+      else
+        echo "helper not running: the header claims a live helper but nothing ticks and no process is present"
+      fi
+      ;;
+    dead)
+      echo "helper not running"
+      if [ "$proc" = 1 ]; then
+        echo "  a runner process is alive but the header says no helper came up;"
+        echo "  the helper itself died during load -- see $log"
+      fi
+      ;;
+    *)
+      # No dlssnr-shmctl or no mapping to read: fall back to the pid check alone.
+      if [ "$proc" = 1 ]; then
+        echo "helper running (process check only -- dlssnr-shmctl not found)"
+      else
+        echo "helper not running"
+      fi
+      ;;
+  esac
+  if [ "$proc" = 1 ]; then
     if running_pid; then
       echo "  runner pid: $(cat "$PID_FILE")"
     fi
     if [ -n "$pids" ]; then
       echo "  helper pids: $(printf '%s' "$pids" | tr '\n' ' ')"
     fi
-  else
-    echo "helper not running"
   fi
   echo "  config: $CONFIG_FILE"
   echo "  runtime: $RUNTIME_DIR"
