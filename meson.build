@@ -1,4 +1,4 @@
-project('dlss5vklayer', 'cpp',
+project('dlss5vklayer', 'c', 'cpp',
   version: '0.2.5',
   default_options: [
     'cpp_std=c++17',

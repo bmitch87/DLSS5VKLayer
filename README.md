@@ -620,3 +620,5 @@ yourself and log out and back in.
 - The layer currently assumes a present-time swapchain layout that works for the tested games and emulators. Some games may need layout handling work.
 - Steam runtime issues may require per-game or per-runtime debugging.
 - Do not use the personal package publicly unless you are certain you may redistribute the bundled NVIDIA binaries.
+
+Experimental developer documentation: [ordered GPU transport](docs/gpu_transport.md).

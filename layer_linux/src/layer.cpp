@@ -29,6 +29,7 @@
 #include "composition.h"
 #include "hotkey.h"
 #include "vk_table.h"
+#include "queue_synchronization.h"
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -128,11 +129,11 @@ struct ShmMap {
     // Three mappings rather than one.
     //
     // The file is a header followed by two pixel regions each large enough for the biggest frame the
-    // protocol allows, which is a quarter of a gigabyte in total. Mapping all of it was fine on
+    // protocol allows, which is about half a gigabyte in total. Mapping all of it was fine on
     // 64-bit and is not on 32-bit: a 32-bit game has about 3 GB of address space and would be handing
     // a tenth of it to a reservation it never touches. Both region offsets are page-aligned by
     // construction, so each can be mapped on its own at the size actually in use -- a few megabytes
-    // for a real frame instead of 265.
+    // for a real frame. On 64-bit, reserve both full ranges to keep imported pointers stable.
     int fd = -1;
     ShmHeader* hdr = nullptr;
     uint8_t* inPixels = nullptr;
@@ -193,16 +194,24 @@ static void* ShmMapAligned(int fd, off_t offset, size_t want, uintptr_t hint) {
     return mmap(nullptr, want, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
 }
 
-// Maps the two pixel regions at the size this frame needs, remapping when the size changes.
+// Keep host-imported addresses stable for the lifetime of the device on 64-bit.
+// Composition objects may still own VkDeviceMemory imports when a model grows;
+// unmapping their pages here would invalidate those imports before they are freed.
+// Reserve the protocol's full ranges, but only import/touch the current frame.
+// 32-bit retains its existing smaller address-space reservations.
 static bool ShmMapFrames(ShmMap& s, size_t bytes) {
-    if (s.mappedFrameBytes >= bytes && s.inPixels && s.outPixels) return true;
     if (bytes > kMaxFrame) return false;
+    if (s.mappedFrameBytes >= bytes && s.inPixels && s.outPixels) return true;
 
     // Round up so a small change in resolution does not remap every frame, and to a 64 KiB multiple so
     // a host-pointer import of the whole region (whose allocation size must be a multiple of the
     // driver's import alignment) stays inside the mapping.
     const size_t kImportAlign = 65536;
+#if UINTPTR_MAX > 0xFFFFFFFFull
+    const size_t want = ((kMaxFrame + kImportAlign - 1) / kImportAlign) * kImportAlign;
+#else
     const size_t want = ((bytes + kImportAlign - 1) / kImportAlign) * kImportAlign;
+#endif
 
     if (s.inPixels) munmap(s.inPixels, s.mappedFrameBytes);
     if (s.outPixels) munmap(s.outPixels, s.mappedFrameBytes);
@@ -232,6 +241,15 @@ static bool ShmMapFrames(ShmMap& s, size_t bytes) {
     s.outPixels = (uint8_t*) out;
     s.mappedFrameBytes = want;
     return true;
+}
+
+// Call only after all compositions have freed their imported VkDeviceMemory.
+static void ShmClose(ShmMap& s) {
+    if (s.inPixels) munmap(s.inPixels, s.mappedFrameBytes);
+    if (s.outPixels) munmap(s.outPixels, s.mappedFrameBytes);
+    if (s.hdr) munmap(s.hdr, kHeaderBytes);
+    if (s.fd >= 0) close(s.fd);
+    s = ShmMap{};
 }
 
 static bool ShmOpen(ShmMap& s) {
@@ -346,12 +364,13 @@ static bool DmaBufEnabled() {
 }
 
 static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, const void* proxy,
-                          void* modelOut, bool proxyInRegion, bool answerFromFd, bool hdrEncode) {
+                          void* modelOut, bool proxyInRegion, bool answerFromFd, bool hdrEncode, uint32_t epoch = 0) {
     if (s.dead) return false;
     if (!ShmOpen(s)) { s.dead = true; return false; }
     if (w > kMaxW || h > kMaxH || w < kMinW || h < kMinH) return false;
     if (bytes != size_t(w) * h * 4 && bytes != size_t(w) * h * 8) return false;
     if (s.hdr->quit.load()) { s.dead = true; return false; }
+    if (epoch && s.hdr->gpuEpoch.load() != epoch) return false;
 
     const bool time = TimeEnabled();
     const double t0 = NowMs();
@@ -373,7 +392,8 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
     // to the helper before it sees the new request number. (The GPU's own write is fenced earlier,
     // by leg 1's vkWaitForFences; this fence covers the host-visible ordering across processes.)
     std::atomic_thread_fence(std::memory_order_release);
-    s.hdr->seq_req.store(req);
+    s.hdr->gpuRequestEpoch.store(epoch);
+    s.hdr->seq_req.store(req, std::memory_order_release);
 
     // How long this frame may wait, which is a question about whether anyone is listening.
     //
@@ -396,6 +416,7 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
     // Wait for the helper (fail-open: present the original frame on timeout).
     const double tSignal = NowMs();
     for (;;) {
+        if (epoch && (s.hdr->gpuEpoch.load() != epoch || !s.hdr->gpuTimelineReady.load())) return false;
         if (s.hdr->seq_resp.load() >= req) {
             s.timeouts = 0;
             s.everAnswered = true;
@@ -409,7 +430,8 @@ static bool ShmProcessFrame(ShmMap& s, uint32_t w, uint32_t h, size_t bytes, con
             // the meantime, and seq_resp only counts. Composing that answer here would copy a
             // different number of bytes into these surfaces -- the row-shifted colour garbage this
             // check exists to refuse.
-            const bool ok = s.hdr->seq_ok.load() >= req && s.hdr->answeredW.load() == w &&
+            const bool ok = s.hdr->seq_resp.load() == req && s.hdr->seq_ok.load() == req &&
+                            (!epoch || s.hdr->gpuResponseEpoch.load() == epoch) && s.hdr->answeredW.load() == w &&
                             s.hdr->answeredH.load() == h;
             if (!ok) Log("[shm] helper could not use frame %u (ok=%u)", req, s.hdr->seq_ok.load());
             if (ok && !answerFromFd && modelOut != (void*) s.outPixels) std::memcpy(modelOut, s.outPixels, bytes);
@@ -465,6 +487,7 @@ struct InstanceChain {
     X(vkGetSwapchainImagesKHR) X(vkQueuePresentKHR) X(vkQueueSubmit) X(vkQueueSubmit2) X(vkQueueWaitIdle) X(vkCreateCommandPool) \
     X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) \
     X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
+    X(vkCreateSemaphore) X(vkDestroySemaphore) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkAllocateMemory) \
     X(vkFreeMemory) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView) \
     X(vkMapMemory) X(vkUnmapMemory) X(vkCreateBuffer) X(vkDestroyBuffer) \
@@ -474,6 +497,8 @@ struct InstanceChain {
 
 struct SwapchainState {
     std::vector<VkImage> images;
+    // Present waits are reused only after this same image has been reacquired.
+    std::vector<VkSemaphore> presentReady;
     // The queue this swapchain was last presented on, and a fence for the repaint's own acquire.
     // A repaint has to submit somewhere, and the only queue known to be right for a swapchain is
     // the one the application itself uses.
@@ -491,7 +516,7 @@ struct SwapchainState {
     // Two fences, not one. Leg 1's must be waited on before the proxy is handed to the helper --
     // the sequence number is the helper's only ordering signal, and it may not be bumped ahead of
     // the write it announces. Leg 2's needs no wait at all in its own frame: the present follows it
-    // on the same queue, so the GPU orders them without the CPU. The wait moves to the start of the
+    // through the image's presentReady semaphore without a CPU wait. The fence wait moves to the start of the
     // next present, where the command buffer and the composed surfaces are reused, which takes a
     // full GPU stall out of the frame it belongs to.
     VkFence fenceLeg1 = VK_NULL_HANDLE;
@@ -501,6 +526,7 @@ struct SwapchainState {
     VkCommandBuffer cb = VK_NULL_HANDLE;
     // Reused by the present path; resizing only occurs when an unusual caller supplies more waits.
     std::vector<VkPipelineStageFlags> waitStages;
+    uint32_t proxySeqSeen=0, answerSeqSeen=0;
     bool ready = false;
     bool passThrough = false;
 
@@ -525,7 +551,8 @@ struct DeviceChain {
     DEVICE_FN_LIST(X)
 #undef X
     std::atomic<bool> inert{false};
-    std::mutex lock;
+    std::mutex lock; // Ordered composition/history and swapchain lifetime only.
+    dlssnr::QueueSynchronization<VkQueue> queueSync;
 
     // Composing a still frame again when the settings move under it. See the thread in
     // Hook_CreateDevice.
@@ -556,20 +583,58 @@ struct DeviceChain {
     bool repaintWasEnabled = true;   // so switching the effect off is itself a change to answer
     bool releaseImages = false;      // VK_EXT_swapchain_maintenance1 was enabled
     std::unordered_map<VkSwapchainKHR, SwapchainState> swapchains;
-    std::unordered_map<VkQueue, uint32_t> queueFamilies;
+
     ShmMap shm;
     uint64_t framesComposed = 0;
     uint64_t framesPassedThrough = 0;
     // Phase 5: the dma-buf exchange. The export sequences last imported; a new sequence means the
     // image behind the descriptor changed and the reference is taken again.
-    uint32_t proxySeqSeen = 0;
-    uint32_t answerSeqSeen = 0;
+    VkSemaphore transportTimeline=VK_NULL_HANDLE;
+    uint32_t timelinePid=0,timelineFd=0,timelineEpoch=0,quarantinedEpoch=0;
+    uint64_t timelineValue=0;
+    bool gpuTransportCapable=false;
 };
 
 static std::unordered_map<VkInstance, InstanceChain> g_instances;
 static std::unordered_map<VkPhysicalDevice, InstanceChain*> g_phys;
 static std::unordered_map<VkDevice, DeviceChain*> g_devices;
 static std::mutex g_stateMutex;
+struct QueueRecord { DeviceChain* device; uint32_t family; };
+static std::unordered_map<VkQueue, QueueRecord> g_queues;
+
+static DeviceChain* DeviceForQueue(VkQueue queue) {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    const auto it = g_queues.find(queue);
+    return it == g_queues.end() ? nullptr : it->second.device;
+}
+static uint32_t QueueFamily(VkQueue queue) {
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    const auto it = g_queues.find(queue);
+    return it == g_queues.end() ? UINT32_MAX : it->second.family;
+}
+static VkResult QueueSubmitLocked(DeviceChain* dc, VkQueue queue, uint32_t count,
+                                 const VkSubmitInfo* info, VkFence fence) {
+    dlssnr::QueueSynchronization<VkQueue>::QueueLease lease(dc->queueSync, queue);
+    return dc->vkQueueSubmit(queue, count, info, fence);
+}
+static VkResult QueuePresentLocked(DeviceChain* dc, VkQueue queue, const VkPresentInfoKHR* info) {
+    dlssnr::QueueSynchronization<VkQueue>::QueueLease lease(dc->queueSync, queue);
+    return dc->vkQueuePresentKHR(queue, info);
+}
+static VkResult DeviceIdleLocked(DeviceChain* dc) {
+    dlssnr::QueueSynchronization<VkQueue>::IdleLease lease(dc->queueSync);
+    return dc->vkDeviceWaitIdle(dc->self);
+}
+static VKAPI_ATTR VkResult VKAPI_CALL Hook_DeviceWaitIdle(VkDevice device) {
+    DeviceChain* dc = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        const auto it = g_devices.find(device);
+        if (it != g_devices.end()) dc = it->second;
+    }
+    return dc && dc->vkDeviceWaitIdle ? DeviceIdleLocked(dc) : VK_ERROR_INITIALIZATION_FAILED;
+}
+
 
 // The one swapchain allowed to drive the neural round trip, chosen as the largest in the process.
 //
@@ -779,15 +844,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_EnumeratePhysicalDevices(
 // Both declared here for the idle repaint, which draws a frame the application did not ask for.
 static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
                            VkImage swapchainImage, uint32_t waitCount, const VkSemaphore* pWaits,
-                           bool repaint, bool* waitsConsumed);
+                           bool repaint, bool* waitsConsumed, VkSemaphore presentReady);
 
 // Put the captured frame back, for when the effect is switched off while the picture is still.
 //
 // No model and no round trip: the composed result is replaced by the frame it was made from, which
 // is what the application drew and what it would draw again if it were running. Without this,
 // switching the effect off while paused leaves the edit on screen until something else redraws.
-static bool RestorePresent(DeviceChain* dc, SwapchainState& sc, VkImage swapchainImage) {
+static bool RestorePresent(DeviceChain* dc, SwapchainState& sc, VkImage swapchainImage, VkSemaphore presentReady) {
     if (!sc.comp || !sc.comp->HasCapturedFrame()) return false;
+    if (sc.leg2Pending) {
+        if (dc->vkWaitForFences(dc->self, 1, &sc.fenceLeg2, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+        if (dc->vkResetFences(dc->self, 1, &sc.fenceLeg2) != VK_SUCCESS) return false;
+        sc.leg2Pending = false;
+    }
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (dc->vkBeginCommandBuffer(sc.cb, &bi) != VK_SUCCESS) return false;
@@ -799,12 +869,10 @@ static bool RestorePresent(DeviceChain* dc, SwapchainState& sc, VkImage swapchai
     VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     si.commandBufferCount = 1;
     si.pCommandBuffers = &sc.cb;
-    if (dc->vkQueueSubmit(sc.queue, 1, &si, sc.fenceLeg2) != VK_SUCCESS) return false;
-    // Waited for here rather than left to the next frame: there may not be a next frame, and the
-    // command buffer is reused by the repaint after this one.
-    dc->vkWaitForFences(dc->self, 1, &sc.fenceLeg2, VK_TRUE, 500ull * 1000ull * 1000ull);
-    dc->vkResetFences(dc->self, 1, &sc.fenceLeg2);
-    sc.leg2Pending = false;
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &presentReady;
+    if (QueueSubmitLocked(dc, sc.queue, 1, &si, sc.fenceLeg2) != VK_SUCCESS) return false;
+    sc.leg2Pending = true;
     {
         static std::once_flag said;
         std::call_once(said, [] { Log("[layer] idle repaint: put the captured frame back"); });
@@ -854,6 +922,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
     // is false the composition falls back to the next transport down.
     static const char* const kWantExts[] = { VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
                                               VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+                                              VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
                                               VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
                                               // The repaint's, for handing an image back unpresented.
                                               VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME };
@@ -921,10 +990,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
         link->u.pLayerInfo = nextLayerInfo;
         addedSwapMaint = false;
         res = create(physicalDevice, pCreateInfo, pAllocator, pDevice);
+        effective=pCreateInfo;
     }
     if (res != VK_SUCCESS) return res;
 
     DeviceChain* dc = new DeviceChain();
+    bool timelineFeature=false,externalSemaphore=false;
+    for(auto* feature=static_cast<const VkBaseInStructure*>(pCreateInfo->pNext);feature;feature=feature->pNext){
+        if(feature->sType==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES)
+            timelineFeature=reinterpret_cast<const VkPhysicalDeviceTimelineSemaphoreFeatures*>(feature)->timelineSemaphore;
+        if(feature->sType==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+            timelineFeature=reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>(feature)->timelineSemaphore;
+    }
+    for(uint32_t i=0;i<effective->enabledExtensionCount;i++)
+        if(!strcmp(effective->ppEnabledExtensionNames[i],VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME))externalSemaphore=true;
+    dc->gpuTransportCapable=timelineFeature&&externalSemaphore;
     dc->instance = ic;
     dc->physical = physicalDevice;
     dc->self = *pDevice;
@@ -935,6 +1015,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 #undef X
     dc->table.next_dpa = next_dpa;
     dc->table.Load(*pDevice);
+    dc->table.vkDeviceWaitIdle = Hook_DeviceWaitIdle;
     dc->releaseImages = addedSwapMaint && dc->vkReleaseSwapchainImagesEXT != nullptr;
     if (!dc->vkQueuePresentKHR || !dc->vkCreateSwapchainKHR || !ic) dc->inert = true;
 
@@ -1117,14 +1198,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
 
                 const bool drew =
                     on ? ProcessPresent(dc, *sc, sc->queue, sc->images[index], 0, nullptr,
-                                         /*repaint=*/true, nullptr)
-                       : RestorePresent(dc, *sc, sc->images[index]);
+                                         /*repaint=*/true, nullptr, sc->presentReady[index])
+                       : RestorePresent(dc, *sc, sc->images[index], sc->presentReady[index]);
                 if (drew) {
                     VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+                    pi.waitSemaphoreCount = 1;
+                    pi.pWaitSemaphores = &sc->presentReady[index];
                     pi.swapchainCount = 1;
                     pi.pSwapchains = &swapchain;
                     pi.pImageIndices = &index;
-                    dc->vkQueuePresentKHR(sc->queue, &pi);
+                    QueuePresentLocked(dc, sc->queue, &pi);
                     dc->repaintSeenCtrl = ctrl;
                     dc->repaintSeenTuning = tune;
                     dc->repaintWasEnabled = on;
@@ -1143,7 +1226,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_CreateDevice(
                     pi.swapchainCount = 1;
                     pi.pSwapchains = &swapchain;
                     pi.pImageIndices = &index;
-                    dc->vkQueuePresentKHR(sc->queue, &pi);
+                    QueuePresentLocked(dc, sc->queue, &pi);
                     Log("[layer] idle repaint: nothing drawn and no way to return the image; "
                         "not repainting again");
                     break;
@@ -1160,7 +1243,7 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
     {
         std::lock_guard<std::mutex> lk(g_stateMutex);
         auto it = g_devices.find(device);
-        if (it != g_devices.end()) { dc = it->second; g_devices.erase(it); }
+        if (it != g_devices.end()) dc = it->second;
     }
     if (!dc) return;
     // Before anything it touches is destroyed, and outside the lock it takes.
@@ -1178,12 +1261,14 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
         dc->shm.hdr->layerPid.store(0);
         dc->shm.hdr->layerCompositionUp.store(0);
     }
-    if (dc->vkDeviceWaitIdle) dc->vkDeviceWaitIdle(device);
+    if (dc->vkDeviceWaitIdle) DeviceIdleLocked(dc);
     {
         std::lock_guard<std::mutex> lk(dc->lock);
         for (auto& kv : dc->swapchains) {
             SwapchainState& sc = kv.second;
             sc.comp.reset();
+            for (VkSemaphore ready : sc.presentReady)
+                if (ready) dc->vkDestroySemaphore(device, ready, nullptr);
             if (sc.fenceLeg1) dc->vkDestroyFence(device, sc.fenceLeg1, nullptr);
             if (sc.fenceLeg2) dc->vkDestroyFence(device, sc.fenceLeg2, nullptr);
             if (sc.repaintFence) dc->vkDestroyFence(device, sc.repaintFence, nullptr);
@@ -1191,7 +1276,16 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroyDevice(VkDevice device,
         }
         dc->swapchains.clear();
     }
+    if(dc->transportTimeline)dc->vkDestroySemaphore(device,dc->transportTimeline,nullptr);
+    ShmClose(dc->shm);
     if (dc->vkDestroyDevice) dc->vkDestroyDevice(device, pAllocator);
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        for (auto it = g_queues.begin(); it != g_queues.end();) {
+            if (it->second.device == dc) it = g_queues.erase(it); else ++it;
+        }
+        g_devices.erase(device);
+    }
     delete dc;
 }
 
@@ -1203,8 +1297,8 @@ static DeviceChain* FindDevice(VkDevice device) {
 
 static void RememberQueue(DeviceChain* dc, VkQueue queue, uint32_t family) {
     if (!queue) return;
-    std::lock_guard<std::mutex> lk(dc->lock);
-    dc->queueFamilies[queue] = family;
+    std::lock_guard<std::mutex> lk(g_stateMutex);
+    g_queues[queue] = {dc, family};
 }
 
 static VKAPI_ATTR void VKAPI_CALL Hook_GetDeviceQueue(VkDevice device, uint32_t family,
@@ -1324,10 +1418,12 @@ static VKAPI_ATTR void VKAPI_CALL Hook_DestroySwapchainKHR(VkDevice device,
     auto it = dc->swapchains.find(swapchain);
     if (it != dc->swapchains.end()) {
         lk.unlock();
-        if (dc->vkDeviceWaitIdle) dc->vkDeviceWaitIdle(device);
+        if (dc->vkDeviceWaitIdle) DeviceIdleLocked(dc);
         lk.lock();
         SwapchainState& sc = it->second;
         sc.comp.reset();
+        for (VkSemaphore ready : sc.presentReady)
+            if (ready) dc->vkDestroySemaphore(device, ready, nullptr);
         if (sc.fenceLeg1) dc->vkDestroyFence(device, sc.fenceLeg1, nullptr);
         if (sc.fenceLeg2) dc->vkDestroyFence(device, sc.fenceLeg2, nullptr);
         if (sc.repaintFence) dc->vkDestroyFence(device, sc.repaintFence, nullptr);
@@ -1380,8 +1476,14 @@ static bool CreateResources(DeviceChain* dc, SwapchainState& sc, uint32_t family
     if (dc->vkCreateFence(d, &fci, nullptr, &sc.fenceLeg1) != VK_SUCCESS) return false;
     if (dc->vkCreateFence(d, &fci, nullptr, &sc.fenceLeg2) != VK_SUCCESS) return false;
 
+    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    sc.presentReady.resize(sc.images.size(), VK_NULL_HANDLE);
+    for (VkSemaphore& ready : sc.presentReady)
+        if (dc->vkCreateSemaphore(d, &sci, nullptr, &ready) != VK_SUCCESS) return false;
+
     if (!dc->instance) return false;
     sc.comp = std::make_unique<dlssnr::Composition>(&dc->table, &dc->instance->table, d, dc->physical);
+    sc.comp->SetExternalQueueFamily(family);
     if (!sc.comp->Usable()) {
         Log("[layer] composition unavailable: %s", sc.comp->Reason());
         sc.comp.reset();
@@ -1412,22 +1514,90 @@ static bool NoteVk(DeviceChain* dc, VkResult r, const char* what) {
 
 // Returns true if the swapchain image now holds the composed frame.
 //
+static bool GpuImagesRequested(DeviceChain* dc) {
+    const char* enabled = getenv("DLSSNR_GPU_IMAGES");
+    return enabled && !strcmp(enabled, "1") && dc->gpuTransportCapable;
+}
+
+static void QuarantineGpuTransport(DeviceChain* dc, const char* why) {
+    dc->quarantinedEpoch = dc->timelineEpoch;
+    if (dc->shm.hdr) dc->shm.hdr->layerCompositionUp.store(0);
+    Log("[gpu-xfer] epoch %u quarantined: %s; original frames until a fresh helper", dc->timelineEpoch, why);
+}
+
+static bool EnsureGpuTimeline(DeviceChain* dc) {
+    ShmHeader* h = dc->shm.hdr;
+    if (!GpuImagesRequested(dc) || !h) return false;
+    const uint32_t epoch = h->gpuEpoch.load(std::memory_order_acquire);
+    const uint32_t ready = h->gpuTimelineReady.load(std::memory_order_acquire);
+    const uint32_t pid = h->gpuTimelinePid.load(), fd = h->gpuTimelineFd.load();
+    if (!epoch || !ready || epoch == dc->quarantinedEpoch) return false;
+    if (dc->transportTimeline && dc->timelineEpoch == epoch) {
+        if (dc->timelinePid != pid || dc->timelineFd != fd) {
+            QuarantineGpuTransport(dc, "descriptor changed inside one generation");
+            return false;
+        }
+        return true;
+    }
+    if (dc->transportTimeline) {
+        // Every old GPU wait was submitted only after its value had completed.
+        // This drain cannot depend on progress from the dead helper.
+        if (!NoteVk(dc, DeviceIdleLocked(dc), "vkDeviceWaitIdle(recover)")) return false;
+        for (auto& entry : dc->swapchains) {
+            auto& sc = entry.second;
+            if (sc.comp) { sc.comp->InvalidateXfer(); sc.comp->ForgetModelFrame(); }
+            sc.proxySeqSeen = sc.answerSeqSeen = 0;
+        }
+        dc->vkDestroySemaphore(dc->self, dc->transportTimeline, nullptr);
+        dc->transportTimeline = VK_NULL_HANDLE;
+        dc->timelineValue = 0;
+    }
+    int copy = AdoptPeerFd(pid, fd);
+    if (copy < 0) return false;
+    auto import = reinterpret_cast<PFN_vkImportSemaphoreFdKHR>(dc->next_dpa(dc->self, "vkImportSemaphoreFdKHR"));
+    if (!import) { close(copy); return false; }
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo ci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; ci.pNext = &type;
+    VkSemaphore semaphore{};
+    if (dc->vkCreateSemaphore(dc->self, &ci, nullptr, &semaphore) != VK_SUCCESS) { close(copy); return false; }
+    VkImportSemaphoreFdInfoKHR info{VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR}; info.semaphore = semaphore;
+    info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT; info.fd = copy;
+    if (import(dc->self, &info) != VK_SUCCESS) { close(copy); dc->vkDestroySemaphore(dc->self, semaphore, nullptr); return false; }
+    // The helper may have restarted while the descriptor was being duplicated.
+    if (h->gpuEpoch.load() != epoch || !h->gpuTimelineReady.load()) {
+        dc->vkDestroySemaphore(dc->self, semaphore, nullptr);
+        return false;
+    }
+    dc->transportTimeline = semaphore; dc->timelinePid = pid; dc->timelineFd = fd;
+    dc->timelineEpoch = epoch; dc->timelineValue = 0;
+    dc->shm.dead = false; dc->shm.timeouts = 0; dc->shm.everAnswered = false;
+    Log("[gpu-xfer] imported timeline epoch=%u pid=%u fd=%u", epoch, pid, fd);
+    return true;
+}
+
+static bool ModelTimelineCompleted(DeviceChain* dc, uint64_t value) {
+    auto counter = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(dc->next_dpa(dc->self, "vkGetSemaphoreCounterValue"));
+    uint64_t completed = 0;
+    return counter && counter(dc->self, dc->transportTimeline, &completed) == VK_SUCCESS && completed >= value;
+}
+
 // Three steps around one round trip. The pass encodes a proxy of the frame on the GPU, that proxy
 // crosses to the helper and comes back as the model's answer, and the pass composes the answer onto
 // the frame. The proxy's crossing is fenced on the CPU because the model is in another process and
 // there is nothing to wait on but a sequence number; the answer's return is not -- leg 2 and the
-// present are ordered by the queue itself, and the fence that covers leg 2 is only waited on at the
+// present are ordered by an image-owned semaphore; the fence covering leg 2 is only waited on at the
 // start of the NEXT frame, where the command buffer and the composed surfaces are reused.
 //
 // The caller's present semaphores are consumed by the first submit, because that submit is the first
 // thing to touch the image. They are therefore unsignalled by the time this returns and must not be
-// handed to vkQueuePresentKHR again; the caller presents with none.
+// handed to vkQueuePresentKHR again; the caller instead waits for presentReady after a successful compose.
 //
 // Every path out leaves the swapchain image in PRESENT_SRC_KHR, including the ones that give up.
 static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
                             VkImage swapchainImage, uint32_t waitCount,
                             const VkSemaphore* waitSemaphores, bool repaint,
-                            bool* waitsConsumed) {
+                            bool* waitsConsumed, VkSemaphore presentReady) {
     if (waitsConsumed) *waitsConsumed = false;
     if (!sc.comp) return false;
     VkDevice d = dc->self;
@@ -1474,8 +1644,8 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
 
     // Point the transport at the shared-memory regions before Prepare sizes anything, so the first
     // frame at a new raster imports the mapping instead of building staging that then has to be
-    // thrown away. The regions are mapped at the model's own size, which is what the GPU copies
-    // into and out of.
+    // thrown away. Only the current model's bytes are imported, even when the mapping reserves
+    // the protocol's maximum range to keep its addresses stable across resolution changes.
     if (dc->shm.hdr && ShmOpen(dc->shm)) {
         uint32_t mw = 0, mh = 0;
         dlssnr::Composition::ModelExtent(sc.width, sc.height, fs, mw, mh);
@@ -1495,7 +1665,9 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     // or imported leaves that direction on the shared-memory transport, which is the arrangement
     // that shipped before. The flags written below say which surfaces this frame's bytes travel
     // through, and the helper honours them on exactly the frame they were set for.
-    sc.comp->SetDmaBuf(DmaBufEnabled());
+    const bool gpuTransport=EnsureGpuTimeline(dc);
+    if(dc->inert.load() || (GpuImagesRequested(dc) && !gpuTransport))return false;
+    sc.comp->SetDmaBuf(gpuTransport);
 
     if (!sc.comp->Prepare(sc.width, sc.height, sc.format, fs, linearHdr, hdrProxy, hdrTransfer)) {
         Log("[layer] composition cannot run here: %s", sc.comp->Reason());
@@ -1527,23 +1699,24 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         dc->shm.hdr->hdrActive.store(hdrActive ? 1u : 0u);
     }
 
-    if (sc.comp->DmaBuf() && dc->shm.hdr) {
-        ShmHeader* hdr = dc->shm.hdr;
-        const uint32_t ps = hdr->proxyExportSeq.load();
-        if (ps && ps != dc->proxySeqSeen) {
-            const int fd = AdoptPeerFd(hdr->proxyPid.load(), hdr->proxyFd.load());
-            if (fd >= 0 && sc.comp->ImportProxy(fd, sc.comp->ModelWidth(), sc.comp->ModelHeight()))
-                dc->proxySeqSeen = ps;
-        } else if (!ps) {
-            dc->proxySeqSeen = 0;
-        }
-        const uint32_t as = hdr->answerExportSeq.load();
-        if (as && as != dc->answerSeqSeen) {
-            const int fd = AdoptPeerFd(hdr->answerPid.load(), hdr->answerFd.load());
-            if (fd >= 0 && sc.comp->ImportAnswerFd(fd, sc.comp->ModelWidth(), sc.comp->ModelHeight()))
-                dc->answerSeqSeen = as;
-        } else if (!as) {
-            dc->answerSeqSeen = 0;
+    if (gpuTransport && dc->shm.hdr) {
+        ShmHeader* hdr=dc->shm.hdr;
+        const bool sameRaster=hdr->answeredW.load()==sc.comp->ModelWidth() && hdr->answeredH.load()==sc.comp->ModelHeight();
+        if(!sameRaster || hdr->gpuImageTransport.load()!=1){
+            sc.comp->InvalidateXfer();sc.proxySeqSeen=sc.answerSeqSeen=0;
+        } else {
+            const uint32_t ps=hdr->proxyExportSeq.load(),as=hdr->answerExportSeq.load();
+            if(ps && (ps!=sc.proxySeqSeen || !sc.comp->ProxyActive())){
+                int fd=AdoptPeerFd(hdr->proxyPid.load(),hdr->proxyFd.load());
+                if(fd>=0 && sc.comp->ImportProxy(fd,sc.comp->ModelWidth(),sc.comp->ModelHeight(),
+                    uint64_t(hdr->proxyAllocationHi.load())<<32|hdr->proxyAllocationLo.load(),hdr->proxyMemoryType.load()))sc.proxySeqSeen=ps;
+            }
+            if(as && (as!=sc.answerSeqSeen || !sc.comp->AnswerImported())){
+                int fd=AdoptPeerFd(hdr->answerPid.load(),hdr->answerFd.load());
+                if(fd>=0 && sc.comp->ImportAnswerFd(fd,sc.comp->ModelWidth(),sc.comp->ModelHeight(),
+                    uint64_t(hdr->answerAllocationHi.load())<<32|hdr->answerAllocationLo.load(),hdr->answerMemoryType.load()))sc.answerSeqSeen=as;
+            }
+            if(!ps || !as){sc.comp->InvalidateXfer();sc.proxySeqSeen=sc.answerSeqSeen=0;}
         }
     }
 
@@ -1551,11 +1724,11 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     // this frame writes and composes from are the same decision, not two that must agree. The
     // echo names the export sequence this process holds a reference at, so the helper reads the
     // fd path only for the very image the layer imported -- not a stale one behind a restart.
-    const bool answerViaFd = sc.comp->AnswerViaFd();
+    const bool answerViaFd = gpuTransport && sc.comp->AnswerImported();
     sc.comp->SetAnswerViaFd(answerViaFd);
     if (dc->shm.hdr) {
-        dc->shm.hdr->layerProxySeq.store(sc.comp->ProxyActive() ? dc->proxySeqSeen : 0u);
-        dc->shm.hdr->layerAnswerSeq.store(answerViaFd ? dc->answerSeqSeen : 0u);
+        dc->shm.hdr->layerProxySeq.store(sc.comp->ProxyActive() ? sc.proxySeqSeen : 0u);
+        dc->shm.hdr->layerAnswerSeq.store(answerViaFd ? sc.answerSeqSeen : 0u);
     }
 
     // A capture is asked for by writing a frame count into the header; taking it clears the request,
@@ -1586,15 +1759,30 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
         si.pWaitDstStageMask = nullptr;
     };
 
+    const uint64_t captureValue=dc->timelineValue+1,modelValue=dc->timelineValue+2,composeValue=dc->timelineValue+3;
+    if(gpuTransport && composeValue>UINT32_MAX){dc->inert=true;return false;}
+    VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    std::vector<VkSemaphore> gpuWaits;
+    if(waitCount)gpuWaits.assign(waitSemaphores,waitSemaphores+waitCount);
+    std::vector<uint64_t> waitValues(waitCount,0);
+    std::vector<VkPipelineStageFlags> gpuStages(waitCount,VK_PIPELINE_STAGE_TRANSFER_BIT);
+    if(gpuTransport){
+        if(dc->timelineValue){gpuWaits.push_back(dc->transportTimeline);waitValues.push_back(dc->timelineValue);gpuStages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);}
+        si.waitSemaphoreCount=uint32_t(gpuWaits.size());si.pWaitSemaphores=gpuWaits.data();si.pWaitDstStageMask=gpuStages.data();
+        timeline.waitSemaphoreValueCount=uint32_t(waitValues.size());timeline.pWaitSemaphoreValues=waitValues.data();
+        timeline.signalSemaphoreValueCount=1;timeline.pSignalSemaphoreValues=&captureValue;
+        si.pNext=&timeline;si.signalSemaphoreCount=1;si.pSignalSemaphores=&dc->transportTimeline;
+    }
+    bool firstSubmit=true;
     const auto endAndSubmit = [&](VkFence fence) {
-        if (!NoteVk(dc, dc->vkEndCommandBuffer(cb), "vkEndCommandBuffer")) return false;
-        if (!NoteVk(dc, dc->vkQueueSubmit(queue, 1, &si, fence), "vkQueueSubmit")) return false;
-        if (waitsConsumed && si.waitSemaphoreCount != 0) *waitsConsumed = true;
+        if (!NoteVk(dc, dc->vkEndCommandBuffer(cb), "vkEndCommandBuffer")) {if(gpuTransport)dc->inert=true;return false;}
+        if (!NoteVk(dc, QueueSubmitLocked(dc, queue, 1, &si, fence), "vkQueueSubmit")) {if(gpuTransport)dc->inert=true;return false;}
+        if (waitsConsumed && firstSubmit && waitCount) *waitsConsumed = true;
+        firstSubmit=false;
         return true;
     };
     const auto waitAndReset = [&](VkFence fence) {
-        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences"))
-            return false;
+        if (!NoteVk(dc, dc->vkWaitForFences(d, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences")) {if(gpuTransport)dc->inert=true;return false;}
         dc->vkResetFences(d, 1, &fence);
         return true;
     };
@@ -1614,26 +1802,48 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
     const double tCapture = time ? NowMs() : 0.0;
 
     // ---- the round trip ----
+    dc->shm.hdr->gpuWaitValue.store(gpuTransport?uint32_t(captureValue):0);
+    dc->shm.hdr->gpuSignalValue.store(gpuTransport?uint32_t(modelValue):0);
     if (!ShmProcessFrame(dc->shm, sc.comp->ModelWidth(), sc.comp->ModelHeight(), sc.comp->ModelBytes(),
                          sc.comp->ProxyPixels(), sc.comp->ModelPixels(), sc.comp->ProxyActive(),
-                         answerViaFd, sc.comp->HdrProxyActive())) {
+                         answerViaFd, sc.comp->HdrProxyActive(), gpuTransport ? dc->timelineEpoch : 0)) {
+        if(gpuTransport) QuarantineGpuTransport(dc, "request failed; no missing-answer GPU wait submitted");
         // Fail-open. Leg 1 already put the image back in PRESENT_SRC_KHR, so the original frame is
         // what gets presented and nothing else is owed.
+        return false;
+    }
+    if (gpuTransport && !ModelTimelineCompleted(dc, modelValue)) {
+        QuarantineGpuTransport(dc, "response precedes its completed GPU signal");
         return false;
     }
     sc.comp->MarkModelFrame();
     const double tHelper = time ? NowMs() : 0.0;
 
     // ---- leg 2: the answer, composed back ----
-    if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) return false;
+    if (!NoteVk(dc, dc->vkBeginCommandBuffer(cb, &bi), "vkBeginCommandBuffer")) {if(gpuTransport)dc->inert=true;return false;}
     if (!sc.comp->RecordCompose(cb, swapchainImage, fs)) {
+        if(gpuTransport)dc->inert=true;
         dc->vkEndCommandBuffer(cb);
         return false;
     }
-    // No wait. The present that follows runs on this same queue behind these commands, so the image
-    // is composed before it is shown without the CPU ever parking here; the fence is collected at
-    // the top of the next frame, where the reused surfaces actually need it.
+    // Queue order alone does not make presentation wait for composition. The
+    // image-owned binary semaphore orders that read; the fence still protects
+    // the reusable command buffer and composition surfaces on the next frame.
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &presentReady;
+    VkSemaphore gpuSignals[2]={presentReady,dc->transportTimeline};
+    uint64_t signalValues[2]={0,composeValue};
+    VkPipelineStageFlags gpuStage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    if(gpuTransport){
+        timeline.waitSemaphoreValueCount=1;timeline.pWaitSemaphoreValues=&modelValue;
+        timeline.signalSemaphoreValueCount=2;timeline.pSignalSemaphoreValues=signalValues;
+        si.waitSemaphoreCount=1;si.pWaitSemaphores=&dc->transportTimeline;si.pWaitDstStageMask=&gpuStage;
+        si.signalSemaphoreCount=2;si.pSignalSemaphores=gpuSignals;
+    }
     if (!endAndSubmit(sc.fenceLeg2)) return false;
+    if(gpuTransport){dc->timelineValue=composeValue;
+        if(dc->framesComposed<5)Log("[gpu-xfer] frame proxy=%d answer=%d timeline=%llu",int(sc.comp->ProxyActive()),int(answerViaFd),(unsigned long long)composeValue);
+    }
     sc.leg2Pending = true;
     const double tReturn = time ? NowMs() : 0.0;
 
@@ -1662,38 +1872,28 @@ static bool ProcessPresent(DeviceChain* dc, SwapchainState& sc, VkQueue queue,
 
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
                                                             const VkPresentInfoKHR* pPresentInfo) {
-    DeviceChain* dc = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(g_stateMutex);
-        if (g_devices.size() == 1) dc = g_devices.begin()->second;
-        else {
-            for (auto& kv : g_devices) {
-                std::lock_guard<std::mutex> dl(kv.second->lock);
-                if (kv.second->queueFamilies.count(queue)) { dc = kv.second; break; }
-            }
-        }
-    }
+    DeviceChain* dc = DeviceForQueue(queue);
     if (!dc || !dc->vkQueuePresentKHR) return VK_ERROR_INITIALIZATION_FAILED;
     dc->lastPresentMs.store(NowMs(), std::memory_order_relaxed);
 
     // Whether this call's wait semaphores have already been consumed by a submit of ours. They are
-    // handed to the first swapchain we actually process; every path after that presents with none,
+    // handed to the first swapchain we actually process; later paths replace them with our completion waits,
     // because a semaphore signalled once may only be waited on once. Presenting with them a second
     // time is a wait that never completes -- which is what a second layer in the chain, Steam's
     // overlay among them, turns from a latent bug into a hang.
     bool waitsConsumed = false;
+    std::vector<VkSemaphore> presentWaits;
 
-    // Held from here to the present at the end, alongside Hook_QueueSubmit{,2}. Vulkan requires
-    // external synchronization for every operation on a queue; the repaint uses the application's
-    // queue, so its acquire/submit/present must not overlap Dolphin's GPU submission thread.
+    // Serialize model history and composition lifetime. Queue operations hold a
+    // separate short lease, so unrelated rendering can progress during inference.
+    // Actual Vulkan Present remains synchronous; no caller pointers outlive this call.
     std::unique_lock<std::mutex> lk;
     if (!dc->inert && LayerEnabled()) {
         lk = std::unique_lock<std::mutex>(dc->lock);
         PollHotkeys(dc);
-        if (!ShmNeuralEnabled(dc->shm)) return dc->vkQueuePresentKHR(queue, pPresentInfo);
-        uint32_t family = 0;
-        auto qit = dc->queueFamilies.find(queue);
-        if (qit != dc->queueFamilies.end()) family = qit->second;
+        if (!ShmNeuralEnabled(dc->shm)) return QueuePresentLocked(dc, queue, pPresentInfo);
+        const uint32_t family = QueueFamily(queue);
+        if (family == UINT32_MAX) return QueuePresentLocked(dc, queue, pPresentInfo);
         for (uint32_t i = 0; i < pPresentInfo->swapchainCount; ++i) {
             auto sit = dc->swapchains.find(pPresentInfo->pSwapchains[i]);
             if (sit == dc->swapchains.end()) continue;
@@ -1729,8 +1929,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
             bool submittedWaits = false;
             const bool composed = ProcessPresent(dc, sc, queue, sc.images[pPresentInfo->pImageIndices[i]],
                                                  waitCount, pPresentInfo->pWaitSemaphores,
-                                                 /*repaint=*/false, &submittedWaits);
+                                                 /*repaint=*/false, &submittedWaits,
+                                                 sc.presentReady[pPresentInfo->pImageIndices[i]]);
             waitsConsumed = waitsConsumed || submittedWaits;
+            if (composed) presentWaits.push_back(sc.presentReady[pPresentInfo->pImageIndices[i]]);
             if (!composed) ++dc->framesPassedThrough;
             if (VerboseEnabled()) {
                 Log("[present] swapchain=%p image=%u seq=%u composed=%d",
@@ -1750,46 +1952,38 @@ static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueuePresentKHR(VkQueue queue,
         }
     }
 
-    if (!waitsConsumed) return dc->vkQueuePresentKHR(queue, pPresentInfo);
+    if (!waitsConsumed && presentWaits.empty()) return QueuePresentLocked(dc, queue, pPresentInfo);
+    if (!waitsConsumed && pPresentInfo->waitSemaphoreCount)
+        presentWaits.insert(presentWaits.end(), pPresentInfo->pWaitSemaphores,
+                           pPresentInfo->pWaitSemaphores + pPresentInfo->waitSemaphoreCount);
 
     // pNext is carried through untouched: present ids, present timing and the rest belong to the
     // caller and none of them are about semaphores.
     VkPresentInfoKHR pi = *pPresentInfo;
-    pi.waitSemaphoreCount = 0;
-    pi.pWaitSemaphores = nullptr;
-    return dc->vkQueuePresentKHR(queue, &pi);
-}
-
-static DeviceChain* DeviceForQueue(VkQueue queue) {
-    std::lock_guard<std::mutex> lk(g_stateMutex);
-    if (g_devices.size() == 1) return g_devices.begin()->second;
-    for (auto& kv : g_devices) {
-        std::lock_guard<std::mutex> dl(kv.second->lock);
-        if (kv.second->queueFamilies.count(queue)) return kv.second;
-    }
-    return nullptr;
+    pi.waitSemaphoreCount = uint32_t(presentWaits.size());
+    pi.pWaitSemaphores = presentWaits.empty() ? nullptr : presentWaits.data();
+    return QueuePresentLocked(dc, queue, &pi);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueSubmit(VkQueue queue, uint32_t submitCount,
                                                         const VkSubmitInfo* pSubmits, VkFence fence) {
     DeviceChain* dc = DeviceForQueue(queue);
     if (!dc || !dc->vkQueueSubmit) return VK_ERROR_INITIALIZATION_FAILED;
-    std::lock_guard<std::mutex> lk(dc->lock);
-    return dc->vkQueueSubmit(queue, submitCount, pSubmits, fence);
+    return QueueSubmitLocked(dc, queue, submitCount, pSubmits, fence);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueSubmit2(VkQueue queue, uint32_t submitCount,
                                                          const VkSubmitInfo2* pSubmits, VkFence fence) {
     DeviceChain* dc = DeviceForQueue(queue);
     if (!dc || !dc->vkQueueSubmit2) return VK_ERROR_INITIALIZATION_FAILED;
-    std::lock_guard<std::mutex> lk(dc->lock);
+    dlssnr::QueueSynchronization<VkQueue>::QueueLease lease(dc->queueSync, queue);
     return dc->vkQueueSubmit2(queue, submitCount, pSubmits, fence);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL Hook_QueueWaitIdle(VkQueue queue) {
     DeviceChain* dc = DeviceForQueue(queue);
     if (!dc || !dc->vkQueueWaitIdle) return VK_ERROR_INITIALIZATION_FAILED;
-    std::lock_guard<std::mutex> lk(dc->lock);
+    dlssnr::QueueSynchronization<VkQueue>::QueueLease lease(dc->queueSync, queue);
     return dc->vkQueueWaitIdle(queue);
 }
 
@@ -1824,6 +2018,7 @@ static PFN_vkVoidFunction LookupHook(const char* n) {
     if (!std::strcmp(n, "vkQueueSubmit")) return (PFN_vkVoidFunction)Hook_QueueSubmit;
     if (!std::strcmp(n, "vkQueueSubmit2")) return (PFN_vkVoidFunction)Hook_QueueSubmit2;
     if (!std::strcmp(n, "vkQueueWaitIdle")) return (PFN_vkVoidFunction)Hook_QueueWaitIdle;
+    if (!std::strcmp(n, "vkDeviceWaitIdle")) return (PFN_vkVoidFunction)Hook_DeviceWaitIdle;
     if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
     return nullptr;
 }
@@ -1838,6 +2033,7 @@ static PFN_vkVoidFunction LookupDeviceHook(const char* n) {
     if (!std::strcmp(n, "vkQueueSubmit")) return (PFN_vkVoidFunction)Hook_QueueSubmit;
     if (!std::strcmp(n, "vkQueueSubmit2")) return (PFN_vkVoidFunction)Hook_QueueSubmit2;
     if (!std::strcmp(n, "vkQueueWaitIdle")) return (PFN_vkVoidFunction)Hook_QueueWaitIdle;
+    if (!std::strcmp(n, "vkDeviceWaitIdle")) return (PFN_vkVoidFunction)Hook_DeviceWaitIdle;
     if (!std::strcmp(n, "vkQueuePresentKHR")) return (PFN_vkVoidFunction)Hook_QueuePresentKHR;
     return nullptr;
 }

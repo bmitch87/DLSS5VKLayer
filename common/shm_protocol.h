@@ -37,7 +37,7 @@ static constexpr uint32_t kShmMagic = 0x32524E47;
 // 64 KiB because VK_EXT_external_memory_host demands the imported pointer meet
 // minImportedHostPointerAlignment and NVIDIA answers 64 KiB, and the dma-buf exchange and HDR
 // and round-trip attribution. A stale mapping of either lineage must be re-created, not half-read.
-static constexpr uint32_t kShmVersion = 20;
+static constexpr uint32_t kShmVersion = 23;
 
 
 static constexpr uint32_t kMaxW = 7680, kMaxH = 4320;
@@ -532,6 +532,14 @@ struct ShmHeader {
     // passes at higher memory and bandwidth cost.
     std::atomic<uint32_t> sdr16Multipass;
     std::atomic<uint32_t> mvecPixelSize;
+    // Private v21: OPAQUE_FD imports must reuse the exporter's allocation and type.
+    std::atomic<uint32_t> gpuTimelineFd, gpuTimelinePid, gpuTimelineReady, gpuWaitValue, gpuSignalValue;
+    std::atomic<uint32_t> gpuImageTransport; // 1: Win32 export / native opaque fd
+    std::atomic<uint32_t> proxyAllocationLo, proxyAllocationHi, proxyMemoryType;
+    std::atomic<uint32_t> answerAllocationLo, answerAllocationHi, answerMemoryType;
+    // Private v23: requests and answers belong to exactly one helper incarnation.
+    std::atomic<uint32_t> gpuEpoch, gpuRequestEpoch, gpuResponseEpoch;
+
 
 };
 
@@ -548,7 +556,7 @@ static_assert(sizeof(ShmHeader) <= kHeaderBytes, "ShmHeader outgrew its region")
 // The version check already existed to prevent exactly that; what was missing was anything to make
 // someone remember to use it. If these fire, the layout changed: bump kShmVersion in the same commit,
 // then update these numbers.
-static_assert(sizeof(ShmHeader) == 1968, "the header layout changed -- bump kShmVersion");
+static_assert(sizeof(ShmHeader) == 2028, "the header layout changed -- bump kShmVersion");
 
 static_assert(offsetof(ShmHeader, enabled) == 44, "layout changed -- bump kShmVersion");
 static_assert(offsetof(ShmHeader, transferStrengthBits) == 88, "layout changed -- bump kShmVersion");
@@ -614,7 +622,10 @@ inline void ShmResetSettings(ShmHeader* h) {
         uint32_t proxyExportSeq, proxyPid, proxyFd, proxyGen;
         uint32_t answerExportSeq, answerPid, answerFd, answerGen;
         uint32_t layerProxySeq, layerAnswerSeq;
+        uint32_t gpuTimelineFd, gpuTimelinePid, gpuTimelineReady, gpuWaitValue, gpuSignalValue;
+        uint32_t gpuImageTransport, proxyAllocationLo, proxyAllocationHi, proxyMemoryType, answerAllocationLo, answerAllocationHi, answerMemoryType;
         uint32_t hdrDetected, hdrActive, proxyFormat, hdrEncode;
+        uint32_t gpuEpoch, gpuRequestEpoch, gpuResponseEpoch;
     } v;
 #define DLSSNR_SAVE(f) v.f = h->f.load()
     DLSSNR_SAVE(seq_req); DLSSNR_SAVE(seq_resp); DLSSNR_SAVE(width); DLSSNR_SAVE(height);
@@ -629,6 +640,9 @@ inline void ShmResetSettings(ShmHeader* h) {
     DLSSNR_SAVE(layerCompositionUp); DLSSNR_SAVE(layerMsBits); DLSSNR_SAVE(layerMeasuredWhiteBits);
     DLSSNR_SAVE(layerHeartbeat); DLSSNR_SAVE(layerReasonSeq); DLSSNR_SAVE(gameNameSeq);
     DLSSNR_SAVE(answeredW); DLSSNR_SAVE(answeredH);
+    DLSSNR_SAVE(gpuTimelineFd); DLSSNR_SAVE(gpuTimelinePid); DLSSNR_SAVE(gpuTimelineReady); DLSSNR_SAVE(gpuWaitValue); DLSSNR_SAVE(gpuSignalValue);
+    DLSSNR_SAVE(gpuEpoch); DLSSNR_SAVE(gpuRequestEpoch); DLSSNR_SAVE(gpuResponseEpoch);
+    DLSSNR_SAVE(gpuImageTransport); DLSSNR_SAVE(proxyAllocationLo); DLSSNR_SAVE(proxyAllocationHi); DLSSNR_SAVE(proxyMemoryType); DLSSNR_SAVE(answerAllocationLo); DLSSNR_SAVE(answerAllocationHi); DLSSNR_SAVE(answerMemoryType);
     DLSSNR_SAVE(proxyExportSeq); DLSSNR_SAVE(proxyPid); DLSSNR_SAVE(proxyFd); DLSSNR_SAVE(proxyGen);
     DLSSNR_SAVE(answerExportSeq); DLSSNR_SAVE(answerPid); DLSSNR_SAVE(answerFd);
     DLSSNR_SAVE(answerGen); DLSSNR_SAVE(layerProxySeq); DLSSNR_SAVE(layerAnswerSeq);
@@ -653,6 +667,9 @@ inline void ShmResetSettings(ShmHeader* h) {
     DLSSNR_LOAD(layerCompositionUp); DLSSNR_LOAD(layerMsBits); DLSSNR_LOAD(layerMeasuredWhiteBits);
     DLSSNR_LOAD(layerHeartbeat); DLSSNR_LOAD(layerReasonSeq); DLSSNR_LOAD(gameNameSeq);
     DLSSNR_LOAD(answeredW); DLSSNR_LOAD(answeredH);
+    DLSSNR_LOAD(gpuTimelineFd); DLSSNR_LOAD(gpuTimelinePid); DLSSNR_LOAD(gpuTimelineReady); DLSSNR_LOAD(gpuWaitValue); DLSSNR_LOAD(gpuSignalValue);
+    DLSSNR_LOAD(gpuEpoch); DLSSNR_LOAD(gpuRequestEpoch); DLSSNR_LOAD(gpuResponseEpoch);
+    DLSSNR_LOAD(gpuImageTransport); DLSSNR_LOAD(proxyAllocationLo); DLSSNR_LOAD(proxyAllocationHi); DLSSNR_LOAD(proxyMemoryType); DLSSNR_LOAD(answerAllocationLo); DLSSNR_LOAD(answerAllocationHi); DLSSNR_LOAD(answerMemoryType);
     DLSSNR_LOAD(proxyExportSeq); DLSSNR_LOAD(proxyPid); DLSSNR_LOAD(proxyFd); DLSSNR_LOAD(proxyGen);
     DLSSNR_LOAD(answerExportSeq); DLSSNR_LOAD(answerPid); DLSSNR_LOAD(answerFd);
     DLSSNR_LOAD(answerGen); DLSSNR_LOAD(layerProxySeq); DLSSNR_LOAD(layerAnswerSeq);

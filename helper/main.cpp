@@ -1,3 +1,4 @@
+#include "../common/scene_sample_grid.h"
 // dlssnr_helper.exe — Windows-side DLSSNR (Feature 18) service.
 // Owns its own Vulkan device + the nvngx_dlssnr.dll snippet (verified
 // standalone_runner sequence), waits on the shared-memory frame queue written
@@ -17,6 +18,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <vector>
+#include <vulkan/vulkan_win32.h>
 
 using namespace dlssnr;
 
@@ -117,17 +119,21 @@ static bool ShmOpen(ShmMap& s) {
     }
     if (s.hdr->quit.load()) Log("[helper] clearing stale quit flag");
     s.hdr->quit.store(0);
-    // Pick up where the layer is, without claiming a frame this helper never answered. A response
-    // that runs ahead of the request is a stale mapping; a response that matches a request the old
-    // helper never marked good would tell the layer to compose a frame that was never produced.
-    {
-        const uint32_t req = s.hdr->seq_req.load();
-        const uint32_t resp = s.hdr->seq_resp.load();
-        const uint32_t ok = s.hdr->seq_ok.load();
-        if (resp > req) s.hdr->seq_resp.store(req);
-        else if (req > 0 && resp == req && ok < req) s.hdr->seq_resp.store(req - 1);
-        else s.hdr->seq_resp.store(req);
-    }
+    // Retire the previous incarnation before publishing any new descriptor. Old requests
+    // are cancelled, never replayed against this process's fresh timeline or model history.
+    s.hdr->gpuTimelineReady.store(0, std::memory_order_release);
+    s.hdr->gpuImageTransport.store(0);
+    s.hdr->proxyExportSeq.store(0); s.hdr->answerExportSeq.store(0);
+    s.hdr->layerProxySeq.store(0); s.hdr->layerAnswerSeq.store(0);
+    s.hdr->seq_ok.store(0);
+    s.hdr->modelUp.store(0);
+    s.hdr->answeredW.store(0); s.hdr->answeredH.store(0);
+    s.hdr->gpuResponseEpoch.store(0);
+    s.hdr->gpuRequestEpoch.store(0);
+    uint32_t epoch = s.hdr->gpuEpoch.load() + 1;
+    if (!epoch) epoch = 1;
+    s.hdr->gpuEpoch.store(epoch, std::memory_order_release);
+    s.hdr->seq_resp.store(s.hdr->seq_req.load());
     // Announced before anything slow happens. The first frame at a new size makes the model load a
     // 165 MB library and build a feature -- hundreds of milliseconds at least -- during which this
     // process ticks no heartbeat because it is busy. A layer inferring liveness from heartbeats alone
@@ -229,6 +235,10 @@ struct VkCtx {
     // names in the shared header. The layer takes its own reference through pidfd_getfd.
     // The export fds stay open for as long as the images do; the layer's open is a fresh one.
     bool dmaBuf = false;
+    VkSemaphore transportTimeline=VK_NULL_HANDLE;
+    int timelineFd=-1;
+    VkDeviceSize proxyAllocation=0, answerAllocation=0;
+    uint32_t proxyMemoryType=0, answerMemoryType=0;
     uint32_t linuxPid = 0;
     GpuImage proxyIn{};
     int proxyExportFd = -1;
@@ -394,7 +404,7 @@ static bool CreateContext(VkCtx& c) {
                            "VK_KHR_synchronization2", VK_NV_OPTICAL_FLOW_EXTENSION_NAME,
                            VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME,
                            VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-                           VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME })
+                           VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, "VK_KHR_external_memory_win32", "VK_KHR_external_semaphore_win32" })
         if (HasDeviceExt(c.physical, e)) enabled.push_back(e);
     c.sync2 = HasDeviceExt(c.physical, "VK_KHR_synchronization2");
     VkPhysicalDeviceOpticalFlowFeaturesNV flowFeatures{};
@@ -408,6 +418,10 @@ static bool CreateContext(VkCtx& c) {
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     if (c.opticalFlow) dci.pNext = &flowFeatures;
     else if (c.sync2) dci.pNext = &sync2Features;
+    VkPhysicalDeviceTimelineSemaphoreFeatures timelineFeature{};
+    timelineFeature.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+    timelineFeature.timelineSemaphore=VK_TRUE;timelineFeature.pNext=const_cast<void*>(dci.pNext);
+    dci.pNext=&timelineFeature;
     dci.queueCreateInfoCount = (uint32_t)qcis.size();
     dci.pQueueCreateInfos = qcis.data();
     dci.enabledExtensionCount = (uint32_t)enabled.size();
@@ -729,18 +743,132 @@ static bool ImportTransport(VkCtx& c, void* in, void* out, size_t bytes) {
 // Build an RGBA8 image in memory that can leave this process as a dma-buf, and hand out the fd.
 // The fd stays open here: the layer opens its own reference through /proc, and the number must
 // stay meaningful until the image is rebuilt.
+struct ProbeBridgeHeader {
+    std::atomic<uint32_t> magic,pid,request;
+    std::atomic<int32_t> fd;
+    std::atomic<uint32_t> response;
+    std::atomic<int32_t> result,after;
+    std::atomic<uint32_t> quit;
+};
+static_assert(sizeof(ProbeBridgeHeader)==32,"IPC layout");
+static ProbeBridgeHeader* probeBridge=nullptr;
+static HANDLE probeBridgeFile=INVALID_HANDLE_VALUE,probeBridgeMapping=nullptr;
+
+static bool OpenProbeBridge(){
+    if(probeBridge)return true;
+    const char* shm=getenv("DLSSNR_SHM");if(!shm)return false;
+    std::string path=shm;if(path[0]=='/')path="Z:"+path;path+=".unix";
+    if (const char* id = getenv("DLSSNR_UNIX_BRIDGE_ID")) { path += "."; path += id; }
+    for(int i=0;i<250;i++){
+        probeBridgeFile=CreateFileA(path.c_str(),GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,0,nullptr);
+        if(probeBridgeFile!=INVALID_HANDLE_VALUE)break;Sleep(20);
+    }
+    if(probeBridgeFile==INVALID_HANDLE_VALUE)return false;
+    probeBridgeMapping=CreateFileMappingA(probeBridgeFile,nullptr,PAGE_READWRITE,0,4096,nullptr);
+    if(!probeBridgeMapping)return false;
+    probeBridge=static_cast<ProbeBridgeHeader*>(MapViewOfFile(probeBridgeMapping,FILE_MAP_READ|FILE_MAP_WRITE,0,0,4096));
+    if(!probeBridge)return false;
+    for(int i=0;i<250;i++){if(probeBridge->magic.load(std::memory_order_acquire)==0x42524731)return true;Sleep(20);}
+    return false;
+}
+static bool CloseProbeFd(int fd){
+    if(!OpenProbeBridge())return false;
+    uint32_t seq=probeBridge->request.load()+1;
+    probeBridge->fd.store(fd);probeBridge->request.store(seq,std::memory_order_release);
+    for(int i=0;i<1000;i++){
+        if(probeBridge->response.load(std::memory_order_acquire)==seq){
+            int result=probeBridge->result.load(),after=probeBridge->after.load();
+            Log("[interop-shim] close fd=%d result=%d fcntl-after=%d",fd,result,after);
+            return result==0&&after==-9;
+        }
+        Sleep(1);
+    }
+    Log("[interop-shim] close fd=%d timed out",fd);return false;
+}
+static bool BeginCmd(VkCommandBuffer cb);
+static bool SubmitAndWait(VkCtx& c, VkCommandBuffer cb);
+
+// Proton shared-resource handle -> owned Unix descriptor. Windows handles remain ours.
+static int ExportUnixResourceFd(HANDLE shared) {
+    using ToFd = LONG (__cdecl *)(HANDLE,unsigned int,int*,unsigned int*);
+    auto toFd=reinterpret_cast<ToFd>(GetProcAddress(GetModuleHandleA("ntdll.dll"),"wine_server_handle_to_fd"));
+    if(!toFd)return -1;
+    DWORD resource=0,bytes=0;
+    BOOL ok=DeviceIoControl(shared,CTL_CODE(FILE_DEVICE_VIDEO,3,METHOD_BUFFERED,FILE_READ_ACCESS),nullptr,0,&resource,sizeof(resource),&bytes,nullptr);
+    if(!ok||bytes!=sizeof(resource))return -1;
+    HANDLE handle=reinterpret_cast<HANDLE>(intptr_t(int32_t(resource)));int fd=-1;
+    if(toFd(handle,FILE_READ_DATA,&fd,nullptr)!=0)fd=-1;
+    CloseHandle(handle);return fd;
+}
+static int ExportUnixMemoryFd(VkCtx& c,VkDeviceMemory memory) {
+    auto getHandle=reinterpret_cast<PFN_vkGetMemoryWin32HandleKHR>(g_gipa(c.instance,"vkGetMemoryWin32HandleKHR"));
+    if(!getHandle)return -1;
+    VkMemoryGetWin32HandleInfoKHR info{};info.sType=VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
+    info.memory=memory;info.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    HANDLE handle=nullptr;if(getHandle(c.device,&info,&handle)!=VK_SUCCESS)return -1;
+    int fd=ExportUnixResourceFd(handle);CloseHandle(handle);return fd;
+}
+// Private v22 transport. One exclusive producer; monotonically increasing values.
+static bool CreateGpuTimeline(VkCtx& c, ShmHeader* hdr) {
+    VkSemaphoreTypeCreateInfo type{};type.sType=VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    type.semaphoreType=VK_SEMAPHORE_TYPE_TIMELINE;
+    VkExportSemaphoreCreateInfo ex{};ex.sType=VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+    ex.pNext=&type;ex.handleTypes=VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    VkSemaphoreCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;ci.pNext=&ex;
+    if(vkCreateSemaphore(c.device,&ci,nullptr,&c.transportTimeline)!=VK_SUCCESS)return false;
+    auto getHandle=reinterpret_cast<PFN_vkGetSemaphoreWin32HandleKHR>(g_gipa(c.instance,"vkGetSemaphoreWin32HandleKHR"));
+    if(!getHandle)return false;
+    VkSemaphoreGetWin32HandleInfoKHR info{};info.sType=VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR;
+    info.semaphore=c.transportTimeline;info.handleType=VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+    HANDLE handle=nullptr;if(getHandle(c.device,&info,&handle)!=VK_SUCCESS)return false;
+    c.timelineFd=ExportUnixResourceFd(handle);CloseHandle(handle);
+    if(c.timelineFd<0)return false;
+    hdr->gpuTimelinePid.store(c.linuxPid);hdr->gpuTimelineFd.store(c.timelineFd);
+    hdr->gpuTimelineReady.store(1,std::memory_order_release);
+    return true;
+}
+static bool TimelineBoundary(VkCtx& c,uint32_t waitValue,uint32_t signalValue) {
+    uint64_t wait=waitValue,signal=signalValue;
+    auto hostWait=reinterpret_cast<PFN_vkWaitSemaphores>(g_gipa(c.instance,"vkWaitSemaphores"));
+    // Fail before submitting a GPU wait for an unfulfilled dependency. This diagnostic path
+    // deliberately remains synchronous until pixel fidelity and failure handling are verified.
+    if(waitValue){
+        if(!hostWait)return false;
+        VkSemaphoreWaitInfo info{};info.sType=VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        info.semaphoreCount=1;info.pSemaphores=&c.transportTimeline;info.pValues=&wait;
+        if(hostWait(c.device,&info,2000000000ULL)!=VK_SUCCESS)return false;
+    }
+    VkTimelineSemaphoreSubmitInfo timeline{};timeline.sType=VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timeline.waitSemaphoreValueCount=waitValue?1:0;timeline.pWaitSemaphoreValues=&wait;
+    timeline.signalSemaphoreValueCount=signalValue?1:0;timeline.pSignalSemaphoreValues=&signal;
+    VkPipelineStageFlags stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo submit{};submit.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO;submit.pNext=&timeline;
+    submit.waitSemaphoreCount=waitValue?1:0;submit.pWaitSemaphores=&c.transportTimeline;submit.pWaitDstStageMask=&stage;
+    submit.signalSemaphoreCount=signalValue?1:0;submit.pSignalSemaphores=&c.transportTimeline;
+    VkFenceCreateInfo ci{};ci.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;VkFence fence{};
+    if(vkCreateFence(c.device,&ci,nullptr,&fence)!=VK_SUCCESS)return false;
+    VkResult result=vkQueueSubmit(c.queue,1,&submit,fence);
+    if(result==VK_SUCCESS)result=vkWaitForFences(c.device,1,&fence,VK_TRUE,2000000000ULL);
+    // Never destroy a fence still in flight. Timeout ends this private test process.
+    if(result==VK_TIMEOUT){Log("[gpu-xfer] boundary GPU timeout");ExitProcess(70);}
+    vkDestroyFence(c.device,fence,nullptr);
+    return result==VK_SUCCESS;
+}
+
 static bool CreateExportable(VkCtx& c, GpuImage& img, int& exportFd, uint32_t w, uint32_t h,
-                             VkFormat fmt, const char* what) {
+                             VkFormat fmt, const char* what, VkDeviceSize& allocation, uint32_t& memoryType) {
     if (img.image && img.width == w && img.height == h && img.format == fmt && exportFd >= 0)
         return true;
+    if (exportFd >= 0) {
+        int old=exportFd;exportFd=-1;
+        if(!CloseProbeFd(old))return false;
+    }
     DestroyImage2D(c, img);
-    if (exportFd >= 0) close(exportFd);
-    exportFd = -1;
-    if (!vkGetMemoryFdKHR || !w || !h) return false;
+    if (!OpenProbeBridge() || !w || !h) return false;
 
     VkExternalMemoryImageCreateInfo ext{};
     ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
     VkImageCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ci.pNext = &ext;
@@ -751,7 +879,7 @@ static bool CreateExportable(VkCtx& c, GpuImage& img, int& exportFd, uint32_t w,
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                VK_IMAGE_USAGE_SAMPLED_BIT;
-    ci.sharingMode = VK_SHARING_MODE_CONCURRENT;
+    ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (vkCreateImage(c.device, &ci, nullptr, &img.image) != VK_SUCCESS) return false;
     img.format = fmt;
@@ -761,9 +889,12 @@ static bool CreateExportable(VkCtx& c, GpuImage& img, int& exportFd, uint32_t w,
     vkGetImageMemoryRequirements(c.device, img.image, &req);
     uint32_t type = FindMemoryType(c, req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (type == UINT32_MAX) { DestroyImage2D(c, img); return false; }
-    VkExportMemoryAllocateInfo exp{};
+    VkMemoryDedicatedAllocateInfo dedicated{};
+    dedicated.sType=VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicated.image=img.image;
+    VkExportMemoryAllocateInfo exp{}; exp.pNext=&dedicated;
     exp.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-    exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     mai.pNext = &exp;
@@ -784,15 +915,21 @@ static bool CreateExportable(VkCtx& c, GpuImage& img, int& exportFd, uint32_t w,
         DestroyImage2D(c, img);
         return false;
     }
-    VkMemoryGetFdInfoKHR gfi{};
-    gfi.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-    gfi.memory = img.memory;
-    gfi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-    if (vkGetMemoryFdKHR(c.device, &gfi, &exportFd) != VK_SUCCESS) {
-        DestroyImage2D(c, img);
-        exportFd = -1;
-        return false;
-    }
+    exportFd = ExportUnixMemoryFd(c, img.memory);
+    if(exportFd<0){DestroyImage2D(c,img);return false;}
+    // Establish GENERAL and release ownership before publishing either descriptor.
+    if(!BeginCmd(c.cmdScratch)){DestroyImage2D(c,img);return false;}
+    VkImageMemoryBarrier barrier{};barrier.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout=VK_IMAGE_LAYOUT_UNDEFINED;barrier.newLayout=VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+    barrier.image=img.image;barrier.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+    vkCmdPipelineBarrier(c.cmdScratch,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,0,0,nullptr,0,nullptr,1,&barrier);
+    barrier.oldLayout=VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex=c.queueFamily;barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_EXTERNAL;
+    vkCmdPipelineBarrier(c.cmdScratch,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&barrier);
+    if(!SubmitAndWait(c,c.cmdScratch)){DestroyImage2D(c,img);return false;}
+    img.layout=VK_IMAGE_LAYOUT_GENERAL;
+    allocation=req.size;memoryType=type;
     Log("[fd] %s exportable %ux%u fd=%d", what, w, h, exportFd);
     return true;
 }
@@ -800,21 +937,26 @@ static bool CreateExportable(VkCtx& c, GpuImage& img, int& exportFd, uint32_t w,
 // Keep the proxy image at the current raster and publish its descriptor. The layer writes this
 // image; this process reads it. Returns true when the image exists at this size.
 static bool EnsureProxyOut(VkCtx& c, ShmHeader* hdr, uint32_t w, uint32_t h, VkFormat fmt) {
-    const bool sizeChanged = c.proxyIn.image &&
-                             (c.proxyIn.width != w || c.proxyIn.height != h || c.proxyIn.format != fmt);
-    if (!CreateExportable(c, c.proxyIn, c.proxyExportFd, w, h, fmt, "proxy")) {
+    const bool rebuilt = !c.proxyIn.image || c.proxyIn.width != w || c.proxyIn.height != h ||
+                         c.proxyIn.format != fmt || c.proxyExportFd < 0;
+    if (!CreateExportable(c, c.proxyIn, c.proxyExportFd, w, h, fmt, "proxy", c.proxyAllocation, c.proxyMemoryType)) {
         c.proxyW = c.proxyH = 0;
+        hdr->proxyExportSeq.store(0, std::memory_order_release);
         return false;
     }
     c.proxyW = w;
     c.proxyH = h;
-    if (sizeChanged || c.proxySeq == 0) {
+    if (rebuilt || c.proxySeq == 0) {
         ++c.proxyGen;
         ++c.proxySeq;
     }
     // Restate the descriptor whenever the header does not carry this sequence -- first frame,
     // rebuild, or a header re-initialised by another process under us.
     if (hdr->proxyExportSeq.load() != c.proxySeq) {
+        hdr->gpuImageTransport.store(1);
+        hdr->proxyAllocationLo.store(uint32_t(c.proxyAllocation));
+        hdr->proxyAllocationHi.store(uint32_t(c.proxyAllocation >> 32));
+        hdr->proxyMemoryType.store(c.proxyMemoryType);
         hdr->proxyPid.store(c.linuxPid);
         hdr->proxyFd.store(uint32_t(c.proxyExportFd));
         hdr->proxyGen.store(c.proxyGen);
@@ -825,20 +967,21 @@ static bool EnsureProxyOut(VkCtx& c, ShmHeader* hdr, uint32_t w, uint32_t h, VkF
 }
 
 static bool EnsureAnswerOut(VkCtx& c, ShmHeader* hdr, uint32_t w, uint32_t h, VkFormat fmt) {
-    const bool sizeChanged = c.answerOut.image &&
-                             (c.answerOut.width != w || c.answerOut.height != h || c.answerOut.format != fmt);
-    if (!CreateExportable(c, c.answerOut, c.answerExportFd, w, h, fmt, "answer")) {
-        if (c.answerOut.image == VK_NULL_HANDLE && hdr->answerExportSeq.load()) {
-            ++c.answerGen;
-            hdr->answerExportSeq.store(0);  // withdrawn: the layer must not open a stale number
-        }
+    const bool rebuilt = !c.answerOut.image || c.answerOut.width != w || c.answerOut.height != h ||
+                         c.answerOut.format != fmt || c.answerExportFd < 0;
+    if (!CreateExportable(c, c.answerOut, c.answerExportFd, w, h, fmt, "answer", c.answerAllocation, c.answerMemoryType)) {
+        hdr->answerExportSeq.store(0, std::memory_order_release);
         return false;
     }
-    if (sizeChanged || c.answerSeq == 0) {
+    if (rebuilt || c.answerSeq == 0) {
         ++c.answerGen;
         ++c.answerSeq;
     }
     if (hdr->answerExportSeq.load() != c.answerSeq) {
+        hdr->gpuImageTransport.store(1);
+        hdr->answerAllocationLo.store(uint32_t(c.answerAllocation));
+        hdr->answerAllocationHi.store(uint32_t(c.answerAllocation >> 32));
+        hdr->answerMemoryType.store(c.answerMemoryType);
         hdr->answerPid.store(c.linuxPid);
         hdr->answerFd.store(uint32_t(c.answerExportFd));
         hdr->answerGen.store(c.answerGen);
@@ -1209,6 +1352,9 @@ struct NeuralState {
     // Phase 5: set every frame the imported proxy covers this raster, so the upload reads the
     // layer's exported memory instead of the shared-memory region.
     bool proxyActive = false;
+    bool proxyPreloaded = false;
+    std::vector<VkBufferImageCopy> sceneSampleRegions;
+    uint32_t sceneSampleWidth = 0, sceneSampleHeight = 0;
 
     uint32_t w = 0, h = 0;
     bool ready = false;
@@ -1288,6 +1434,7 @@ static uint32_t FlowGridBitsToFactor(VkOpticalFlowGridSizeFlagsNV bit) {
 
 static VkOpticalFlowGridSizeFlagsNV ChooseFlowGrid(VkOpticalFlowGridSizeFlagsNV supported,
                                                    uint32_t w, uint32_t h, uint32_t requested) {
+    if (!w || !h || requested > 3) return VK_OPTICAL_FLOW_GRID_SIZE_UNKNOWN_NV;
     const VkOpticalFlowGridSizeFlagsNV sizes[] = {
         VK_OPTICAL_FLOW_GRID_SIZE_4X4_BIT_NV,
         VK_OPTICAL_FLOW_GRID_SIZE_8X8_BIT_NV,
@@ -1298,14 +1445,14 @@ static VkOpticalFlowGridSizeFlagsNV ChooseFlowGrid(VkOpticalFlowGridSizeFlagsNV 
     for (uint32_t i = 0; i < 4; ++i) {
         VkOpticalFlowGridSizeFlagsNV bit = sizes[i];
         uint32_t g = FlowGridBitsToFactor(bit);
-        if (g == wanted && (supported & bit) && (w % g) == 0 && (h % g) == 0) return bit;
+        if (g == wanted && (supported & bit)) return bit;
     }
     VkOpticalFlowGridSizeFlagsNV fallback = VK_OPTICAL_FLOW_GRID_SIZE_UNKNOWN_NV;
     uint32_t fallbackDistance = UINT32_MAX;
     for (uint32_t i = 0; i < 4; ++i) {
         VkOpticalFlowGridSizeFlagsNV bit = sizes[i];
         uint32_t g = FlowGridBitsToFactor(bit);
-        if ((supported & bit) && g && (w % g) == 0 && (h % g) == 0) {
+        if ((supported & bit) && g) {
             const uint32_t distance = g > wanted ? g - wanted : wanted - g;
             if (distance < fallbackDistance) {
                 fallback = bit;
@@ -1314,6 +1461,12 @@ static VkOpticalFlowGridSizeFlagsNV ChooseFlowGrid(VkOpticalFlowGridSizeFlagsNV 
         }
     }
     return fallback;
+}
+
+// Partial edge cells need a full output texel. Do not force an odd-sized
+// input onto the expensive 1x1 grid or change the user's model resolution.
+static uint32_t FlowGridExtent(uint32_t extent, uint32_t grid) {
+    return grid ? extent / grid + uint32_t(extent % grid != 0) : 0;
 }
 
 static bool QueryOpticalFlowFormat(VkCtx& c, VkOpticalFlowUsageFlagsNV usage,
@@ -1572,8 +1725,8 @@ static bool SetupOpticalFlow(VkCtx& c, NeuralState& ns, uint32_t w, uint32_t h, 
     const char* dirEnv = getenv("DLSSNR_MVEC_DIRECTION");
     f.currentToPrevious = !(dirEnv && dirEnv[0] == '0');
 
-    const uint32_t ow = w / f.grid;
-    const uint32_t oh = h / f.grid;
+    const uint32_t ow = FlowGridExtent(w, f.grid);
+    const uint32_t oh = FlowGridExtent(h, f.grid);
     if (!CreateImage2DOpticalFlow(c, f.inputFormat, w, h, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, f.prev) ||
         !CreateImage2DOpticalFlow(c, f.inputFormat, w, h, VK_OPTICAL_FLOW_USAGE_INPUT_BIT_NV, f.curr) ||
         !CreateImage2DOpticalFlow(c, f.flowFormat, ow, oh, VK_OPTICAL_FLOW_USAGE_OUTPUT_BIT_NV, f.out)) {
@@ -1821,15 +1974,15 @@ static void RecordProxyToColorIn(NeuralState& ns, VkCommandBuffer cb) {
     acq.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     acq.srcAccessMask = 0;
     acq.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    acq.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    acq.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    acq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
-    acq.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    acq.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    acq.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    acq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+    acq.dstQueueFamilyIndex = ns.vk.queueFamily;
     acq.image = ns.vk.proxyIn.image;
     acq.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
                          nullptr, 0, nullptr, 1, &acq);
-    ns.vk.proxyIn.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    ns.vk.proxyIn.layout = VK_IMAGE_LAYOUT_GENERAL;
     TransitionImage(ns.vk, cb, ns.colorIn, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1837,22 +1990,22 @@ static void RecordProxyToColorIn(NeuralState& ns, VkCommandBuffer cb) {
     cp.srcSubresource = { ns.vk.proxyIn.aspect(), 0, 0, 1 };
     cp.dstSubresource = { ns.colorIn.aspect(), 0, 0, 1 };
     cp.extent = { ns.colorIn.width, ns.colorIn.height, 1 };
-    vkCmdCopyImage(cb, ns.vk.proxyIn.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ns.colorIn.image,
+    vkCmdCopyImage(cb, ns.vk.proxyIn.image, VK_IMAGE_LAYOUT_GENERAL, ns.colorIn.image,
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
     // Hand the proxy back before the producer's next write touches it.
     VkImageMemoryBarrier prel{};
     prel.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     prel.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     prel.dstAccessMask = 0;
-    prel.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    prel.newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    prel.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    prel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+    prel.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    prel.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    prel.srcQueueFamilyIndex = ns.vk.queueFamily;
+    prel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
     prel.image = ns.vk.proxyIn.image;
     prel.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
                          0, nullptr, 0, nullptr, 1, &prel);
-    ns.vk.proxyIn.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    ns.vk.proxyIn.layout = VK_IMAGE_LAYOUT_GENERAL;
 }
 
 static bool RunOpticalFlow(NeuralState& ns) {
@@ -1874,7 +2027,7 @@ static bool RunOpticalFlow(NeuralState& ns) {
     if (!BeginCmd(ns.vk.cmdScratch)) return false;
     VkCommandBuffer cb = ns.vk.cmdScratch;
     if (ns.proxyActive) {
-        RecordProxyToColorIn(ns, cb);
+        if (!ns.proxyPreloaded) RecordProxyToColorIn(ns, cb);
     } else {
         TransitionImage(ns.vk, cb, ns.colorIn, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -2141,8 +2294,8 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
     }();
     if (!enabled || !in || !w || !h) return false;
 
-    const uint32_t gw = w < 64 ? w : 64;
-    const uint32_t gh = h < 36 ? h : 36;
+    const uint32_t gw = dlssnr::SceneGridWidth(w);
+    const uint32_t gh = dlssnr::SceneGridHeight(h);
     const size_t n = size_t(gw) * gh;
     bool sizeChanged = ns.prevLuma.size() != n || ns.lumaW != gw || ns.lumaH != gh;
     if (sizeChanged) {
@@ -2153,9 +2306,9 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
 
     uint64_t sum = 0;
     for (uint32_t y = 0; y < gh; ++y) {
-        uint32_t py = uint32_t((uint64_t(y) * h + gh / 2) / gh);
+        uint32_t py = dlssnr::SceneSampleCoordinate(y, h, gh);
         for (uint32_t x = 0; x < gw; ++x) {
-            uint32_t px = uint32_t((uint64_t(x) * w + gw / 2) / gw);
+            uint32_t px = dlssnr::SceneSampleCoordinate(x, w, gw);
             const uint8_t* p = in + (size_t(py) * w + px) * 4;
             uint32_t r = fmt == 0 ? p[2] : p[0];
             uint32_t g = fmt == 0 ? p[1] : p[1];
@@ -2174,6 +2327,50 @@ static bool DetectSceneCut(NeuralState& ns, const uint8_t* in, uint32_t w, uint3
     bool cut = ns.sceneCutStreak >= 2;
     if (cut) Log("[mvec] scene cut detected mean=%d threshold=%d streak=%u", mean, threshold, ns.sceneCutStreak);
     return cut;
+}
+
+// Preserve the host transport's detector exactly for GPU-only SDR input. Copy
+// colorIn once under the existing EXTERNAL ownership transfer, then read only
+// its original 64x36 sample positions. The flow stage consumes that same colorIn
+// without reacquiring the external image a second time. Coherent staging plus
+// the transfer-to-host barrier/fence makes the sampled bytes visible to the CPU.
+static bool PrepareProxySceneCut(NeuralState& ns, uint32_t w, uint32_t h, bool& cut) {
+    cut = false;
+    if (!w || !h || ns.colorIn.format != VK_FORMAT_R8G8B8A8_UNORM) return false;
+    const uint32_t gw = dlssnr::SceneGridWidth(w), gh = dlssnr::SceneGridHeight(h);
+    const size_t bytes = size_t(gw) * gh * 4;
+    if (!CreateStaging(ns.vk, bytes)) return false;
+    if (ns.sceneSampleWidth != w || ns.sceneSampleHeight != h) {
+        ns.sceneSampleRegions.assign(size_t(gw) * gh, {});
+        for (uint32_t y = 0; y < gh; ++y) for (uint32_t x = 0; x < gw; ++x) {
+            auto& region = ns.sceneSampleRegions[size_t(y) * gw + x];
+            region.bufferOffset = (size_t(y) * gw + x) * 4;
+            region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.imageOffset = { int32_t(dlssnr::SceneSampleCoordinate(x,w,gw)),
+                                   int32_t(dlssnr::SceneSampleCoordinate(y,h,gh)), 0 };
+            region.imageExtent = { 1, 1, 1 };
+        }
+        ns.sceneSampleWidth = w; ns.sceneSampleHeight = h;
+    }
+    if (!BeginCmd(ns.vk.cmdScratch)) return false;
+    const VkCommandBuffer cb = ns.vk.cmdScratch;
+    RecordProxyToColorIn(ns, cb);
+    TransitionImage(ns.vk, cb, ns.colorIn, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    vkCmdCopyImageToBuffer(cb, ns.colorIn.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                          ns.vk.readStaging, uint32_t(ns.sceneSampleRegions.size()), ns.sceneSampleRegions.data());
+    VkBufferMemoryBarrier host{};
+    host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    host.srcQueueFamilyIndex = host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    host.buffer = ns.vk.readStaging; host.offset = 0; host.size = bytes;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, nullptr, 1, &host, 0, nullptr);
+    if (!SubmitAndWait(ns.vk, cb)) return false;
+    ns.proxyPreloaded = true;
+    cut = DetectSceneCut(ns, static_cast<const uint8_t*>(ns.vk.readMap), gw, gh, 1);
+    return true;
 }
 
 static NgxTuning TuningFor(const ShmHeader* h, uint32_t pass) {
@@ -2502,17 +2699,7 @@ static void MaintainPasses(NeuralState& ns, ShmMap& shm, uint32_t wanted) {
 // keyed by, which is what the layer needs to open an exported fd. Wine's Z: drive is the host's
 // root, so the file is reachable through the ordinary file API.
 static uint32_t ReadLinuxPid() {
-    HANDLE h = CreateFileA("Z:\\proc\\self\\stat", GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    char buf[256];
-    DWORD got = 0;
-    const bool ok = ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr) && got > 0;
-    CloseHandle(h);
-    if (!ok) return 0;
-    buf[got] = '\0';
-    return (uint32_t)strtoul(buf, nullptr, 10);
+    return OpenProbeBridge() ? probeBridge->pid.load() : 0;
 }
 
 static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
@@ -2670,12 +2857,15 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         std::memcpy(ns.vk.uploadMap, shm.inPixels, bytes);
     }
 
-    // A cut is not motion. Carrying a flow field across one hands the model a field describing a
-    // scene that is no longer on screen, which is worse than handing it nothing. The CPU detector
-    // reads the shared-memory region, which the dma-buf path leaves unwritten, so it stands down
-    // while the fd path is live -- one frame of stale flow across a cut is the price of the copy.
-    const bool sceneCut = !ns.proxyActive && !hdrEncode &&
-                          DetectSceneCut(ns, shm.inPixels, w, h, 1);
+    // Both transports use the same detector and history. HDR retains the existing
+    // detector-off behavior; no threshold or model-quality setting is changed.
+    ns.proxyPreloaded = false;
+    bool sceneCut = false;
+    if (!hdrEncode) {
+        if (ns.proxyActive) {
+            if (!PrepareProxySceneCut(ns, w, h, sceneCut)) return false;
+        } else sceneCut = DetectSceneCut(ns, shm.inPixels, w, h, 1);
+    }
     if (sceneCut && !ns.firstFrame && ns.flow.enabled) {
         ns.flow.hasPrev = false;
         ns.pendingMvClear = true;  // zeroed inside the flow prep submit, GPU-side
@@ -2694,9 +2884,11 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
             ns.lastResetLogged = 0xFFFFFFFFu;
         }
     } else if (ns.proxyActive) {
-        if (!BeginCmd(ns.vk.cmdScratch)) return false;
-        RecordProxyToColorIn(ns, ns.vk.cmdScratch);
-        if (!SubmitAndWait(ns.vk, ns.vk.cmdScratch)) return false;
+        if (!ns.proxyPreloaded) {
+            if (!BeginCmd(ns.vk.cmdScratch)) return false;
+            RecordProxyToColorIn(ns, ns.vk.cmdScratch);
+            if (!SubmitAndWait(ns.vk, ns.vk.cmdScratch)) return false;
+        }
     } else if (!UploadMappedPixels(ns.vk, ns.colorIn, bytes, UploadSource(ns.vk))) {
         return false;
     }
@@ -2804,21 +2996,21 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         aacq.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         aacq.srcAccessMask = 0;
         aacq.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        aacq.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        aacq.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        aacq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
-        aacq.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        aacq.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        aacq.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        aacq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+        aacq.dstQueueFamilyIndex = ns.vk.queueFamily;
         aacq.image = ns.vk.answerOut.image;
         aacq.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                              0, nullptr, 0, nullptr, 1, &aacq);
-        ns.vk.answerOut.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        ns.vk.answerOut.layout = VK_IMAGE_LAYOUT_GENERAL;
         VkImageCopy cp{};
         cp.srcSubresource = { last->aspect(), 0, 0, 1 };
         cp.dstSubresource = { ns.vk.answerOut.aspect(), 0, 0, 1 };
         cp.extent = { w, h, 1 };
         vkCmdCopyImage(cb, last->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, ns.vk.answerOut.image,
-                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
         TransitionImage(ns.vk, cb, ns.vk.answerOut, VK_IMAGE_LAYOUT_GENERAL,
                         VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
@@ -2827,18 +3019,30 @@ static bool ProcessFrame(NeuralState& ns, ShmMap& shm) {
         rel.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         rel.dstAccessMask = 0;
         rel.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        rel.newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        rel.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        rel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+        rel.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        rel.srcQueueFamilyIndex = ns.vk.queueFamily;
+        rel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
         rel.image = ns.vk.answerOut.image;
         rel.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                              0, 0, nullptr, 0, nullptr, 1, &rel);
-        ns.vk.answerOut.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ns.vk.answerOut.layout = VK_IMAGE_LAYOUT_GENERAL;
         if (!SubmitAndWait(ns.vk, cb)) return false;
     } else {
         if (!ReadbackPixels(ns.vk, *last, bytes)) return false;
         if (!ns.vk.transportOut) std::memcpy(shm.outPixels, ns.vk.readMap, bytes);
+    }
+    if(getenv("DLSSNR_GPU_VERIFY") && (ns.proxyActive || fdAnswer)) {
+        if(ns.proxyActive) {
+            if(!ReadbackPixels(ns.vk,ns.colorIn,bytes))return false;
+            const void* inputRead=ns.vk.transportOut?static_cast<void*>(shm.outPixels):ns.vk.readMap;
+            const bool matches=std::memcmp(inputRead,shm.inPixels,bytes)==0;
+            Log("[gpu-verify] proxy matches=%d bytes=%zu",int(matches),bytes);
+            if(!matches)return false;
+        }
+        // Reference pixels from the exact same evaluation, independent of external image import.
+        if(!ReadbackPixels(ns.vk,*last,bytes))return false;
+        if(!ns.vk.transportOut)std::memcpy(shm.outPixels,ns.vk.readMap,bytes);
     }
     const double tDone = time ? NowMs() : 0.0;
 
@@ -2913,12 +3117,10 @@ int main() {
     {
         const char* env = getenv("DLSSNR_DMABUF");
         const bool want = !(env && !_stricmp(env, "0"));
-        if (want && vkGetMemoryFdKHR &&
-            HasDeviceExt(ns.vk.physical, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) &&
-            HasDeviceExt(ns.vk.physical, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
+        if (want && getenv("DLSSNR_GPU_IMAGES") && HasDeviceExt(ns.vk.physical, "VK_KHR_external_memory_win32")) {
             ns.vk.linuxPid = ReadLinuxPid();
             if (ns.vk.linuxPid) {
-                ns.vk.dmaBuf = true;
+                ns.vk.dmaBuf = CreateGpuTimeline(ns.vk,shm.hdr);
                 Log("[fd] dma-buf exchange ready (linux pid %u)", ns.vk.linuxPid);
             } else {
                 Log("[fd] could not read the linux pid; shared memory transport stays");
@@ -2928,6 +3130,7 @@ int main() {
     shm.hdr->helperState.store(kHelperRunning);
     Log("[helper] context ready, waiting for frames");
 
+    const uint32_t helperEpoch = shm.hdr->gpuEpoch.load();
     uint32_t lastReq = shm.hdr->seq_resp.load();
     while (!shm.hdr->quit.load()) {
         // Restated every pass, not announced once.
@@ -2963,8 +3166,18 @@ int main() {
         // The acquire pairs with the layer's release before seq_req: the proxy it wrote (by GPU into the
         // imported region, or by memcpy) is visible here before we read it.
         std::atomic_thread_fence(std::memory_order_acquire);
-        bool ok = ProcessFrame(ns, shm);
+        const uint32_t waitValue=shm.hdr->gpuWaitValue.load();
+        const uint32_t signalValue=shm.hdr->gpuSignalValue.load();
+        const uint32_t requestEpoch = shm.hdr->gpuRequestEpoch.load();
+        bool ok = shm.hdr->gpuEpoch.load() == helperEpoch;
+        if(ns.vk.dmaBuf && signalValue) {
+            ok=ok && requestEpoch==helperEpoch && signalValue>waitValue;
+            if(ok && waitValue)ok=TimelineBoundary(ns.vk,waitValue,0);
+        } else if(shm.hdr->layerProxySeq.load() || shm.hdr->layerAnswerSeq.load())ok=false;
+        if(ok)ok=ProcessFrame(ns, shm);
+        if(ns.vk.dmaBuf && signalValue && ok)ok=TimelineBoundary(ns.vk,0,signalValue);
         if (!ok) Log("[helper] frame %u failed (w=%u h=%u)", req, shm.hdr->width.load(), shm.hdr->height.load());
+        shm.hdr->gpuResponseEpoch.store(helperEpoch);
         shm.hdr->seq_ok.store(ok ? req : 0);
         // The release pairs with the layer's acquire on seq_resp: the answer -- written by the GPU
         // into the imported region or by the staging memcpy -- is visible before the number that
@@ -2980,14 +3193,22 @@ int main() {
 
     if (shm.hdr->quit.load()) Log("[helper] quit requested");
     else if (ns.ngx.disabled) Log("[helper] neural disabled");
+    shm.hdr->gpuTimelineReady.store(0, std::memory_order_release);
+    shm.hdr->gpuImageTransport.store(0);
+    shm.hdr->proxyExportSeq.store(0); shm.hdr->answerExportSeq.store(0);
     shm.hdr->helperState.store(kHelperStopped);
     Log("[helper] shutting down");
     if (ns.ngx.snippet) NgxTeardown(ns.ngx, ns.vk.device);
     vkDeviceWaitIdle(ns.vk.device);
     DestroyImage2D(ns.vk, ns.vk.proxyIn);
     DestroyImage2D(ns.vk, ns.vk.answerOut);
-    if (ns.vk.proxyExportFd >= 0) close(ns.vk.proxyExportFd);
-    if (ns.vk.answerExportFd >= 0) close(ns.vk.answerExportFd);
+    if (ns.vk.proxyExportFd >= 0) CloseProbeFd(ns.vk.proxyExportFd);
+    if (ns.vk.answerExportFd >= 0) CloseProbeFd(ns.vk.answerExportFd);
+    if(ns.vk.timelineFd>=0)CloseProbeFd(ns.vk.timelineFd);
+    if(ns.vk.transportTimeline)vkDestroySemaphore(ns.vk.device,ns.vk.transportTimeline,nullptr);
+    if(probeBridge){probeBridge->quit.store(1,std::memory_order_release);UnmapViewOfFile(probeBridge);probeBridge=nullptr;}
+    if(probeBridgeMapping)CloseHandle(probeBridgeMapping);
+    if(probeBridgeFile!=INVALID_HANDLE_VALUE)CloseHandle(probeBridgeFile);
     DestroyOpticalFlow(ns.vk, ns.flow);
     if (ns.vk.mvPipeLayout && vkDestroyPipelineLayout) vkDestroyPipelineLayout(ns.vk.device, ns.vk.mvPipeLayout, nullptr);
     if (ns.vk.mvDescLayout && vkDestroyDescriptorSetLayout) vkDestroyDescriptorSetLayout(ns.vk.device, ns.vk.mvDescLayout, nullptr);
