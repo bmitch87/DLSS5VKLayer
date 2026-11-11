@@ -168,8 +168,8 @@ class Composition {
 
     // Adopt one of the helper's exported images. The fd is consumed (or closed). Returns false if
     // it cannot be imported at this raster; the shared-memory path then carries that direction.
-    bool ImportProxy(int fd, uint32_t w, uint32_t h);
-    bool ImportAnswerFd(int fd, uint32_t w, uint32_t h);
+    bool ImportProxy(int fd, uint32_t w, uint32_t h, VkDeviceSize allocation, uint32_t memoryType);
+    bool ImportAnswerFd(int fd, uint32_t w, uint32_t h, VkDeviceSize allocation, uint32_t memoryType);
     // True when the imported answer covers the current model raster, so leg 2 can read it directly.
     bool AnswerImported() const {
         return _answerXfer.image != VK_NULL_HANDLE && _answerXfer.width == _modelW &&
@@ -180,6 +180,7 @@ class Composition {
     // The channel's readiness, restated every present: the exportable proxy is only built while it
     // is on, and leg 1 only writes it while it is on. Turning it off mid-run falls back to the
     // shared-memory transport on the next frame.
+    void SetExternalQueueFamily(uint32_t family) { _externalQueueFamily=family; }
     void SetDmaBuf(bool on) { _dmaBuf = on; }
     bool DmaBuf() const { return _dmaBuf; }
 
@@ -196,6 +197,7 @@ class Composition {
 
     bool HasModelFrame() const { return _haveModel; }
     void MarkModelFrame() { _haveModel = true; }
+    void ForgetModelFrame() { _haveModel = false; }
 
     // Write this many matched before/after pairs, starting with the next composed frame.
     void RequestCapture(uint32_t frames) { _capture.Begin(frames); }
@@ -233,7 +235,8 @@ class Composition {
 
     bool MakeImage(Image& img, uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage);
     void DropImage(Image& img);
-    bool ImportFdMemory(int fd, VkImage image, const VkMemoryRequirements& req, VkDeviceMemory* out);
+    bool ImportFdMemory(int fd, VkImage image, const VkMemoryRequirements& req, VkDeviceSize allocation, uint32_t memoryType, VkDeviceMemory* out);
+    void ReleaseExternal(VkCommandBuffer cb, Image& image, VkAccessFlags access, VkPipelineStageFlags stage);
     bool MakeHostBuffer(HostBuffer& buf, size_t bytes, VkBufferUsageFlags usage);
     bool MakeTransportBuffer(HostBuffer& buf, size_t bytes, VkBufferUsageFlags usage, void* hostPtr);
     void DropHostBuffer(HostBuffer& buf);
@@ -256,6 +259,7 @@ class Composition {
     DlssNrConstants BaseConstants(const FrameSettings& s) const;
     float ResolvedWhitePoint(const FrameSettings& s) const;
 
+    uint32_t _externalQueueFamily=VK_QUEUE_FAMILY_IGNORED;
     const DeviceTable* _vk = nullptr;
     const InstanceTable* _instance = nullptr;
     VkDevice _device = VK_NULL_HANDLE;

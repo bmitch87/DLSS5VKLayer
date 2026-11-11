@@ -915,31 +915,31 @@ bool Composition::Prepare(uint32_t width, uint32_t height, VkFormat swapchainFor
 // attempt gets its own duplicate of the descriptor, because a failed import may or may not have
 // consumed the fd depending on the driver. The winner keeps its duplicate, the losers close
 // theirs, and the caller closes the original either way.
-bool Composition::ImportFdMemory(int fd, VkImage image, const VkMemoryRequirements& req, VkDeviceMemory* out) {
-    for (uint32_t type = 0; type < 32; ++type) {
-        if (!(req.memoryTypeBits & (1u << type))) continue;
-        const int dup = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-        if (dup < 0) return false;
-        VkImportMemoryFdInfoKHR imp{};
-        imp.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
-        imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-        imp.fd = dup;
-        VkMemoryAllocateInfo mai{};
-        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        mai.pNext = &imp;
-        mai.allocationSize = req.size;
-        mai.memoryTypeIndex = type;
-        if (_vk->vkAllocateMemory(_device, &mai, nullptr, out) == VK_SUCCESS) {
-            if (_vk->vkBindImageMemory(_device, image, *out, 0) == VK_SUCCESS) return true;
-            _vk->vkFreeMemory(_device, *out, nullptr);
-            *out = VK_NULL_HANDLE;
-        }
-        close(dup);
-    }
-    return false;
+bool Composition::ImportFdMemory(int fd, VkImage image, const VkMemoryRequirements& req,
+                                 VkDeviceSize allocation, uint32_t type, VkDeviceMemory* out) {
+    if(type>=32 || !(req.memoryTypeBits&(1u<<type)) || allocation<req.size)return false;
+    int copy=fcntl(fd,F_DUPFD_CLOEXEC,0);if(copy<0)return false;
+    VkMemoryDedicatedAllocateInfo dedicated{};dedicated.sType=VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;dedicated.image=image;
+    VkImportMemoryFdInfoKHR imp{};imp.sType=VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+    imp.pNext=&dedicated;imp.handleType=VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;imp.fd=copy;
+    VkMemoryAllocateInfo mai{};mai.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;mai.pNext=&imp;
+    mai.allocationSize=allocation;mai.memoryTypeIndex=type;
+    if(_vk->vkAllocateMemory(_device,&mai,nullptr,out)!=VK_SUCCESS){close(copy);return false;}
+    // Successful import consumes copy, including when binding subsequently fails.
+    if(_vk->vkBindImageMemory(_device,image,*out,0)==VK_SUCCESS)return true;
+    _vk->vkFreeMemory(_device,*out,nullptr);*out=VK_NULL_HANDLE;return false;
+}
+void Composition::ReleaseExternal(VkCommandBuffer cb, Image& image,
+                                   VkAccessFlags access, VkPipelineStageFlags stage) {
+    Transition(cb,image,VK_IMAGE_LAYOUT_GENERAL);
+    VkImageMemoryBarrier release{};release.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    release.srcAccessMask=access;release.oldLayout=VK_IMAGE_LAYOUT_GENERAL;release.newLayout=VK_IMAGE_LAYOUT_GENERAL;
+    release.srcQueueFamilyIndex=_externalQueueFamily;release.dstQueueFamilyIndex=VK_QUEUE_FAMILY_EXTERNAL;
+    release.image=image.image;release.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+    _vk->vkCmdPipelineBarrier(cb,stage,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,nullptr,0,nullptr,1,&release);
 }
 
-bool Composition::ImportProxy(int fd, uint32_t w, uint32_t h) {
+bool Composition::ImportProxy(int fd, uint32_t w, uint32_t h, VkDeviceSize allocation, uint32_t memoryType) {
     if (fd < 0 || !_vk->vkAllocateMemory || !w || !h) {
         if (fd >= 0) close(fd);
         return false;
@@ -954,7 +954,7 @@ bool Composition::ImportProxy(int fd, uint32_t w, uint32_t h) {
     // dma-buf rather than an opaque driver object.
     VkExternalMemoryImageCreateInfo ext{};
     ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
     VkImageCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ci.pNext = &ext;
@@ -982,7 +982,7 @@ bool Composition::ImportProxy(int fd, uint32_t w, uint32_t h) {
 
     VkMemoryRequirements req{};
     _vk->vkGetImageMemoryRequirements(_device, _proxyXfer.image, &req);
-    if (!ImportFdMemory(fd, _proxyXfer.image, req, &_proxyXfer.memory)) {
+    if (!ImportFdMemory(fd, _proxyXfer.image, req, allocation, memoryType, &_proxyXfer.memory)) {
         DropImage(_proxyXfer);
         close(fd);
         return false;
@@ -998,11 +998,11 @@ bool Composition::ImportProxy(int fd, uint32_t w, uint32_t h) {
         DropImage(_proxyXfer);
         return false;
     }
-    _proxyXfer.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    Log("[comp] proxy imported at %ux%u (dma-buf)", w, h);
+    _proxyXfer.layout = VK_IMAGE_LAYOUT_GENERAL;
+    Log("[comp] proxy imported at %ux%u (opaque-fd)", w, h);
     return true;
 }
-bool Composition::ImportAnswerFd(int fd, uint32_t w, uint32_t h) {
+bool Composition::ImportAnswerFd(int fd, uint32_t w, uint32_t h, VkDeviceSize allocation, uint32_t memoryType) {
     if (fd < 0 || !_vk->vkAllocateMemory || !w || !h) {
         if (fd >= 0) close(fd);
         return false;
@@ -1017,7 +1017,7 @@ bool Composition::ImportAnswerFd(int fd, uint32_t w, uint32_t h) {
     // the handle type says the fd is a dma-buf rather than an opaque driver object.
     VkExternalMemoryImageCreateInfo ext{};
     ext.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
     VkImageCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ci.pNext = &ext;
@@ -1043,7 +1043,7 @@ bool Composition::ImportAnswerFd(int fd, uint32_t w, uint32_t h) {
 
     VkMemoryRequirements req{};
     _vk->vkGetImageMemoryRequirements(_device, _answerXfer.image, &req);
-    if (!ImportFdMemory(fd, _answerXfer.image, req, &_answerXfer.memory)) {
+    if (!ImportFdMemory(fd, _answerXfer.image, req, allocation, memoryType, &_answerXfer.memory)) {
         DropImage(_answerXfer);
         close(fd);
         return false;
@@ -1059,8 +1059,8 @@ bool Composition::ImportAnswerFd(int fd, uint32_t w, uint32_t h) {
         DropImage(_answerXfer);
         return false;
     }
-    _answerXfer.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    Log("[comp] answer imported at %ux%u (dma-buf)", w, h);
+    _answerXfer.layout = VK_IMAGE_LAYOUT_GENERAL;
+    Log("[comp] answer imported at %ux%u (opaque-fd)", w, h);
     return true;
 }
 
@@ -1090,14 +1090,23 @@ void Composition::TransitionSwapchain(VkCommandBuffer cb, VkImage image, VkImage
     b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-    if (from == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR && to == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-        b.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        srcStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
-        dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    } else if (from == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && to == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
-        b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    // A layout transition is itself an access. Cover both capture (read) and
+    // composition (write), including the final write before presentation.
+    b.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    if (from == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR &&
+        (to == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL || to == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)) {
+        // Chain the acquire/render-finished semaphore wait at TRANSFER into
+        // this layout transition, rather than starting before that wait.
+        b.srcAccessMask = 0;
+        b.dstAccessMask = to == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                              ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
+        srcStage = dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else if (to == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR &&
+               (from == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL || from == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)) {
+        b.srcAccessMask = from == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                              ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = 0;
         srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
     }
@@ -1362,21 +1371,21 @@ bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, cons
         pacq.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         pacq.srcAccessMask = 0;
         pacq.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        pacq.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        pacq.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        pacq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
-        pacq.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        pacq.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        pacq.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        pacq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+        pacq.dstQueueFamilyIndex = _externalQueueFamily;
         pacq.image = _proxyXfer.image;
         pacq.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                   0, 0, nullptr, 0, nullptr, 1, &pacq);
-        _proxyXfer.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        _proxyXfer.layout = VK_IMAGE_LAYOUT_GENERAL;
         VkImageCopy copy{};
         copy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         copy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         copy.extent = { _modelW, _modelH, 1 };
         _vk->vkCmdCopyImage(cb, source->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, _proxyXfer.image,
-                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+                            VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
 
         // Release to FOREIGN: the helper's driver acquires from the same domain before it reads.
         Transition(cb, _proxyXfer, VK_IMAGE_LAYOUT_GENERAL);
@@ -1385,14 +1394,14 @@ bool Composition::RecordCapture(VkCommandBuffer cb, VkImage swapchainImage, cons
         rel.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         rel.dstAccessMask = 0;
         rel.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        rel.newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        rel.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        rel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
+        rel.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        rel.srcQueueFamilyIndex = _externalQueueFamily;
+        rel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
         rel.image = _proxyXfer.image;
         rel.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                                   0, 0, nullptr, 0, nullptr, 1, &rel);
-        _proxyXfer.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        _proxyXfer.layout = VK_IMAGE_LAYOUT_GENERAL;
         // The helper reads this image through the fd on exactly the frame the flag was set for,
         // and the flag is set when and only when this branch runs, so the host transport stays
         // untouched. One decision, one surface, one frame.
@@ -1427,18 +1436,17 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
         acq.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         acq.srcAccessMask = 0;
         acq.dstAccessMask = rawCopy ? VK_ACCESS_TRANSFER_READ_BIT : VK_ACCESS_SHADER_READ_BIT;
-        acq.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        acq.newLayout = rawCopy ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-                                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        acq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
-        acq.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        acq.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        acq.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        acq.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+        acq.dstQueueFamilyIndex = _externalQueueFamily;
         acq.image = _answerXfer.image;
         acq.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                   rawCopy ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                   0, 0, nullptr, 0, nullptr, 1, &acq);
-        _answerXfer.layout = rawCopy ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-                                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        _answerXfer.layout = VK_IMAGE_LAYOUT_GENERAL;
+        Transition(cb,_answerXfer,rawCopy?VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     } else {
         Transition(cb, _model, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         VkBufferImageCopy region{};
@@ -1463,20 +1471,8 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
         TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                             VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
-        if (dmaAnswer) {
-            VkImageMemoryBarrier rel{};
-            rel.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            rel.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            rel.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            rel.newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            rel.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            rel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
-            rel.image = _answerXfer.image;
-            rel.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &rel);
-            _answerXfer.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-        }
+        if (dmaAnswer) ReleaseExternal(cb,_answerXfer,VK_ACCESS_TRANSFER_READ_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
+
         return true;
     }
     if (_superSample) {
@@ -1526,21 +1522,7 @@ bool Composition::RecordCompose(VkCommandBuffer cb, VkImage swapchainImage, cons
 
     // The answer's memory belongs to the helper's device between frames: hand it back before the
     // helper's next write, so neither side's caches hold a version the other has moved past.
-    if (dmaAnswer) {
-        VkImageMemoryBarrier rel{};
-        rel.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        rel.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        rel.dstAccessMask = 0;
-        rel.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        rel.newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        rel.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        rel.dstQueueFamilyIndex = VK_QUEUE_FAMILY_FOREIGN_EXT;
-        rel.image = _answerXfer.image;
-        rel.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        _vk->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                  VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &rel);
-        _answerXfer.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-    }
+    if (dmaAnswer) ReleaseExternal(cb,_answerXfer,VK_ACCESS_SHADER_READ_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
     Transition(cb, _composed, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     TransitionSwapchain(cb, swapchainImage, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);

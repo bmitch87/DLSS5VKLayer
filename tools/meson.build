@@ -14,3 +14,11 @@ executable('dlssnr-shmctl',
   link_args: ['-static', '-static-libstdc++', '-static-libgcc'],
   install: false,
 )
+
+# Helper-only preload: close native descriptors exported through Wine.
+shared_library('dlssnr_unix_fd_bridge',
+  'unix_fd_bridge.c',
+  c_args: ['-std=c11'],
+  dependencies: dependency('threads'),
+  install: false,
+)
